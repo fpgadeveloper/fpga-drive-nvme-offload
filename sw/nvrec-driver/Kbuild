@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# Kbuild for the out-of-tree nvrec module.
+#
+# The shared headers (nvrec_uapi.h, and nvrec_regs.h once the hardware has
+# it) live in the repository's include/ directory, two levels up. The Yocto
+# recipe unpacks sw/nvrec-driver and include/ with the same relative layout,
+# so the path works in both places. Override with NVREC_INCLUDE=<dir>.
+NVREC_INCLUDE ?= $(src)/../../include
+
+obj-m := nvrec.o
+nvrec-y := nvrec_main.o nvrec_hw.o nvrec_nvme.o nvrec_blk.o
+ccflags-y += -I$(NVREC_INCLUDE)

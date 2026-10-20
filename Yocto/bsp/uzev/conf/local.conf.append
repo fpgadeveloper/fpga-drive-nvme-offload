@@ -1,0 +1,61 @@
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# SPDX-License-Identifier: MIT
+
+# FPGA Drive NVMe-offload recorder overrides for the UltraZed-EV (uzev), EDF flow.
+#
+# This board uses the gen-machineconf "parse-sdt" flow (AMD's recommended
+# path). Yocto/scripts/configure-build.sh generates a System Device Tree from
+# the Vivado XSA and runs gen-machineconf to produce a *custom* MACHINE
+# (nvrec-<target>) whose device tree — PS and PL — is derived directly from
+# the hardware. MACHINE is therefore NOT pinned here; it is set by
+# configure-build.
+#
+# Consequences of the parse-sdt flow:
+#   - The PL hardware (xilinx_xdma PCIe Root Ports) is captured by the SDT's
+#     pl.dtsi and lopper-merged into the generated Linux device tree.
+#     system-user.dtsi carries the SoC-side board fixups (GTR clocks, PHY,
+#     UART ttyPS mapping, fixed MAC) and the opsero,nvrec node.
+#   - The Vivado bitstream is extracted into the SDT and wired via
+#     BITSTREAM_PATH; because no PL overlay is requested, fpga-overlay is left
+#     out of MACHINE_FEATURES and xilinx-bootbin embeds the bitstream into
+#     BOOT.BIN (FSBL programs the PL at boot, before Linux/PCIe come up).
+#   - DISTRO is set by the amd-edf template; IMAGE_FSTYPES by edf-linux-disk-image.
+#   - The EDF wks partitions the SD card as: /boot/efi (vfat), /boot (ext4),
+#     / (ext4) -> rootfs lives on /dev/mmcblk0p3.
+#
+# A customer who changes the PS in Vivado (clocks, peripherals, MIO, DDR, ...)
+# only needs to rebuild the XSA and re-run `./build.sh yocto --target <target>`; the
+# change flows through XSA -> SDT -> machine.conf -> device tree automatically.
+
+# CMA pool needed for PCIe DMA from large NVMe transfers.
+# Kernel command line. APPEND is NOT read by the EDF boot flow. On ZynqMP the
+# cmdline is built by boot.scr (meta-amd-edf edf-linux-mmc-boot.cmd): DT
+# /chosen/bootargs ("earlycon console=ttyPS0,115200 clk_ignore_unused
+# init_fatal_sh=1", emitted by sdtgen) + "root=/dev/mmcblk<N>p3 ro rootwait
+# uio_pdrv_genirq.of_id=generic-uio". BSP_EXTRA_BOOTARGS is appended to it by
+# meta-user/recipes-bsp/u-boot/u-boot-edf-scr_%.bbappend.
+# Design args follow PetaLinux/bsp/uzev CONFIG_SUBSYSTEM_USER_CMDLINE.
+# No "rw": root is mounted ro and systemd-remount-fs remounts it rw (fstab "/" defaults).
+# NVREC_CMA: CMA pool. The nvrec driver allocates the recording ring there
+# (one physically contiguous region; default 256 slots x chunk, chunk =
+# min(1 MB, the drives' MDTS) -> at most 256 MB) next to the PCIe/NVMe DMA
+# needs of the kernel. The UltraZed-EV SOM has 4 GB of PS DDR4, of which 2 GB
+# are below 4 GB where arm64 puts the CMA pool: 1024M (the base design used
+# 1000M here) leaves room for the kernel and keeps rings up to ~768 MB
+# possible (NUM_SLOTS x chunk must fit in the pool with the kernel's own CMA
+# users). Raise it (e.g. 1536M as on the ZCU106, same memory layout) for
+# larger rings.
+# NVREC_HUGEPAGES: 2 MB hugepages reserved at boot, only for apps that bring
+# their own ring (accepted when physically contiguous); 0 by default.
+NVREC_CMA ?= "1024M"
+NVREC_HUGEPAGES ?= "0"
+BSP_EXTRA_BOOTARGS = "cma=${NVREC_CMA}${@' hugepagesz=2M hugepages=' + d.getVar('NVREC_HUGEPAGES') if d.getVar('NVREC_HUGEPAGES') != '0' else ''}"
+
+# Hostname. meta-amd-edf's distro conf sets hostname:pn-base-files:amd-edf =
+# "amd-edf"; it is parsed after local.conf and its extra override outranks a
+# plain hostname:pn-base-files, so use :forcevariable (last in OVERRIDES).
+hostname:pn-base-files:forcevariable = "uzev-nvrec-2025-2"
+
+# Reserve space in the rootfs for the toolset we install at image time.
+IMAGE_ROOTFS_EXTRA_SPACE = "524288"

@@ -1,0 +1,29 @@
+# Custom RTL (module references)
+
+Verilog sources for the recorder's custom logic. The `fdrec_*` modules are reused unchanged
+from [fpga-drive-recorder](https://github.com/fpgadeveloper/fpga-drive-recorder) (test
+pattern generator, checker, ingest and egress FIFOs); the `nvrec_*` modules are the NVMe
+offload engine of this design.
+
+| Module | Purpose |
+|---|---|
+| `nvrec_core` | top of the block-design module reference: register decode, run control, clock-domain crossings, instantiates everything below |
+| `nvrec_regs` | AXI4-Lite slave front end of the register block |
+| `nvrec_wr` | ring writer: ingest FIFO -> AXI4 write bursts into the ring of chunks |
+| `nvrec_cmd` | NVMe command builder (Write / Read SQEs) + submission arbiter (builder / injector), credits |
+| `nvrec_cq` | completion router: slot release in ring order, statistics, latency histogram |
+| `nvrec_rd` | ring reader (playback): AXI4 read bursts -> egress FIFO |
+| `nvrec_inj` | CPU command injector (software SQEs onto the hardware SQ, CQE FIFO) |
+| `nvrec_dbmon` | doorbell monitor (debug log of the Host Accelerator's doorbell writes) |
+| `nvrec_axil_guard` | separate module reference (`nvmeha_guard`) in front of the Host Accelerator's `S_AXI_LITE`: AXI-Lite timeout guard, so an expired evaluation core answers with all-ones instead of hanging the CPU; its `dead` output feeds `nvrec_core` `STATE.HA_DEAD` |
+| `fdrec_tpg`, `fdrec_check`, `fdrec_ingest`, `fdrec_egress` | from fpga-drive-recorder, unchanged |
+
+* `Vivado/scripts/build.tcl` adds every `*.v` and `*.sv` file in this folder to the
+  project's `sources_1` fileset (and `*.vh` / `*.svh` as include headers) *before*
+  the block design script runs, so the block design can instantiate the modules with
+  `create_bd_cell -type module -reference <module_name>`.
+* Keep the top module of each module reference in a Verilog (`.v`) file.
+* One module per file, file name = module name.
+* Testbenches are in `../sim/` (see `../sim/README.md`).
+* The register map implemented here is defined in `include/nvrec_regs.h` and
+  documented in `docs/source/register_map.md`; keep all three in sync.

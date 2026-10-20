@@ -1,0 +1,54 @@
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# SPDX-License-Identifier: MIT
+
+# FPGA Drive NVMe-offload recorder overrides for VCK190 (vck190_fmcp1), EDF flow.
+# (Ported from fpga-drive-recorder Yocto/bsp/vck190, HW-validated there.)
+#
+# This board uses the gen-machineconf "parse-sdt" flow (AMD's recommended
+# path), the same flow now used for every zynqMP target.
+# Yocto/scripts/configure-build.sh generates a System Device Tree from the
+# Vivado XSA and runs gen-machineconf to produce a *custom* MACHINE
+# (nvrec-<target>) whose device tree -- PS, PL, and the per-domain DTS the
+# PLM/PSM firmware build from -- is derived directly from the hardware.
+# MACHINE is therefore NOT pinned here; it is set by configure-build.
+#
+# Consequences of the parse-sdt flow:
+#   - The PL hardware (xilinx_qdma PCIe Root Ports, nvrec_core, nvmeha) is
+#     captured by the SDT's pl.dtsi and lopper-merged into the generated
+#     Linux device tree. system-user.dtsi carries the SoC-side board fixups
+#     (QDMA ranges, GEM PHYs + fixed MACs) and the opsero,nvrec node.
+#   - The Vivado boot artifact (.pdi) is extracted into the SDT and wired
+#     automatically; because no PL overlay is requested, fpga-overlay is left
+#     out of MACHINE_FEATURES and the bitstream/PDI is embedded into BOOT.BIN.
+#   - DISTRO is set by the amd-edf template; IMAGE_FSTYPES by edf-linux-disk-image.
+#   - The Versal EDF wks (edf-disk-single-rootfs-efi.wks) partitions the card
+#     as esp(vfat)/storage(vfat)/root(ext4); bootimg-efi-amd populates the esp
+#     with BOOT.BIN + systemd-boot directly (no manual BOOT.BIN copy step).
+
+# Kernel command line. APPEND is NOT read by the EDF boot flow. This BSP boots
+# U-Boot -> boot.scr (CONFIG_BOOTCOMMAND in meta-user/recipes-bsp/u-boot/files/
+# fpgadrv-bootcmd.cfg); the fixed kernel arguments (console, clk_ignore_unused,
+# root) are in meta-user/recipes-bsp/u-boot/files/fpgadrv-boot.cmd, which also
+# enables the FMC VADJ rail before Linux starts (without it the SSDs never
+# link). BSP_EXTRA_BOOTARGS is appended to that script's `setenv bootargs`
+# line by meta-user/recipes-bsp/u-boot/u-boot-edf-scr_%.bbappend.
+#
+# NVREC_CMA: CMA pool. The nvrec driver allocates the recording ring there
+# (one physically contiguous region; default 256 slots x chunk, chunk =
+# min(1 MB, the drives' MDTS) -> at most 256 MB) next to the PCIe/NVMe DMA
+# needs of the kernel. The VCK190 has 2 GB of DDR4 at 0x0 (where arm64 puts
+# the pool) plus 6 GB at 0x500_0000_0000; 1536M is the base design's value.
+# NVREC_HUGEPAGES: 2 MB hugepages reserved at boot, only for apps that bring
+# their own ring (accepted when physically contiguous); 0 by default.
+NVREC_CMA ?= "1536M"
+NVREC_HUGEPAGES ?= "0"
+BSP_EXTRA_BOOTARGS = "cma=${NVREC_CMA}${@' hugepagesz=2M hugepages=' + d.getVar('NVREC_HUGEPAGES') if d.getVar('NVREC_HUGEPAGES') != '0' else ''}"
+
+# Hostname. meta-amd-edf's distro conf sets hostname:pn-base-files:amd-edf =
+# "amd-edf"; it is parsed after local.conf and its extra override outranks a
+# plain hostname:pn-base-files, so use :forcevariable (last in OVERRIDES).
+hostname:pn-base-files:forcevariable = "vck190-nvrec-2025-2"
+
+# Reserve space in the rootfs for the toolset we install at image time.
+IMAGE_ROOTFS_EXTRA_SPACE = "524288"
