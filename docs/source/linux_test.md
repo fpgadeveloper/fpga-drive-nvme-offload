@@ -24,25 +24,39 @@ SSD it takes over:
 dmesg | grep -E "PCIe Link|nvrec"
 ```
 
-Example output (ZCU106, two 980 PRO):
+Example output (ZCU106, two 980 PRO; the `nvrec 420010000.nvrec` line is one line, wrapped here):
 
 ```none
 xilinx-xdma-pcie 400000000.axi-pcie: PCIe Link is UP
 xilinx-xdma-pcie 500000000.axi-pcie: PCIe Link is UP
-nvrec 420010000.nvrec: /dev/nvrec: nvrec_core v1.1, src_clk 199980011 Hz, dp_clk 249975006 Hz, FIFO 4096 beats; nvmeha: 2 SSDs x 1 queues (SQ window 0x90000000, CQ window 0x90008000), hardware queues, CPU I/O via the injector
+nvrec 420010000.nvrec: /dev/nvrec: driver 1.1, nvrec_core v1.2, src_clk 249975021 Hz, dp_clk 249975021 Hz,
+  beat 32 bytes, FIFO 8192/4096 beats (ingest/egress), 2048 ring slots, DRY; nvmeha: 2 SSDs x 1 queues
+  (SQ window 0x90000000, CQ window 0x90008000), hardware queues, CPU I/O via the injector
+nvrec-nvme 0000:01:00.0: SSD0: APST disabled (the drive's setting)
 nvrec-nvme 0000:01:00.0: SSD0: Samsung SSD 980 PRO 1TB (<serial>, fw 5B2QGXA7): 1953525168 x 512-byte LBAs (1000 GB), MDTS 512 KB, DSTRD 0, 1 I/O queues granted, 0 SW + 1 HW queues in the IP, block I/O via the CPU command injector -> /dev/nvrec0n1
+nvrec-nvme 0000:01:00.0: SSD0: composite temperature 27 C (warning 82 C, critical 85 C; 0 = not reported)
+nvrec-nvme 0001:01:00.0: SSD1: APST disabled (the drive's setting)
 nvrec-nvme 0001:01:00.0: SSD1: Samsung SSD 980 PRO 1TB (<serial>, fw 5B2QGXA7): 1953525168 x 512-byte LBAs (1000 GB), MDTS 512 KB, DSTRD 0, 1 I/O queues granted, 0 SW + 1 HW queues in the IP, block I/O via the CPU command injector -> /dev/nvrec1n1
+nvrec-nvme 0001:01:00.0: SSD1: composite temperature 28 C (warning 82 C, critical 85 C; 0 = not reported)
 ```
 
 What the lines tell you:
 
-* `nvrec_core v1.1` is the register map version of the hardware (1.1 has the Host
-  Accelerator timeout guard); `src_clk` and `dp_clk` are the measured source and datapath
-  clocks; `2 SSDs x 1 queues` is the Host Accelerator's configuration: one hardware queue
-  per SSD, whose memory (`SQ window`, `CQ window`) the SSDs reach at 0x9000_0000.
-* One `SSD<n>` line per drive: model, serial, firmware, capacity and LBA size, the
-  **MDTS** (which sets the recording chunk, see [supported SSDs](supported_ssds)), the
-  doorbell stride (`DSTRD 0` is required), and the block device the drive is reachable at.
+* `driver 1.1` is the kernel driver version and `nvrec_core v1.2` the register map version
+  of the hardware (1.2: the configurable datapath width and the fabric-only mode; 1.1 added
+  the Host Accelerator timeout guard); `src_clk` and `dp_clk` are the measured source and
+  datapath clocks; `beat 32 bytes` is the 256-bit fabric datapath of the Zynq UltraScale+
+  targets (`vck190_fmcp1`, 512 bits, shows `beat 64 bytes, FIFO 4096/4096 beats`; see
+  [Kernel driver](driver.md#beats-and-words)), with an ingest FIFO of 8192 beats (256 KB)
+  and an egress FIFO of 4096 beats (128 KB); `2048 ring slots` is the hardware slot table;
+  `DRY` says the fabric-only mode is there. `2 SSDs x 1 queues` is the Host Accelerator's
+  configuration: one hardware queue per SSD, whose memory (`SQ window`, `CQ window`) the
+  SSDs reach at 0x9000_0000.
+* Per drive: the APST state the drive came up with and what the driver did with it (see
+  [Kernel driver](driver.md#power-states-apst-and-temperature)); model, serial, firmware,
+  capacity and LBA size, the **MDTS** (which sets the recording chunk, see
+  [supported SSDs](supported_ssds)), the doorbell stride (`DSTRD 0` is required), and the
+  block device the drive is reachable at; its temperature and thresholds.
 
 The SSDs are **not** `/dev/nvme0n1` / `/dev/nvme1n1` in this design: they belong to the
 `nvrec-nvme` driver, which creates their I/O queues inside the Host Accelerator (see
@@ -63,13 +77,17 @@ If a link does not come up or an SSD is missing, see [Troubleshooting](troublesh
 ## 2. Check the recorder driver
 
 ```
-cat /sys/class/misc/nvrec/version          # 1.1
+cat /sys/module/nvrec/version              # 1.1: the driver
+cat /sys/class/misc/nvrec/version          # 1.2: the register map of the hardware
+cat /sys/class/misc/nvrec/beat_bytes       # 32: a 256-bit datapath (64 on vck190_fmcp1)
 cat /sys/class/misc/nvrec/ha_dead          # 0 = the Host Accelerator is working
+cat /sys/block/nvrec0n1/nvrec/temperature  # composite temperature of SSD0, degrees C
+cat /sys/block/nvrec0n1/nvrec/apst         # off (the driver's default)
 grep Cma /proc/meminfo                     # CmaTotal: the pool for the recording ring
 ```
 
-The recording ring (256 MB by default: 256 × 1 MB, 512 × the 980 PRO's 512 KB chunks or
-1024 × 256 KB) and its PRP lists are allocated from the CMA pool
+The recording ring (512 MB by default: 512 × 1 MB, 1024 × the 980 PRO's 512 KB chunks or
+2048 × 256 KB) and its PRP lists are allocated from the CMA pool
 when a run starts; the image reserves 1 GB (`uzev`) or 1.5 GB (`zcu106_hpc0`,
 `vck190_fmcp1`).
 
@@ -141,33 +159,34 @@ Example output (ZCU106, RAID0 of two 980 PRO, freshly trimmed; the `RESULT` line
 wrapped here):
 
 ```none
-nvrec: /mnt/rec/test.dat: 20480 x 524288-byte chunks from array chunk 35 over 2 member(s), ring 512 slots (256 MB), qd 32
-nvrec: 10737418240 bytes in 10.74 s, 1000.0 MB/s; 20480 commands, 0 errors, max 1 in flight per SSD
-nvrec: command latency min 179 / avg 179 / max 243 us; ring high-water 2 slots, writer waited 0.000 ms for a free slot
-nvrec: dropped beats 0, FIFO high-water during the run 259 of 4096 beats; file header + padding before the data
-nvrec: ring 512 slots x 524288 bytes = 256 MB, high-water 2 slots
-RESULT bytes=10737418240 seconds=10.738 rate_bps=999999999 drops=0 fifo_hwm=259 fifo_depth=4096
-  error=0 nvme_errors=0 chunk=524288 qd=32 members=2 ring_hwm=2 lat_avg_us=179 lat_max_us=243
-  data_offset=524288 lat_min_us=179 lat_count=20480 inflight_hwm=1,1 ring_wait_ms=0.000
-  lat_hist=0,0,0,0,0,0,20480,0,0,0,0,0,0,0,0,0 lat_bin0_log2=10 ring_slots=512 ring_bytes=268435456
+nvrec: /mnt/rec/test.dat: 20480 x 524288-byte chunks from array chunk 35 over 2 member(s), ring 1024 slots (512 MB), qd 32
+nvrec: 10737418240 bytes in 10.74 s, 999.9 MB/s; 20480 commands, 0 errors, max 4 in flight per SSD
+nvrec: command latency min 179 / avg 180 / max 3670 us; ring high-water 8 slots, writer waited 0.000 ms for a free slot
+nvrec: dropped beats 0, FIFO high-water during the run 129 of 8192 beats; file header + padding before the data
+nvrec: ring 1024 slots x 524288 bytes = 512 MB, high-water 8 slots
+RESULT bytes=10737418240 seconds=10.738 rate_bps=999999997 drops=0 fifo_hwm=129 fifo_depth=8192
+  error=0 nvme_errors=0 chunk=524288 qd=32 members=2 ring_hwm=8 lat_avg_us=180 lat_max_us=3670
+  data_offset=524288 beat_bytes=32 no_write=0 lat_min_us=179 lat_count=20480 inflight_hwm=4,1
+  ring_wait_ms=0.000 lat_hist=0,0,0,0,0,0,20468,0,0,6,6,0,0,0,0,0 lat_bin0_log2=10
+  ring_slots=1024 ring_bytes=536870912
 exit code 0
 ```
 
 What the summary tells you:
 
 * **the first line**: 10 GiB is 20480 chunks of 512 KB (the 980 PRO's MDTS), striped over the
-  two drives starting at chunk 35 of the array, through a ring of 512 slots (256 MB).
+  two drives starting at chunk 35 of the array, through a ring of 1024 slots (512 MB).
 * **20480 commands, 0 errors**: one NVMe Write command per chunk, all issued and completed in
-  hardware; `max 1 in flight per SSD` is the deepest each SSD's queue got (the limit is
-  `--qd`, default 32). At 1 GB/s a 980 PRO completes every 512 KB command before the next
-  chunk is full; at higher rates or during write stalls more commands queue up.
+  hardware; `max 4 in flight per SSD` is the deepest each SSD's queue got (the limit is
+  `--qd`, default 32). At 1 GB/s a 980 PRO completes nearly every 512 KB command before the
+  next chunk is full; at higher rates or during write stalls more commands queue up.
 * **command latency**: from the moment the command builder hands a command to the Host
   Accelerator to its completion, measured in hardware.
 * **ring high-water**: the most chunks that were waiting for the SSDs at any time, out of
-  the ring's 512. It shows how much of the ring the SSDs' write stalls used; `writer waited`
+  the ring's 1024. It shows how much of the ring the SSDs' write stalls used; `writer waited`
   is the time the ring was full (it must stay 0 for a clean recording).
-* **dropped beats 0**: no data was lost. `FIFO high-water` is the fill of the 4096-beat
-  ingest FIFO during the run.
+* **dropped beats 0**: no data was lost. `FIFO high-water` is the fill of the 8192-beat
+  (256 KB) ingest FIFO during the run; beats are 32 bytes on this design (`beat_bytes=32`).
 * `RESULT` is one machine-readable line for scripts (`nvbench.sh` uses it); its first keys
   follow the `fdrec` tool of fpga-drive-recorder, the others are listed in
   [Applications](apps.md#nvrec).
@@ -181,7 +200,7 @@ What the summary tells you:
 
 ## 5. Verify
 
-Verify every beat of the recording:
+Verify every word of the recording:
 
 ```
 sudo nvverify /mnt/rec/test.dat; echo "exit code $?"
@@ -194,29 +213,31 @@ Example output (the recording above):
 
 ```none
 /mnt/rec/test.dat:
-  header          NVREC version 1, data at 524288, 16-byte beats
+  header          NVREC version 1, data at 524288, 32-byte beats
   flags           0x3 (test pattern, complete)
-  design version  1.1
+  design version  1.2
   target / host   zcu106_hpc0 / zcu106-nvrec-2025-2
-  src_clk_hz      199980011
+  src_clk_hz      249975021
   rate_bps        999999999
   ...
   data_bytes      10737418240
-  drop_count      0
+  drop_count      0 beats
   first_seq       0
   chunk / members 524288 bytes / 2, start chunk 35, qd 32
   NVMe            0 errors, latency avg 179 us, max 243 us
-  beats           671088640 (10737418240 bytes)
+  words           671088640 (10737418240 bytes, 335544320 beats of 32 bytes)
   first sequence  0
   last sequence   671088639
-  discontinuities 0, beats missing 0
-  corrupted beats 0
+  discontinuities 0, words missing 0 (0 beats)
+  corrupted words 0
 RESULT PASS
 exit code 0
 ```
 
 `data at 524288` is the header and padding in front of the data: the data starts on a
 chunk boundary of the array, so that every hardware command writes one whole chunk.
+`nvverify` checks the test pattern per 16-byte word (a 32-byte beat holds two), so it reads
+recordings of any datapath width.
 
 ## 6. Copy the recording off the board
 
@@ -247,34 +268,39 @@ sudo nvplay --rate 3000MB /mnt/rec/test.dat; echo "exit code $?"
 
 `nvplay` prints the same summary lines as `nvrec` (see [Applications](apps.md#nvplay) for a
 complete example), then the prefill time, the checker's counts (`nvplay: checker: ... 0
-errors, 0 gaps ..., 0 underflows`) and its `RESULT` line. Example, the recording above played
-at 3000 MB/s (the prefill and `RESULT` lines; the `RESULT` line is one line, wrapped here):
+errors, 0 gaps ..., 0 underflows`) and its `RESULT` line. Example, a 10 GB recording of the
+same kind on the same RAID0 of two 980 PROs, played at 4000 MB/s (the prefill and `RESULT`
+lines; the `RESULT` line is one line, wrapped here):
 
 ```none
-nvplay: ring prefill before the sink was enabled: 0.047 s (not in the time above)
-RESULT bytes=10737418240 seconds=3.579 sink_rate_bps=2999999998 beats=671088640 errors=0 gaps=0
-  gap_beats=0 drop_count=0 underflows=0 nvme_errors=0 complete=1 error=0 prefill_seconds=0.047
-  lat_avg_us=283 lat_max_us=10527 ring_hwm=512 lat_min_us=174 lat_count=20480 inflight_hwm=32,32
-  ring_wait_ms=0.000 lat_hist=0,0,0,0,0,0,19970,66,81,40,140,161,22,0,0,0 lat_bin0_log2=10
-  ring_slots=512 ring_bytes=268435456
+nvplay: ring prefill before the sink was enabled: 0.085 s (not in the time above)
+RESULT bytes=10737418240 seconds=2.684 sink_rate_bps=3999999997 beats=335544320 errors=0 gaps=0
+  gap_beats=0 drop_count=0 underflows=0 nvme_errors=0 complete=1 error=0 prefill_seconds=0.085
+  beat_bytes=32 file_beat_bytes=32 ring_only=0 passes=1 lat_avg_us=424 lat_max_us=10317
+  ring_hwm=1024 lat_min_us=174 lat_count=20480 inflight_hwm=32,32 ring_wait_ms=0.000
+  lat_hist=0,0,0,0,0,0,19331,127,1,13,451,487,70,0,0,0 lat_bin0_log2=10
+  ring_slots=1024 ring_bytes=536870912
 exit code 0
 ```
 
 Before the checker is enabled, the ring is filled from the SSDs (`prefill`), so that the
 sink does not starve while the first read commands complete. During playback the ring is
-normally full (`ring_hwm=512` of 512 slots) and every SSD has its full `--qd` of reads in
-flight (`inflight_hwm=32,32`): the SSDs read ahead of the sink.
+normally full (`ring_hwm=1024` of 1024 slots) and every SSD has its full `--qd` of reads in
+flight (`inflight_hwm=32,32`): the SSDs read ahead of the sink. `beats` counts the 32-byte
+beats the checker took.
 
 | `nvplay` exit code | Meaning |
 |---|---|
-| 0 | Playback complete, and the checker saw every beat with no errors, no underflows, and gap beats equal to the recording's drop count |
+| 0 | Playback complete, and the checker saw every beat with no errors, no underflows, and gaps equal to the recording's drop count |
 | 2 | Playback complete, but the checker found a problem (for example underflows: the SSDs could not deliver the data as fast as `--rate`) |
 | 1 | Error or incomplete playback (Ctrl-C, NVMe error, stall) |
 | 5 | The NVMe Host Accelerator stopped responding (evaluation license expired?) |
 
 ```{note}
 Without `--rate`, `nvplay` leaves the sink rate as it is; its default is one beat per
-`src_clk` cycle (3.2 GB/s). Give `nvplay` a `--rate` below the read rate of your SSDs.
+`src_clk` cycle (8 GB/s on the 256-bit Zynq UltraScale+ targets, 16 GB/s on the 512-bit
+`vck190_fmcp1`). Give `nvplay` a `--rate` below the read rate
+of your SSDs.
 ```
 
 ## 8. When the Host Accelerator stops (evaluation license)
@@ -305,4 +331,23 @@ sudo nvbench.sh
 ```
 
 Run it once on a single SSD and once on RAID0, within one power-on session if you use an
-evaluation license. See [Benchmarks](benchmarks) for the method and for results.
+evaluation license. It sweeps from 500 MB/s to the generator maximum (8000 MB/s on the
+256-bit targets, 16 000 MB/s on `vck190_fmcp1`) in 500 MB/s steps; `--from`, `--step` and `--to` change that. See
+[Benchmarks](benchmarks) for the method and for results.
+
+## 10. Check the fabric path alone (no SSD)
+
+The fabric-only mode (register map 1.2) runs the recorder and the player without any NVMe
+command, so it shows what the fabric and the DDR path sustain on their own — the ceiling no
+SSD can raise. It needs no recording volume and does not touch the SSDs:
+
+```
+sudo nvrec --no-write --rate 8000MB --size 64G; echo "exit code $?"
+sudo nvplay --ring-only --rate 8000MB --passes 4; echo "exit code $?"
+```
+
+`nvrec --no-write` fills the ring at `--rate` and releases every slot at once: exit code 0
+means no beat was dropped at that rate. `nvplay --ring-only` fills the ring once from the
+generator, then streams it to the checker at `--rate`: exit code 0 means every beat arrived
+in order and the sink never ran dry. Lower the rate in steps to find the highest clean one.
+See [Applications](apps.md#fabric-only---no-write) for the details.

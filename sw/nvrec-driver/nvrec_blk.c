@@ -338,6 +338,33 @@ NVREC_DISK_ATTR(mdts_bytes, "%u", s->mdts_bytes);
 NVREC_DISK_ATTR(inflight_cmds, "%d", atomic_read(&s->inflight));
 NVREC_DISK_ATTR(pci, "%s", pci_name(s->pdev));
 NVREC_DISK_ATTR(dead, "%u", s->dead);
+/* Identify Controller WCTEMP / CCTEMP in degrees C, 0 = not reported */
+NVREC_DISK_ATTR(temperature_warn, "%d", s->wctemp_k ? (int)s->wctemp_k - 273 : 0);
+NVREC_DISK_ATTR(temperature_crit, "%d", s->cctemp_k ? (int)s->cctemp_k - 273 : 0);
+
+/* composite temperature, degrees C: SMART log of the drive (admin queue,
+ * not the recorder's path), read at most once a second */
+static ssize_t temperature_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	int t, ret = nvrec_nvme_temperature(disk_ssd(dev), &t);
+
+	return ret ? ret : sysfs_emit(buf, "%d\n", t);
+}
+static DEVICE_ATTR_RO(temperature);
+
+/* Autonomous Power State Transitions now: on / off / unsupported */
+static ssize_t apst_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	bool on;
+	int ret = nvrec_nvme_apst_get(disk_ssd(dev), &on);
+
+	if (ret == -EOPNOTSUPP)
+		return sysfs_emit(buf, "unsupported\n");
+	return ret ? ret : sysfs_emit(buf, "%s\n", on ? "on" : "off");
+}
+static DEVICE_ATTR_RO(apst);
 
 static struct attribute *nvrec_disk_attrs[] = {
 	&dev_attr_ssd_index.attr,
@@ -351,6 +378,10 @@ static struct attribute *nvrec_disk_attrs[] = {
 	&dev_attr_inflight_cmds.attr,
 	&dev_attr_pci.attr,
 	&dev_attr_dead.attr,
+	&dev_attr_temperature.attr,
+	&dev_attr_temperature_warn.attr,
+	&dev_attr_temperature_crit.attr,
+	&dev_attr_apst.attr,
 	NULL,
 };
 

@@ -17,9 +17,14 @@ Testbenches:
 | Testbench | What it checks |
 |---|---|
 | `tb_nvrec_wr` | ring writer: burst rules (4 KB, INCR), chunk data, ring wrap and flow control, LENGTH, STOP with padding (512 B and 4 KB LBAs), abort |
-| `tb_nvrec_core` | whole `nvrec_core` with a Host Accelerator + SSD model: SQE fields for 1- and 2-member stripes, out-of-order completions with in-order slot release, injector arbitration, playback into `fdrec_check`, error / unexpected CQEs, IRQs, a ring-full stress test, counter clear rules (issue and completion counters cleared together by `SOFT_RST`), `RUN_FIFO_HWM`, the `HA_DEAD` status/IRQ |
+| `tb_nvrec_core` | whole `nvrec_core` with a Host Accelerator + SSD model: SQE fields for 1- and 2-member stripes, out-of-order completions with in-order slot release, injector arbitration, playback into `fdrec_check`, error / unexpected CQEs, IRQs, a ring-full stress test, counter clear rules (issue and completion counters cleared together by `SOFT_RST`), `RUN_FIFO_HWM`, the `HA_DEAD` status/IRQ, `CONFIG.DRY` fabric-only record (no SSD command, slots released as filled) and ring-resident playback, `BEAT_BYTES` / `BYTES` units |
 | `tb_nvrec_axil_guard` | the AXI-Lite timeout guard: pass-through to a live slave (data, strobes, SLVERR), a slave that stops answering (read completes after the timeout with all-ones / OKAY, later accesses answered at once, slave no longer driven), heartbeat-only detection |
-| `tb_fdrec_tpg` | the reused fpga-drive-recorder test pattern generator (the checker is exercised by `tb_nvrec_core` test 3; its own testbench needs fdrec_core and stays in fpga-drive-recorder) |
+| `tb_fdrec_tpg` | the reused fpga-drive-recorder test pattern generator (the checker is exercised by `tb_nvrec_core` tests 3 and 8; its own testbench needs fdrec_core and stays in fpga-drive-recorder) |
+
+`tb_fdrec_tpg`, `tb_nvrec_wr` and `tb_nvrec_core` run once per datapath width (128, 256
+and 512 bits): a line `// sim_runs: DATA_WIDTH=128 DATA_WIDTH=256 DATA_WIDTH=512` in the
+testbench makes `sim.tcl` elaborate it with each top-level parameter override and report
+each run separately (`tb_nvrec_core[DATA_WIDTH=512]`).
 
 Contract for a testbench:
 
@@ -32,4 +37,4 @@ Contract for a testbench:
 
 A testbench passes only if its output contains `PASS` and no `FAIL`. `sim.tcl` exits
 with status 1 if any testbench fails. Work files and logs go to `Vivado/sim/<tb>/`
-(gitignored).
+(`Vivado/sim/<tb>_<run>/` for the per-width runs; gitignored).

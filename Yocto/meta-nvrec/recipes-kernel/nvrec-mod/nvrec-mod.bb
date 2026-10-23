@@ -14,6 +14,12 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0-only;md5=801f80980d171d
 
 inherit module
 
+# Driver version (NVREC_DRV_VERSION in sw/nvrec-driver/nvrec.h, modinfo
+# version). 1.1: fabric beat size from the BEAT_BYTES register (register map
+# 1.2: 128/256/512-bit datapaths), fabric-only (DRY) runs, APST switched off
+# at probe (module parameter apst), SMART temperature in sysfs.
+PV = "1.1"
+
 # Sources come straight from this repository (no fetch): sw/nvrec-driver and
 # the shared headers in include/ (nvrec_regs.h, nvrec_uapi.h). Both unpack
 # under ${WORKDIR} with their repo-relative paths, so the module's Kbuild

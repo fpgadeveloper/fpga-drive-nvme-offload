@@ -109,7 +109,8 @@
       "license": true,
       "flashsize": "0",
       "flashintf": "0",
-      "ip_license": true
+      "ip_license": true,
+      "data_width": 512
     }
   ]
 }

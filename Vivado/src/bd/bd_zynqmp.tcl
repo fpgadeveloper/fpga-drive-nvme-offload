@@ -17,6 +17,9 @@ proc str_contains {str substr} {
   }
 }
 
+# nvrec datapath parameters of this target (nvrec_data_width, FIFO depths, ...)
+source [file join [file dirname [file normalize [info script]]] nvrec_params.tcl]
+
 # GT and PCIe LOCs
 set select_quad_0 [dict get $gt_loc_dict $target 0 quad]
 set pcie_blk_locn_0 [dict get $gt_loc_dict $target 0 pcie]
@@ -83,13 +86,31 @@ if {$dual_design} {
 }
 
 # NVMe offload recorder: PS clocks and HP port for the recording datapath
-#   pl_clk1 = 250 MHz : dp_clk  (nvrec_core, nvmeha clk_core, HP0/HP1/HP2, SmartConnects)
-#   pl_clk2 = 200 MHz : src_clk (test pattern generator / user data source, ingest write side)
-#   S_AXI_HP2_FPD (128-bit) : nvrec_core ring writer / reader -> PS DDR (non-coherent)
+#   pl_clk1 = 250 MHz : dp_clk  (nvrec_core, nvmeha clk_core (PG328: <= 250 MHz),
+#                       HP0/HP1 = the SSDs' DMA path to DDR, SmartConnects)
+#   pl_clk2 = 250 MHz : src_clk (test pattern generator / user data source and sink,
+#                       ingest write side, egress read side): nvrec_data_width bits x
+#                       250 MHz = 8.0 GB/s at 256 bits
+#   pl_clk3 = 333 MHz : S_AXI_HP2_FPD only (saxihp2_fpd_aclk; DS925 max for the PS-PL AXI
+#   requested           interfaces): 128 bits x 333 MHz = 5.33 GB/s peak
+#   S_AXI_HP2_FPD (128-bit) : nvrec_core ring writer / reader -> PS DDR (non-coherent),
+#                       through axi_smc_dma (nvrec_data_width @ dp_clk -> 128-bit @ pl_clk3)
+# PLL sources: pl_clk0/1/2 come from the IOPLL (1500 MHz / 15, / 6, / 6), pl_clk3 from the RPLL.
+# The PS clock wizard never exceeds a requested frequency, so it retunes the RPLL to the
+# highest pl_clk3 <= 333 MHz that it can make: 322.19 MHz on the ZCU106 (PSS_REF_CLK
+# 33.330 MHz), 327.77 MHz on the UltraZed-EV (33.333 MHz). With all four on one PLL it would
+# pull dp_clk and src_clk down to 245.8 MHz, hence the explicit SRCSEL (as fpga-drive-recorder).
+# The HP2 request is a variable so that it can be lowered (300, 250) if timing does not close.
+if {![info exists nvrec_hp2_mhz]} { set nvrec_hp2_mhz 333 }
 set_property -dict [list CONFIG.PSU__FPGA_PL1_ENABLE {1} \
+  CONFIG.PSU__CRL_APB__PL1_REF_CTRL__SRCSEL {IOPLL} \
   CONFIG.PSU__CRL_APB__PL1_REF_CTRL__FREQMHZ {250} \
   CONFIG.PSU__FPGA_PL2_ENABLE {1} \
-  CONFIG.PSU__CRL_APB__PL2_REF_CTRL__FREQMHZ {200} \
+  CONFIG.PSU__CRL_APB__PL2_REF_CTRL__SRCSEL {IOPLL} \
+  CONFIG.PSU__CRL_APB__PL2_REF_CTRL__FREQMHZ {250} \
+  CONFIG.PSU__FPGA_PL3_ENABLE {1} \
+  CONFIG.PSU__CRL_APB__PL3_REF_CTRL__SRCSEL {RPLL} \
+  CONFIG.PSU__CRL_APB__PL3_REF_CTRL__FREQMHZ $nvrec_hp2_mhz \
   CONFIG.PSU__USE__S_AXI_GP4 {1} \
   CONFIG.PSU__SAXIGP4__DATA_WIDTH {128}] [get_bd_cells zynq_ultra_ps_e_0]
 
@@ -427,9 +448,9 @@ if {$dual_design} {
 # FPGA Drive NVMe offload recorder (nvrec)
 # ##########################################################
 #
-#  user_data_source (src_clk)        nvrec_core_0 (dp_clk)                    nvmeha_0 (AMD NVMe
-#  [fdrec_tpg] --AXIS 128b--> [ingest -> ring writer] --AXI4--> axi_smc_dma -> S_AXI_HP2_FPD -> DDR
-#                             [cmd builder] --SQE AXIS 512b--> S_AXIS    Host Accelerator)
+#  user_data_source (src_clk 250)    nvrec_core_0 (dp_clk 250)                nvmeha_0 (AMD NVMe
+#  [fdrec_tpg] --AXIS DWb--> [ingest -> ring writer] --AXI4 DWb--> axi_smc_dma --128b @ pl_clk3-->
+#                             [cmd builder] --SQE AXIS 512b--> S_AXIS    S_AXI_HP2_FPD -> DDR)
 #                             [cq router]   <--CQE AXIS 128b-- M_AXIS
 #                             [dbmon] <--- M_AXI_SSD (doorbells) ; m_axi_db -> smc_db -> smc_bar_0/1 -> xdma_N/S_AXI_B
 #  user_data_sink  <-- egress FIFO <-- [ring reader] (playback)
@@ -439,6 +460,10 @@ if {$dual_design} {
 #  PS:       M_AXI_HPM0_FPD -> periph_intercon_0 -> nvrec_core_0 regs,
 #            nvmeha_guard (AXI-Lite timeout guard) -> nvmeha_0 S_AXI_LITE,
 #            and (through smc_bar_0) xdma_0/S_AXI_B; M_AXI_HPM1_FPD -> periph_intercon_1 -> smc_bar_1
+#
+# DWb = nvrec_data_width bits (256 on the reference designs: 8.0 GB/s from the
+# source and into the sink). The HP2 port (128 bits x pl_clk3: 5.16 GB/s peak on
+# the ZCU106, 5.24 GB/s on the UltraZed-EV) is the ring's DDR-side ceiling.
 #
 # The user_data_source / user_data_sink hierarchies are the documented
 # insertion points for a customer's own data source / sink.
@@ -466,10 +491,21 @@ proc nvrec_map {space slave_seg offset range} {
   }
 }
 
-# Actual PL clock frequencies
+# Actual PL clock frequencies (the PS PLLs may not hit the requested values exactly)
 set dp_clk_hz  [expr {int(round([get_property CONFIG.FREQ_HZ [get_bd_pins zynq_ultra_ps_e_0/pl_clk1]]))}]
 set src_clk_hz [expr {int(round([get_property CONFIG.FREQ_HZ [get_bd_pins zynq_ultra_ps_e_0/pl_clk2]]))}]
-puts "INFO: nvrec dp_clk (pl_clk1) = $dp_clk_hz Hz, src_clk (pl_clk2) = $src_clk_hz Hz"
+set hp2_clk_hz [expr {int(round([get_property CONFIG.FREQ_HZ [get_bd_pins zynq_ultra_ps_e_0/pl_clk3]]))}]
+puts "INFO: nvrec dp_clk (pl_clk1) = $dp_clk_hz Hz, src_clk (pl_clk2) = $src_clk_hz Hz, hp2 (pl_clk3) = $hp2_clk_hz Hz, DATA_WIDTH = $nvrec_data_width"
+# dp_clk / src_clk must stay at 250 MHz (nvmeha clk_core limit, source rate): a PLL
+# retune that pulls them off (eg. all PL clocks on one PLL) is a build error
+foreach {name hz} [list dp_clk $dp_clk_hz src_clk $src_clk_hz] {
+  if {abs($hz - 250000000) > 250000} {
+    error "nvrec: $name = $hz Hz, expected 250 MHz (check the PL1/PL2 SRCSEL)"
+  }
+}
+if {$hp2_clk_hz > 333334000} {
+  error "nvrec: pl_clk3 (HP2) = $hp2_clk_hz Hz exceeds the 333 MHz PS-PL interface maximum (DS925)"
+}
 
 # Resets: dp_clk, src_clk, and pl_clk0 (nvmeha AXI-Lite)
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset rst_dp_clk
@@ -492,6 +528,7 @@ create_bd_pin -dir I user_data_source/tpg_seq_rst
 create_bd_pin -dir I -from 31 -to 0 user_data_source/tpg_rate_inc
 create_bd_pin -dir O -from 63 -to 0 user_data_source/tpg_seq_next
 create_bd_cell -type module -reference fdrec_tpg user_data_source/fdrec_tpg_0
+set_property CONFIG.DATA_WIDTH $nvrec_data_width [get_bd_cells user_data_source/fdrec_tpg_0]
 foreach p {src_clk src_resetn tpg_enable tpg_seq_rst tpg_rate_inc tpg_seq_next} {
   connect_bd_net [get_bd_pins user_data_source/$p] [get_bd_pins user_data_source/fdrec_tpg_0/$p]
 }
@@ -510,19 +547,22 @@ foreach p $chk_counters {
   create_bd_pin -dir O -from 63 -to 0 user_data_sink/$p
 }
 create_bd_cell -type module -reference fdrec_check user_data_sink/fdrec_check_0
+set_property CONFIG.DATA_WIDTH $nvrec_data_width [get_bd_cells user_data_sink/fdrec_check_0]
 foreach p [concat {snk_clk snk_resetn chk_enable chk_reset chk_rate_inc} $chk_counters] {
   connect_bd_net [get_bd_pins user_data_sink/$p] [get_bd_pins user_data_sink/fdrec_check_0/$p]
 }
 connect_bd_intf_net [get_bd_intf_pins user_data_sink/S_AXIS] [get_bd_intf_pins user_data_sink/fdrec_check_0/s_axis]
 
 # nvrec_core: ingest/egress FIFOs, ring writer/reader, command builder,
-# completion router, injector, doorbell monitor, AXI-Lite registers
+# completion router, injector, doorbell monitor, AXI-Lite registers.
+# FIFOs by bytes at every width: ingest 256 KB, egress 128 KB (nvrec_params.tcl).
 create_bd_cell -type module -reference nvrec_core nvrec_core_0
-set_property -dict [list CONFIG.SRC_CLK_HZ $src_clk_hz \
+set_property -dict [list CONFIG.DATA_WIDTH $nvrec_data_width \
+  CONFIG.SRC_CLK_HZ $src_clk_hz \
   CONFIG.DP_CLK_HZ $dp_clk_hz \
-  CONFIG.FIFO_DEPTH {4096} \
-  CONFIG.EGR_FIFO_DEPTH {4096} \
-  CONFIG.SLOT_W {10}] [get_bd_cells nvrec_core_0]
+  CONFIG.FIFO_DEPTH $nvrec_ing_fifo_depth \
+  CONFIG.EGR_FIFO_DEPTH $nvrec_egr_fifo_depth \
+  CONFIG.SLOT_W $nvrec_slot_w] [get_bd_cells nvrec_core_0]
 
 connect_bd_intf_net [get_bd_intf_pins user_data_source/M_AXIS] [get_bd_intf_pins nvrec_core_0/s_axis]
 foreach p {tpg_enable tpg_seq_rst tpg_rate_inc tpg_seq_next} {
@@ -572,9 +612,11 @@ connect_bd_intf_net [get_bd_intf_pins nvrec_core_0/m_axis_sqe] [get_bd_intf_pins
 connect_bd_intf_net [get_bd_intf_pins nvmeha_0/M_AXIS] [get_bd_intf_pins nvrec_core_0/s_axis_cqe]
 connect_bd_intf_net [get_bd_intf_pins nvmeha_0/M_AXI_SSD] [get_bd_intf_pins nvrec_core_0/s_axi_db]
 
-# Ring writer / reader -> SmartConnect -> S_AXI_HP2_FPD
+# Ring writer / reader -> SmartConnect -> S_AXI_HP2_FPD. Two clocks: aclk = dp_clk
+# (nvrec_core side, nvrec_data_width bits), aclk1 = pl_clk3 (the HP2 side, 128
+# bits); the SmartConnect does the width and clock conversion.
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect axi_smc_dma
-set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] [get_bd_cells axi_smc_dma]
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1} CONFIG.NUM_CLKS {2}] [get_bd_cells axi_smc_dma]
 connect_bd_intf_net [get_bd_intf_pins nvrec_core_0/m_axi] [get_bd_intf_pins axi_smc_dma/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins axi_smc_dma/M00_AXI] [get_bd_intf_pins zynq_ultra_ps_e_0/S_AXI_HP2_FPD]
 
@@ -620,11 +662,15 @@ set_property CONFIG.NUM_MI [expr {$n_mi + 2}] [get_bd_cells periph_intercon_0]
 connect_bd_intf_net [get_bd_intf_pins periph_intercon_0/${mi_regs}_AXI] [get_bd_intf_pins nvrec_core_0/s_axi]
 connect_bd_intf_net [get_bd_intf_pins periph_intercon_0/${mi_lite}_AXI] [get_bd_intf_pins nvmeha_guard/s_axi]
 
+# HP2 clock: S_AXI_HP2_FPD and the ring SmartConnect's master side only
+connect_bd_net [get_bd_pins zynq_ultra_ps_e_0/pl_clk3] \
+  [get_bd_pins zynq_ultra_ps_e_0/saxihp2_fpd_aclk] \
+  [get_bd_pins axi_smc_dma/aclk1]
+
 # dp_clk domain clocks and resets
 connect_bd_net [get_bd_pins zynq_ultra_ps_e_0/pl_clk1] \
   [get_bd_pins zynq_ultra_ps_e_0/saxihp0_fpd_aclk] \
   [get_bd_pins zynq_ultra_ps_e_0/saxihp1_fpd_aclk] \
-  [get_bd_pins zynq_ultra_ps_e_0/saxihp2_fpd_aclk] \
   [get_bd_pins axi_smc_dma/aclk] \
   [get_bd_pins smc_db/aclk] \
   [get_bd_pins smc_q/aclk] \
@@ -706,6 +752,16 @@ foreach sp {zynq_ultra_ps_e_0/Data nvmeha_guard/m_axi nvmeha_0/Data nvrec_core_0
 }
 
 validate_bd_design
+
+# The ring path after parameter propagation: widths and clocks of the
+# SmartConnect's two sides (it must have both clocks: dp_clk and pl_clk3)
+foreach ip {nvrec_core_0/m_axi axi_smc_dma/S00_AXI axi_smc_dma/M00_AXI zynq_ultra_ps_e_0/S_AXI_HP2_FPD} {
+  set ipin [get_bd_intf_pins $ip]
+  puts "INFO: nvrec $ip DATA_WIDTH [get_property CONFIG.DATA_WIDTH $ipin] FREQ_HZ [get_property CONFIG.FREQ_HZ $ipin]"
+}
+foreach clk {aclk aclk1} {
+  puts "INFO: nvrec axi_smc_dma/$clk <- [get_bd_nets -of_objects [get_bd_pins axi_smc_dma/$clk]]"
+}
 
 # Restore current instance
 current_bd_instance $oldCurInst

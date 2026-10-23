@@ -159,7 +159,7 @@ def save(fig, name):
     print("wrote", out)
 
 
-def legend(ax, x, y):
+def legend(ax, x, y, data_bits=256):
     """Arrow-colour key used by the block diagrams."""
     harrow(ax, x, x + 6.0, y, "", C_LINKARR_FILL, C_LINKARR_EDGE, bh=0.8, hh=1.5,
            hl=1.2)
@@ -171,7 +171,7 @@ def legend(ax, x, y):
             ha="left", va="center", fontsize=7.0, color=TXT)
     harrow(ax, x, x + 6.0, y - 7.2, "", C_USER_FILL, C_USER_EDGE, bh=0.8, hh=1.5,
            hl=1.2)
-    ax.text(x + 7.5, y - 7.2, "AXI4-Stream (data 128 bit, SQE 512, CQE 128)",
+    ax.text(x + 7.5, y - 7.2, "AXI4-Stream (data %d bit, SQE 512, CQE 128)" % data_bits,
             ha="left", va="center", fontsize=7.0, color=TXT)
 
 
@@ -189,13 +189,17 @@ FAMILIES = {
         proc_title="Zynq\nUltraScale+\nPS",
         proc_body="Arm Cortex-A53\n\nLinux (Yocto / EDF)\nnvrec driver\nnvrec / nvplay\n\n"
                   "SSD bring-up,\nrun set-up and\nstatistics only\n\n"
-                  "pl_clk0  100 MHz\npl_clk1  250 MHz\n(dp_clk)\npl_clk2  200 MHz\n(src_clk)",
+                  "pl_clk0  100 MHz\npl_clk1  250 MHz\n(dp_clk)\npl_clk2  250 MHz\n(src_clk)\n"
+                  "pl_clk3  322 / 328 MHz\n(HP2)",
         ddr="PS DDR4",
-        ddr_body="ring (CMA, 256 MB default)\nPRP lists, admin queues",
+        ddr_body="ring (CMA, 512 MB default)\nPRP lists, admin queues",
         ctl_lbl="M_AXI_HPM0_FPD →\nperiph_intercon_0  (AXI-Lite)",
-        smc="axi_smc_dma\n\nto PS port\nS_AXI_HP2_FPD\n128 bit,\nnon-\ncoherent",
+        smc="axi_smc_dma\n256 → 128\nbit\n\nto PS port\nS_AXI_HP2_FPD\n@ pl_clk3,\nnon-\ncoherent",
+        data_bits=256,
+        ing_body="async, 256 KB\nfull → drop + count",
+        egr_body="async, 128 KB,\nlossless",
         dp_clk="dp_clk  250 MHz (pl_clk1)",
-        src_clk="src_clk  200 MHz (pl_clk2)",
+        src_clk="src_clk  250 MHz (pl_clk2)",
         lite_clk="pl_clk0  100 MHz",
         nvmeha_clk="clk_core = dp_clk,  clk_axi_lite = pl_clk0 (100 MHz)",
         smc_db="smc_db",
@@ -228,24 +232,27 @@ FAMILIES = {
         proc_title="Versal\nCIPS",
         proc_body="versal_cips_0\nArm Cortex-A72\n\nLinux (Yocto / EDF)\nnvrec driver\nnvrec / nvplay\n\n"
                   "SSD bring-up,\nrun set-up and\nstatistics only\n\n"
-                  "pl0_ref_clk 250 MHz\npl1_ref_clk 250 MHz\n(dp_clk)\npl2_ref_clk 200 MHz\n(src_clk)\n"
+                  "pl0_ref_clk 250 MHz\npl1_ref_clk 250 MHz\n(dp_clk)\npl2_ref_clk 250 MHz\n(src_clk)\n"
                   "pl3_ref_clk 100 MHz",
         ddr="DDR4 via NoC",
-        ddr_body="axi_noc_0: ring via S09_AXI\n→ MC_2; SSDs via S08_AXI",
+        ddr_body="axi_noc_0 ring: S09_AXI\n512 bit, 14000 MB/s → MC_2\nSSD1: S08 → MC_1\nSSD2: S10 → MC_3",
         ctl_lbl="M_AXI_FPD →\nsmc_m_axi_fpd  (AXI-Lite)",
-        smc="axi_smc_dma\n\nto NoC port\nS09_AXI\n(MC_2),\nnon-\ncoherent",
+        smc="axi_smc_dma\n\nto NoC port\nS09_AXI\n512 bit\n(MC_2),\nnon-\ncoherent",
+        data_bits=512,
+        ing_body="async, 256 KB\nfull → drop + count",
+        egr_body="async, 256 KB,\nlossless",
         dp_clk="dp_clk  250 MHz (pl1_ref_clk)",
-        src_clk="src_clk  200 MHz (pl2_ref_clk)",
+        src_clk="src_clk  250 MHz (pl2_ref_clk)",
         lite_clk="pl3_ref_clk  100 MHz",
         nvmeha_clk="clk_core = dp_clk,  clk_axi_lite = pl3_ref_clk (100 MHz)",
         smc_db=None,
         db_lbl="m_axi_db → smc_m_axi_fpd",
-        smc_q=None,
-        q_lbl="smc_m_axi_bridge M01",
+        smc_q="smc_q",
+        q_lbl="",
         bar_box=("smc_m_axi\n_fpd", "smc_m_axi\n_fpd"),
-        ssd_box=("smc_m_axi\n_bridge", "smc_m_axi\n_bridge"),
+        ssd_box=("smc_m_axi\n_bridge", "smc_m_axi\n_bridge_1"),
         host_lbl=("M_AXI_FPD →\nsmc_m_axi_fpd", "M_AXI_FPD →\nsmc_m_axi_fpd"),
-        nvme_lbl=("NoC S08_AXI", "NoC S08_AXI"),
+        nvme_lbl=("NoC S08_AXI (MC_1)", "NoC S10_AXI (MC_3)"),
         rp_title=("qdma_0  +  qdma_0_support", "qdma_1  +  qdma_1_support"),
         rp_body=("QDMA Subsystem for PCIe\nAXI Bridge, Root Port, Gen4\n\n"
                  "S_AXI_BRIDGE: BAR0 window 0xA800_0000\nM_AXI_BRIDGE: the SSD's DMA",
@@ -256,10 +263,10 @@ FAMILIES = {
         link=("x4 @ 16 GT/s\nFMCP1 DP0–3", "x4 @ 16 GT/s\nFMCP1 DP4–7"),
         irq="QDMA irq → pl_ps_irq0–5 (SPI 84–89);  nvrec_core_0/irq → pl_ps_irq6 (SPI 90);  "
             "nvmeha_0/ha_interrupt → pl_ps_irq7 (SPI 91)",
-        notes="Same nvrec_core_0, nvmeha_0 and nvmeha_guard as the Zynq UltraScale+ designs.  smc_m_axi_fpd and smc_m_axi_bridge "
-              "are ONE SmartConnect each, shared by both root ports.\n"
-              "SSD DMA: qdma_N/M_AXI_BRIDGE → smc_m_axi_bridge → axi_noc_0 S08_AXI (MC_1) → DDR4, or → nvmeha_0/S_AXI_SSD "
-              "(queue window 0x9000_0000).  QDMA control: M_AXI_LPD → smc_m_axi_lpd.\n"
+        notes="Same nvrec_core_0, nvmeha_0 and nvmeha_guard as the Zynq UltraScale+ designs, 512-bit datapath.  smc_m_axi_fpd is ONE "
+              "SmartConnect shared by both root ports.\n"
+              "SSD DMA: qdma_0 → smc_m_axi_bridge → NoC S08_AXI (MC_1), qdma_1 → smc_m_axi_bridge_1 → NoC S10_AXI (MC_3), 7000 MB/s each, "
+              "or → smc_q → nvmeha_0/S_AXI_SSD (queue window 0x9000_0000).  QDMA control: M_AXI_LPD → smc_m_axi_lpd.\n"
               "Doorbells: nvmeha_0/M_AXI_SSD → doorbell monitor → smc_m_axi_fpd (second slave port) → qdma_N/S_AXI_BRIDGE "
               "(BAR0 only).  The PCIe part is the Versal design of fpga-drive-aximm-pcie.",
     ),
@@ -312,10 +319,10 @@ def draw_block(fam):
                "ring reader", "4 KB AXI4 read bursts\nof completed chunks",
                title_fs=7.8, body_fs=6.1, title_dy=1.9, z=3)
     titled_box(ax, fifo_x, rec_y - 4.0, fifo_w, 8.0, C_MAC_FILL, C_MAC_EDGE,
-               "ingest FIFO", "async, 64 KB\nfull → drop + count",
+               "ingest FIFO", s["ing_body"],
                title_fs=7.8, body_fs=6.1, title_dy=1.9, z=3)
     titled_box(ax, fifo_x, ply_y - 4.0, fifo_w, 8.0, C_MAC_FILL, C_MAC_EDGE,
-               "egress FIFO", "async, 64 KB,\nlossless",
+               "egress FIFO", s["egr_body"],
                title_fs=7.8, body_fs=6.1, title_dy=1.9, z=3)
     harrow(ax, fifo_x, rw_x + rw_w, rec_y, "", C_USER_FILL, C_USER_EDGE,
            bh=0.6, hh=1.2, hl=0.8, z=4)
@@ -497,7 +504,7 @@ def draw_block(fam):
             "External to the FPGA\n\n(your own ADC / DAC\nconnects to the user\nhierarchies through\nany free FPGA I/O)",
             ha="center", va="center", fontsize=7.2, color=C_MUTED, linespacing=1.25)
 
-    legend(ax, 136.0, 110.0)
+    legend(ax, 136.0, 110.0, s["data_bits"])
 
     # ---- interrupts and notes strip --------------------------------------------
     titled_box(ax, 2.0, 0.0, 166.0, 11.0, C_CTRL_FILL, C_CTRL_EDGE,
@@ -523,7 +530,7 @@ def path_frame(ax, title, ps_body, data_up):
     vblock(ax, 12.0, 64.0, 70.0, C_LINKARR_FILL, C_LINKARR_EDGE, bw=0.9, hw=1.7,
            hl=1.1)
     titled_box(ax, 2.0, 36.0, 20.0, 28.0, C_PS_FILL, C_PS_EDGE, "PS DDR",
-               "ring: NUM_CHUNKS slots\nof CHUNK_SIZE bytes\n(one CMA region,\n256 MB by default;\n"
+               "ring: NUM_CHUNKS slots\nof CHUNK_SIZE bytes\n(one CMA region,\n512 MB by default;\n"
                "chunk = 1 MB or the\nSSDs' MDTS)\n\nPRP list per slot\n(written once by\nthe driver)",
                title_fs=9.2, body_fs=6.1, title_dy=2.6, lw=1.3)
 
@@ -576,7 +583,7 @@ def core_frame(ax, cdc, side_lbl):
     # clock domains
     line(ax, [(cdc, 66.0), (cdc, 82.0)], C_REFCLK_LINE, lw=1.2, ls=(0, (3, 2)), z=2.5)
     clk_tag(ax, (27.0 + cdc) / 2, 83.6, "dp_clk  250 MHz  (ring, commands, nvmeha clk_core)")
-    clk_tag(ax, (cdc + 168.0) / 2, 83.6, "src_clk  200 MHz  (%s side)" % side_lbl)
+    clk_tag(ax, (cdc + 168.0) / 2, 83.6, "src_clk  250 MHz  (%s side)" % side_lbl)
     line(ax, [(27.0, 82.0), (cdc, 82.0)], C_REFCLK_LINE, lw=1.0)
     line(ax, [(cdc, 82.0), (168.0, 82.0)], C_REFCLK_LINE, lw=1.0, ls=(0, (3, 2)))
 
@@ -589,7 +596,7 @@ def draw_record_path():
     core_frame(ax, 112.0, "source")
 
     titled_box(ax, 27.0, 50.0, 10.0, 16.0, C_MAC_FILL, C_MAC_EDGE, "axi_smc\n_dma",
-               "Smart-\nConnect", title_fs=7.0, body_fs=6.0, title_dy=3.0)
+               "Smart-\nConnect\n\n256 → 128\nbit, to\npl_clk3", title_fs=7.0, body_fs=6.0, title_dy=3.0)
     harrow(ax, 27.0, 22.0, 58.0, "S_AXI_HP2_FPD\nwrite", C_AXARR_FILL, C_AXARR_EDGE,
            bh=1.1, hh=2.0, hl=1.3, fs=5.6, lab_dy=4.0)
     harrow(ax, 46.0, 37.0, 58.0, "", C_AXARR_FILL, C_AXARR_EDGE, bh=0.9, hh=1.7, hl=1.1)
@@ -599,10 +606,10 @@ def draw_record_path():
                "opens a slot only when it is free\nchunk filled = all write\nresponses back",
                title_fs=8.2, body_fs=6.0, title_dy=2.2, z=3)
     titled_box(ax, 96.0, 50.0, 26.0, 16.0, C_MAC_FILL, C_MAC_EDGE, "ingest FIFO",
-               "xpm_fifo_async\n4096 x 128 bit (64 KB)\n\nTREADY held at 1: when full,\n"
+               "xpm_fifo_async\n8192 x 256 bit (256 KB)\n\nTREADY held at 1: when full,\n"
                "the beat is dropped and\ncounted (RUN_DROP_COUNT)",
                title_fs=8.2, body_fs=6.0, title_dy=2.2, z=3)
-    harrow(ax, 96.0, 72.0, 58.0, "AXIS 128b", C_USER_FILL, C_USER_EDGE, bh=0.9, hh=1.7,
+    harrow(ax, 96.0, 72.0, 58.0, "AXIS 256b", C_USER_FILL, C_USER_EDGE, bh=0.9, hh=1.7,
            hl=1.1, fs=5.8, lab_dy=2.6)
 
     titled_box(ax, 46.0, 37.0, 26.0, 10.5, C_MAC_FILL, C_MAC_EDGE, "command builder",
@@ -631,9 +638,10 @@ def draw_record_path():
 
     # source
     titled_box(ax, 140.0, 50.0, 28.0, 16.0, C_USER_FILL, C_USER_EDGE,
-               "user_data_source", "fdrec_tpg (default)\n\nTDATA[63:0] = seq\nTDATA[127:64] = ~seq\n"
+               "user_data_source", "fdrec_tpg (default)\n\n16-byte word k of a beat:\n"
+               "[63:0] = seq + k\n[127:64] = ~(seq + k)\n"
                "rate: TPG_RATE_INC", title_fs=8.4, body_fs=6.2, title_dy=2.4, lw=1.3)
-    harrow(ax, 140.0, 122.0, 58.0, "AXIS 128b", C_USER_FILL, C_USER_EDGE, bh=1.0,
+    harrow(ax, 140.0, 122.0, 58.0, "AXIS 256b", C_USER_FILL, C_USER_EDGE, bh=1.0,
            hh=1.9, hl=1.2, fs=6.0, lab_dy=3.0)
     ax.text(131.0, 53.0, "TREADY = 1\n(ignored)", ha="center", va="center",
             fontsize=5.9, color=C_WARN, linespacing=1.1)
@@ -669,7 +677,7 @@ def draw_play_path():
     core_frame(ax, 112.0, "sink")
 
     titled_box(ax, 27.0, 50.0, 10.0, 16.0, C_MAC_FILL, C_MAC_EDGE, "axi_smc\n_dma",
-               "Smart-\nConnect", title_fs=7.0, body_fs=6.0, title_dy=3.0)
+               "Smart-\nConnect\n\n256 → 128\nbit, to\npl_clk3", title_fs=7.0, body_fs=6.0, title_dy=3.0)
     harrow(ax, 22.0, 27.0, 58.0, "S_AXI_HP2_FPD\nread", C_AXARR_FILL, C_AXARR_EDGE,
            bh=1.1, hh=2.0, hl=1.3, fs=5.6, lab_dy=4.0)
     harrow(ax, 37.0, 46.0, 58.0, "", C_AXARR_FILL, C_AXARR_EDGE, bh=0.9, hh=1.7, hl=1.1)
@@ -679,10 +687,10 @@ def draw_play_path():
                "only when the egress FIFO has\nroom; TLAST on each chunk's\nlast beat",
                title_fs=8.2, body_fs=6.0, title_dy=2.2, z=3)
     titled_box(ax, 96.0, 50.0, 26.0, 16.0, C_MAC_FILL, C_MAC_EDGE, "egress FIFO",
-               "xpm_fifo_async, 64 KB\nlossless: when full, the\nreader waits\n\n"
+               "xpm_fifo_async, 128 KB\n(4096 x 256 bit + TLAST)\nlossless: when full, the\nreader waits\n"
                "EGR_CTRL.FLUSH: accept\nand discard (EGR_DISCARD)",
                title_fs=8.2, body_fs=6.0, title_dy=2.2, z=3)
-    harrow(ax, 72.0, 96.0, 58.0, "AXIS 128b + TLAST", C_USER_FILL, C_USER_EDGE, bh=0.9,
+    harrow(ax, 72.0, 96.0, 58.0, "AXIS 256b + TLAST", C_USER_FILL, C_USER_EDGE, bh=0.9,
            hh=1.7, hl=1.1, fs=5.8, lab_dy=2.6)
 
     titled_box(ax, 46.0, 37.0, 26.0, 10.5, C_MAC_FILL, C_MAC_EDGE, "command builder",
@@ -714,7 +722,7 @@ def draw_play_path():
                "fdrec_check (default), models a DAC:\nTREADY on the ticks of a\nQ1.31 rate throttle (CHK_RATE_INC)\n\n"
                "checks the TPG pattern;\nCHK_ERRORS, CHK_GAPS,\nCHK_UNDERFLOWS",
                title_fs=8.4, body_fs=6.0, title_dy=2.4, lw=1.3)
-    harrow(ax, 122.0, 140.0, 58.0, "AXIS 128b\n+ TLAST", C_USER_FILL, C_USER_EDGE,
+    harrow(ax, 122.0, 140.0, 58.0, "AXIS 256b\n+ TLAST", C_USER_FILL, C_USER_EDGE,
            bh=1.0, hh=1.9, hl=1.2, fs=6.0, lab_dy=4.0)
     route(ax, [(140.0, 53.0), (122.0, 53.0)], C_WARN, lw=1.2)
     ax.text(131.0, 51.4, "TREADY (rate)", ha="center", va="top", fontsize=5.9,

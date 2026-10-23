@@ -16,13 +16,13 @@ The `user_data_source` hierarchy has these pins:
 
 | Pin | Direction | Width | Description |
 |---|---|---|---|
-| `src_clk` | in | 1 | Source clock. PS `pl_clk2` (200 MHz) on Zynq UltraScale+, CIPS `pl2_ref_clk` (200 MHz) on Versal. |
+| `src_clk` | in | 1 | Source clock. PS `pl_clk2` (250 MHz) on Zynq UltraScale+, CIPS `pl2_ref_clk` (250 MHz) on Versal. |
 | `src_resetn` | in | 1 | Active-low reset, synchronous to `src_clk` (from `rst_src_clk`). |
-| `M_AXIS` | out | AXI4-Stream | `TDATA[127:0]`, `TVALID`, `TREADY` (see below). No `TLAST`, `TKEEP` or `TUSER`. |
+| `M_AXIS` | out | AXI4-Stream | `TDATA[255:0]` on the Zynq UltraScale+ targets, `TDATA[511:0]` on `vck190_fmcp1` (the datapath width, see [Data width](#data-width)), `TVALID`, `TREADY` (see below). No `TLAST`, `TKEEP` or `TUSER`. |
 | `tpg_enable` | in | 1 | `TPG_CTRL.ENABLE`, already synchronised to `src_clk`. Optional. |
 | `tpg_seq_rst` | in | 1 | `TPG_CTRL.SEQ_RST` pulse (also held high during a soft reset), synchronous to `src_clk`. Optional. |
 | `tpg_rate_inc` | in | 32 | `TPG_RATE_INC`, synchronous to `src_clk`. Optional. |
-| `tpg_seq_next` | out | 64 | Read back as `TPG_SEQ_NEXT`, sampled in the `src_clk` domain. Tie to 0 if unused. |
+| `tpg_seq_next` | out | 64 | Read back as `TPG_SEQ_NEXT` (the test pattern generator's next word number), sampled in the `src_clk` domain. Tie to 0 if unused. |
 
 `M_AXIS` and all the `tpg_*` signals are in the `src_clk` domain. `nvrec_core` does every
 clock-domain crossing, so your logic only has to deal with `src_clk`.
@@ -31,14 +31,15 @@ clock-domain crossing, so your logic only has to deal with `src_clk`.
 
 The recorder assumes your source **cannot be stalled**, like an ADC:
 
-* Drive `TVALID` high for one `src_clk` cycle for every 128-bit beat you produce.
+* Drive `TVALID` high for one `src_clk` cycle for every beat (256 bits on the Zynq
+  UltraScale+ targets, 512 bits on `vck190_fmcp1`) you produce.
 * `TREADY` is always 1. You can leave it unconnected. Do not wait for it.
 * If the ingest FIFO is full, `nvrec_core` drops the beat and counts it (`RUN_DROP_COUNT`
   while a recording runs). The data is never delayed and never corrupted. A beat is either
   recorded or counted as dropped. A recording is only valid if the drop count is 0, and
   `nvrec` exits with code 2 if it is not.
 * Data is recorded byte-for-byte as it appears on `TDATA`, little-endian: `TDATA[7:0]` is the
-  first byte of each 16-byte beat in the file.
+  first byte of each beat (32 or 64 bytes) in the file.
 * There is no framing on the source side. The ring writer cuts the stream into chunks
   itself, downstream of the drop point. If you need markers in the data (frame starts,
   timestamps, channel numbers), put them in `TDATA`.
@@ -65,36 +66,77 @@ it comes from a pin.
 **Rate limits.** The average input rate must stay below what the rest of the chain can
 sustain, otherwise beats are dropped:
 
-* The fabric datapath: `dp_clk` × 16 B = 4 GB/s (250 MHz `dp_clk`).
-* The SSD (or the RAID0 array) sustained write rate, which is usually much lower. Use
-  `nvbench.sh` to measure it for your board and SSDs.
+* The source interface: one beat per `src_clk` cycle, 250 MHz × 32 B = **8 GB/s** on the
+  Zynq UltraScale+ targets, 250 MHz × 64 B = **16 GB/s** on `vck190_fmcp1`.
+* The fabric datapath: `dp_clk` × the beat, the same 8 or 16 GB/s (250 MHz `dp_clk`).
+  `src_clk` and `dp_clk` run at the same frequency, so a source at one beat every cycle
+  leaves the ingest FIFO no time to drain after a pause of the ring writer.
+* The path into memory: on Versal a 512-bit NoC port for the ring (QoS 14 000 MB/s per
+  direction; the two PCIe Root Ports each have their own NoC port, S08 and S10, at
+  7000 MB/s); on Zynq UltraScale+ the `S_AXI_HP2_FPD` port, 128 bits wide at 322.19 MHz on
+  the ZCU106 and 327.77 MHz on the UltraZed-EV (5.16 / 5.24 GB/s peak; 333 MHz requested),
+  so on those targets the memory port, not the fabric, sets the ceiling. `nvrec --no-write` measures this path on its own,
+  without an SSD (see [Applications](apps.md#fabric-only---no-write)).
+* The SSDs read the ring from the same DDR, so a recording crosses DDR twice; and the SSD
+  (or the RAID0 array) sustained write rate is usually lower still. Use `nvbench.sh` or
+  `nvbench-suite.sh` to measure it for your board and SSDs.
 
-The ingest FIFO (4096 beats, 64 KB) only absorbs short bursts and the ring writer's
-4 KB burst cadence; the ring in DDR (256 MB by default) absorbs the SSDs' write stalls.
-If your source is bursty, its average over a few milliseconds is what matters. You can
-make the FIFO deeper with the `FIFO_DEPTH` parameter of `nvrec_core_0` (a power of 2, in
-128-bit beats, block RAM).
+Measured without an SSD (`nvrec --no-write`, see
+[Benchmarks](benchmarks.md#fabric-only-no-ssd)), the fabric reaches DDR without a dropped beat
+up to **5000 MB/s on `zcu106_hpc0`** (5250 MB/s drops: the HP port delivers 5155 MB/s) and up to
+**14 500 MB/s on `vck190_fmcp1`**, whose datapath is 512 bits wide (14 750 MB/s drops: its ring
+port delivers 14.7 GB/s). `uzev` was not measured (its HP port peaks at 5.24 GB/s). A source
+whose average stays below these rates loses no beat on its way into DDR; whether the SSDs keep
+up is the next question (see [Benchmarks](benchmarks.md#ceilings-at-a-glance)).
+
+The ingest FIFO (256 KB: 8192 beats of 32 bytes on the Zynq UltraScale+ targets, 4096 beats
+of 64 bytes on `vck190_fmcp1`) only absorbs short bursts and the ring writer's 4 KB burst
+cadence (32 µs at 8 GB/s, 16 µs at 16 GB/s); the ring in DDR (512 MB by default) absorbs
+the SSDs' write stalls. If your source is bursty, its average over a few milliseconds is
+what matters. You can make the FIFO deeper with the `FIFO_DEPTH` parameter of
+`nvrec_core_0` (a power of 2, in beats, block RAM); the block-design scripts size it at
+256 KB for every width (`nvrec_ing_fifo_depth` in `Vivado/src/bd/nvrec_params.tcl`).
 
 ## Data width
 
-The stream is 128 bits wide. If your source produces 128-bit words, connect it directly.
+The stream is 256 bits (32 bytes) wide on the Zynq UltraScale+ targets (`zcu106_hpc0`,
+`uzev`) and 512 bits (64 bytes) on the Versal target (`vck190_fmcp1`). The width is the
+`DATA_WIDTH` parameter of `nvrec_core` and of the `fdrec_tpg` / `fdrec_check` modules: 128,
+256 or 512. The block-design scripts set it from one variable, `nvrec_data_width`, which
+`Vivado/src/bd/nvrec_params.tcl` reads from the target's `"data_width"` entry in
+`config/data.json` (default 256; 512 for `vck190_fmcp1`); a `set nvrec_data_width <n>` in the
+Tcl console before the block design is built overrides it. The FIFO depths follow: the
+ingest FIFO is 256 KB at every width, the egress FIFO 128 KB at 128 and 256 bits and 256 KB
+at 512 bits (`"egress_fifo_kb"` overrides it). Software adapts by itself: the driver reads the
+beat size from the `BEAT_BYTES` register (see [Kernel driver](driver.md#beats-and-words)) and
+the file header records it. If your source produces words of the build's width, connect it
+directly.
 
-If your source is narrower, pack its samples into 128-bit beats before `M_AXIS`. There are
-two common ways:
+If your source is narrower, pack its samples into beats of the build's width before
+`M_AXIS`. There are two common ways:
 
 * **AXI4-Stream Data Width Converter** (`axis_dwidth_converter`). Put it in
   `user_data_source` between your source and `M_AXIS`, with the slave side at your width
-  (for example 4 bytes) and the master side at 16 bytes. It collects 4 × 32-bit words into
-  one 128-bit beat. The converter has a `TREADY` input, but `nvrec_core` always drives it
-  high, so the converter never stalls your source.
+  (for example 4 bytes, or 16 bytes for a source written for the 128-bit interface of the
+  previous revision) and the master side at the beat size (32 bytes, or 64 on
+  `vck190_fmcp1`). At 32 bytes it collects 8 × 32-bit words (or 2 × 128-bit words) into one
+  beat, the first one in the lowest bits. The converter has a `TREADY` input, but
+  `nvrec_core` always drives it high, so the converter never stalls your source.
 * **Your own packing logic.** A shift register that collects N samples and pulses `TVALID`
   every Nth sample. This is a few lines of RTL and costs almost nothing.
 
 In both cases the first sample ends up in the lowest bits (`TDATA[W-1:0]`), so it is the first
 in the file. If you stop with a partly filled beat, those samples are not recorded.
 
-If your source is wider than 128 bits, or faster than one beat per `src_clk` cycle, use a
-faster `src_clk` and a width converter, or split the data into 128-bit beats yourself.
+A source that delivers 128-bit words at up to one per `src_clk` cycle (4 GB/s at 250 MHz)
+can also keep a 128-bit interface: build the design with `"data_width": 128`. A 256-bit beat
+per cycle is needed only above 4 GB/s, a 512-bit one above 8 GB/s.
+
+If your source is wider than the build's datapath, or faster than one beat per `src_clk`
+cycle, use a faster `src_clk` and a width converter, or split the data into beats yourself;
+the fabric datapath (8 GB/s at 256 bits, 16 GB/s at 512) and the memory path above still
+bound the average rate (a 512-bit build doubles the fabric datapath, not the memory path of
+the Zynq UltraScale+ targets).
 
 ## What about the TPG controls?
 
@@ -109,8 +151,9 @@ software. Your source can use them however you like, or not at all:
 * Tie `tpg_seq_next` to 0 if you do not have a sample counter. Software only uses it to fill
   in `first_seq` in the file header for TPG recordings.
 
-Note that `nvverify` checks the TPG pattern (a sequence number in the low half and its
-complement in the high half). It cannot verify recordings from your own source. Use
+Note that `nvverify` checks the TPG pattern (16-byte words, each a sequence number in the
+low half and its complement in the high half; a 32-byte beat holds two consecutive words).
+It cannot verify recordings from your own source. Use
 your own tools to check them, and use the drop count (`nvrec` summary, file header
 `drop_count`) to know that no data was lost.
 

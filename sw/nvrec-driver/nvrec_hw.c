@@ -14,6 +14,11 @@
  * injector (every CPU I/O: block device, filesystem), at most
  * NVREC_INJ_CQ_FIFO_DEPTH injected commands outstanding in total. The IP's
  * software queue interface (S_AXI) is not built in.
+ *
+ * Datapath width (register map 1.2): BEAT_BYTES (16, 32 or 64) is read at
+ * probe (0 on a 1.0/1.1 bitstream = its 128-bit datapath, 16) and used for
+ * the source/sink rate conversion; every beat counter is in those beats.
+ * CONFIG.DRY (1.2) runs the fabric side only: no NVMe command is built.
  */
 
 #include <linux/module.h>
@@ -103,6 +108,12 @@ static void ha_wr(struct nvrec_dev *nv, u32 off, u32 v)
 static bool hw_has_guard(struct nvrec_dev *nv)
 {
 	return nv->hw_version >= NVREC_VERSION_1_1;
+}
+
+/* register map 1.2: BEAT_BYTES register, CONFIG.DRY */
+static bool hw_is_1_2(struct nvrec_dev *nv)
+{
+	return nv->hw_version >= NVREC_VERSION_1_2;
 }
 
 /* Latch "Host Accelerator dead": log once, stop touching it, disable the
@@ -320,7 +331,17 @@ int nvrec_hw_probe(struct nvrec_dev *nv)
 			 nv->hw_version >> 16, nv->hw_version & 0xffff);
 	nv->src_clk_hz = core_rd(nv, NVREC_SRC_CLK_HZ);
 	nv->dp_clk_hz = core_rd(nv, NVREC_DP_CLK_HZ);
+	/* bytes per fabric beat: the BEAT_BYTES register of map 1.2; offset
+	 * 0x0BC is unmapped (reads 0) on 1.0/1.1, whose datapath is 128 bits */
+	nv->beat_bytes = hw_is_1_2(nv) ? core_rd(nv, NVREC_BEAT_BYTES_REG) : 0;
+	if (!nv->beat_bytes)
+		nv->beat_bytes = NVREC_BEAT_BYTES_DEFAULT;
+	if (nv->beat_bytes != 16 && nv->beat_bytes != 32 && nv->beat_bytes != 64)
+		return dev_err_probe(dev, -ENODEV,
+				     "unsupported nvrec_core BEAT_BYTES %u (expected 16, 32 or 64)\n",
+				     nv->beat_bytes);
 	nv->fifo_depth = core_rd(nv, NVREC_ING_FIFO_DEPTH);
+	nv->egr_fifo_depth = core_rd(nv, NVREC_EGR_FIFO_DEPTH);
 
 	ret = nvrec_hw_read_cfg(nv);
 	if (ret)
@@ -331,6 +352,8 @@ int nvrec_hw_probe(struct nvrec_dev *nv)
 
 	nv->caps = NVREC_CAP_TPG | NVREC_CAP_RECORD | NVREC_CAP_PLAY |
 		   NVREC_CAP_CHECK | NVREC_CAP_INJECTOR;
+	if (hw_is_1_2(nv))
+		nv->caps |= NVREC_CAP_DRY;
 
 	nv->irq_core = platform_get_irq_byname(pdev, "core");
 	if (nv->irq_core < 0)
@@ -552,16 +575,18 @@ int nvrec_hw_soft_reset(struct nvrec_dev *nv)
 				  !(v & NVREC_GLOBAL_CTRL_SOFT_RST), 1, 10000);
 }
 
+/* rate_bps = INC / 2^31 * SRC_CLK_HZ * BEAT_BYTES (TPG and checker alike) */
 static u64 inc_to_rate(struct nvrec_dev *nv, u64 inc)
 {
 	if (inc > NVREC_TPG_RATE_INC_ONE)
 		inc = NVREC_TPG_RATE_INC_ONE;
-	return mul_u64_u64_div_u64(inc, (u64)nv->src_clk_hz * NVREC_BEAT_BYTES, 1ull << 31);
+	return mul_u64_u64_div_u64(inc, (u64)nv->src_clk_hz * nv->beat_bytes, 1ull << 31);
 }
 
+/* INC = rate_bps * 2^31 / (SRC_CLK_HZ * BEAT_BYTES), capped at one beat per clock */
 static u32 rate_to_inc(struct nvrec_dev *nv, u64 rate_bps)
 {
-	u64 max = (u64)nv->src_clk_hz * NVREC_BEAT_BYTES;
+	u64 max = (u64)nv->src_clk_hz * nv->beat_bytes;
 	u64 inc;
 
 	if (!max)
@@ -604,11 +629,12 @@ u64 nvrec_hw_seq_next(struct nvrec_dev *nv)
 	return core_rd64(nv, NVREC_TPG_SEQ_NEXT_LO);
 }
 
-/* Ring + geometry + run configuration (latched by the hardware at START) */
-static void nvrec_hw_program(struct nvrec_dev *nv, bool play)
+/* Ring + geometry + run configuration (latched by the hardware at START).
+ * A DRY run may have no member (nr_members 0): nothing NVMe is used. */
+static void nvrec_hw_program(struct nvrec_dev *nv, bool play, bool dry)
 {
 	const struct nvrec_geometry *g = &nv->geo;
-	struct nvrec_ssd *s0 = nv->ssd[g->members[0].ssd];
+	struct nvrec_ssd *s0 = g->nr_members ? nv->ssd[g->members[0].ssd] : NULL;
 	u32 cfg = 0, qd = g->qd ? g->qd : 32;
 	unsigned int j;
 
@@ -617,7 +643,7 @@ static void nvrec_hw_program(struct nvrec_dev *nv, bool play)
 	core_wr(nv, NVREC_CHUNK_SIZE, nv->chunk);
 	core_wr64(nv, NVREC_PRP_LIST_BASE_LO, nv->prp_lists_dma);
 	core_wr(nv, NVREC_PRP_LIST_SHIFT, nv->prp_shift);
-	core_wr(nv, NVREC_LBA_SHIFT, s0->lba_shift);
+	core_wr(nv, NVREC_LBA_SHIFT, s0 ? s0->lba_shift : 9);
 	core_wr64(nv, NVREC_START_CHUNK_LO, g->start_chunk);
 	core_wr(nv, NVREC_LENGTH_CHUNKS, g->length_chunks);
 	core_wr(nv, NVREC_LAST_CHUNK_BYTES, play ? g->last_chunk_bytes : 0);
@@ -643,6 +669,8 @@ static void nvrec_hw_program(struct nvrec_dev *nv, bool play)
 		cfg |= NVREC_CONFIG_MODE_PLAY;
 	if (g->flags & NVREC_GEO_FUA)
 		cfg |= NVREC_CONFIG_FUA;
+	if (dry)
+		cfg |= NVREC_CONFIG_DRY;
 	cfg |= (g->nr_members << NVREC_CONFIG_N_MEMBERS_SHIFT) & NVREC_CONFIG_N_MEMBERS_MASK;
 	core_wr(nv, NVREC_CONFIG, cfg);
 }
@@ -652,20 +680,23 @@ static void nvrec_hw_program(struct nvrec_dev *nv, bool play)
  * then the configuration, then START. Record with NVREC_START_TPG: the
  * generator is enabled last, so the first beat it emits (sequence 0) is the
  * first beat recorded. Playback with NVREC_START_CHECK: the checker is reset
- * and enabled before data reaches it.
+ * and enabled before data reaches it. NVREC_START_DRY: CONFIG.DRY, the
+ * fabric side only (no NVMe command, so a dead Host Accelerator is no
+ * obstacle).
  */
 int nvrec_hw_start(struct nvrec_dev *nv, bool play, u32 flags)
 {
+	bool dry = flags & NVREC_START_DRY;
 	int ret;
 	u32 v;
 
-	if (nvrec_hw_ha_dead(nv))
+	if (!dry && nvrec_hw_ha_dead(nv))
 		return -ENOLINK;
 	ret = nvrec_hw_soft_reset(nv);
 	if (ret)
 		return ret;
 	nv->prefill_ns = 0;
-	nvrec_hw_program(nv, play);
+	nvrec_hw_program(nv, play, dry);
 	core_wr(nv, NVREC_IRQ_STATUS, NVREC_IRQ_DONE | NVREC_IRQ_ABORTED |
 		NVREC_IRQ_CMD_ERROR | NVREC_IRQ_OVERFLOW | NVREC_IRQ_UNEXPECTED_CQE);
 	if (play && (flags & NVREC_START_CHECK)) {
@@ -675,7 +706,24 @@ int nvrec_hw_start(struct nvrec_dev *nv, bool play, u32 flags)
 		core_wr(nv, NVREC_CHK_CTRL, 0);
 	}
 	core_wr(nv, NVREC_CTRL, NVREC_CTRL_START);
-	if (play && (flags & NVREC_START_CHECK)) {
+	if (play && dry && (flags & NVREC_START_CHECK)) {
+		/*
+		 * DRY: every chunk counts as completed at START, the reader
+		 * streams the ring at once. Enable the sink once the egress
+		 * FIFO holds half its depth (the reader is running and the
+		 * sink starts with headroom), as fdrec does after priming.
+		 */
+		u32 want = max_t(u32, nv->egr_fifo_depth / 2, 1);
+		unsigned long end = jiffies + msecs_to_jiffies(100);
+		u64 t0 = ktime_get_ns();
+
+		/* ~16-64 us at the fabric rate; 100 ms = something is stuck */
+		while (core_rd(nv, NVREC_EGR_FIFO_LEVEL) < want &&
+		       !nvrec_hw_finished(nv) && time_before(jiffies, end))
+			usleep_range(5, 10);
+		nv->prefill_ns = ktime_get_ns() - t0;
+		core_wr(nv, NVREC_CHK_CTRL, NVREC_CHK_CTRL_ENABLE);
+	} else if (play && (flags & NVREC_START_CHECK)) {
 		/*
 		 * Prefill: the reader streams the chunks IN ORDER, and early
 		 * on the SSD completes them out of order with latency spikes
@@ -721,7 +769,7 @@ bool nvrec_hw_finished(struct nvrec_dev *nv)
 	    (core_rd(nv, NVREC_CHK_CTRL) & NVREC_CHK_CTRL_ENABLE)) {
 		u32 v;
 
-		/* the egress FIFO (64 KB) drains in < 1 ms at >= 100 MB/s:
+		/* the egress FIFO (128 KB) drains in < 2 ms at >= 100 MB/s:
 		 * wait for it here rather than on the next wake-up, so the
 		 * run's end time is exact (callers may be atomic) */
 		if (readl_poll_timeout_atomic(nv->core + NVREC_EGR_FIFO_LEVEL, v,
@@ -754,12 +802,14 @@ int nvrec_hw_stop(struct nvrec_dev *nv, bool abort)
 	nvrec_hw_tpg_enable(nv, false);
 	if (!nvrec_hw_finished(nv))
 		core_wr(nv, NVREC_CTRL, abort ? NVREC_CTRL_ABORT : NVREC_CTRL_STOP);
-	/* a dead Host Accelerator completes nothing: do not wait long */
+	/* a dead Host Accelerator completes nothing: do not wait long
+	 * (a DRY run has no command in flight, it only flushes the writer) */
 	ret = readl_poll_timeout(nv->core + NVREC_STATE, v,
 				 (v & NVREC_STATE_MASK) == NVREC_STATE_DONE ||
 				 (v & NVREC_STATE_MASK) == NVREC_STATE_ABORTED ||
 				 (v & NVREC_STATE_MASK) == NVREC_STATE_IDLE,
-				 100, (nvrec_hw_ha_dead(nv) ? 100 : stop_timeout_ms) * 1000ul);
+				 100, (nvrec_hw_ha_dead(nv) && !nv->run_dry ? 100 :
+				       stop_timeout_ms) * 1000ul);
 	core_wr(nv, NVREC_CHK_CTRL, 0);
 	return ret;
 }

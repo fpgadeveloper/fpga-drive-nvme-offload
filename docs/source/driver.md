@@ -26,6 +26,42 @@ the register map
 | `nvrec_nvme.c` | PCI driver: controller reset/enable, admin queue, Identify, I/O queue creation |
 | `nvrec_blk.c` | blk-mq block devices |
 
+This page describes driver version 1.1 (`modinfo nvrec`), which goes with register map 1.2.
+It also runs a register map 1.1 bitstream (128-bit datapath, no fabric-only mode).
+
+## Beats and words
+
+The fabric datapath is 256 bits wide on the Zynq UltraScale+ targets and 512 bits wide on
+`vck190_fmcp1` (the `DATA_WIDTH` parameter of `nvrec_core` and the `fdrec_*` modules; 128 is
+the other supported width). At probe the driver reads the **beat size** from the
+`BEAT_BYTES` register (register map 1.2): 32 bytes on a 256-bit datapath, 64 on 512 bits,
+16 on 128 bits. On register map 1.0 and
+1.1, whose datapath is 128 bits, the register reads 0 and the driver uses 16. Any other
+value makes the probe fail (`unsupported nvrec_core BEAT_BYTES`). The driver reports the
+beat size in `nvrec_info.beat_bytes`, in the `beat_bytes` sysfs attribute and in its probe
+message, and uses it for the conversion between bytes/s and the generator and sink rate
+registers:
+
+    rate (bytes/s) = RATE_INC / 2^31 x SRC_CLK_HZ x BEAT_BYTES
+
+so the generator's maximum is `src_clk × beat_bytes`: 250 MHz × 32 B = 8000 MB/s on the
+256-bit targets, 250 MHz × 64 B = 16 000 MB/s on `vck190_fmcp1` (3200 MB/s on the 128-bit
+revision). A larger rate is clamped to it.
+
+Two units appear in the counters:
+
+* **Beats** (fabric beats of `beat_bytes` bytes): `drop_count`, `ing_drop_count`,
+  `beats_in`, `beats_out`, the `chk_*` counts (`chk_errors` counts a beat once, whatever
+  number of its words is bad), the FIFO depths and high-water marks.
+* **Words** (16-byte test-pattern words): `seq_next` (`TPG_SEQ_NEXT`), `chk_last_seq`
+  (`CHK_LAST_SEQ`) and `nvrec_start.first_seq`. A 32-byte beat carries two consecutive
+  words (a 64-byte beat four), so the sequence number of its word 0 advances by two (four)
+  per beat. Recordings are
+  therefore byte-identical whatever the datapath width (see [File format](apps.md#file-format)).
+
+`bytes` is in bytes (beats × `beat_bytes`); chunk sizes, LBAs and the ring are unchanged by
+the width: a chunk (64 KB or more) and an LBA (512 bytes or more) are always whole beats.
+
 ## Why the stock nvme driver is kept off the SSDs
 
 An NVMe controller has exactly one owner. Whoever sets `CC.EN` creates the admin queue in its
@@ -98,12 +134,45 @@ For each SSD (`nvrec_nvme.c`, NVMe Base Specification 2.0 §3.5.1):
    own CQ memory) and Create I/O SQ (QID 1, CQID 1), 64 entries, both at the IP's queue window
    `NVREC_QWIN_SQ_BASE/CQ_BASE + ssd × 4 KB`.
 8. That SSD's credit counter in `nvrec_core` is reloaded (`CTRL` bit 6/7, per SSD: the other
-   SSD's commands in flight are not affected), and the block device is added.
+   SSD's commands in flight are not affected).
+9. Autonomous Power State Transitions (APST, see below) are logged and, by default, switched
+   off; the composite temperature is logged; the block device is added.
 
 At platform probe (before any SSD), the driver programs `NVMEHA_SQ1_BASE`/`CQ1_BASE` with the
 queue window, cross-checks the read-back bases of all other queues against the documented
 4 KB stride (a warning names the first mismatch), sets the IP's response-timeout interval and
 enables its interrupts.
+
+### Power states (APST) and temperature
+
+An NVMe drive with **Autonomous Power State Transitions** enabled drops into a deep idle
+power state after some idle time, and waking from it takes tens of milliseconds (a Sabrent
+Rocket 2230 reports 44 ms for its PS4; the fpga-drive-recorder benchmarks saw a 60–64 ms
+write stall shortly after the start of a recording on idle drives with APST on, and none
+with it off). The first chunks of a recording then wait in the ring: a 512 MB ring lasts
+64 ms at 8 GB/s, so a fast recording that starts on an idle drive can drop. The
+stock Linux driver enables APST; `nvrec` never did, so each drive kept its own power-on
+setting. Driver 1.1 reads the setting at probe (Get Features 0x0C) and logs it per SSD:
+
+```
+nvrec-nvme 0000:01:00.0: SSD0: APST enabled by the drive -> disabled (module parameter apst=0)
+nvrec-nvme 0000:01:00.0: SSD0: composite temperature 34 C (warning 82 C, critical 85 C; 0 = not reported)
+```
+
+With the module parameter **`apst=0`** (the default) it switches APST off (Set Features
+APSTE = 0, not saved: the drive's own setting returns at its next power-up); with
+**`apst=1`** it leaves the drive's setting alone. A drive without APST support is logged as
+such. `/sys/block/nvrecXn1/nvrec/apst` reads the current state (`on`, `off` or
+`unsupported`). To change the parameter, add `options nvrec apst=1` to a file in
+`/etc/modprobe.d/` and reboot (the module is loaded at boot, before the SSDs are claimed).
+
+The drive's **composite temperature** comes from its SMART / Health Information log (Get
+Log Page 02h through the admin queue, which is independent of the recording path), read
+when `/sys/block/nvrecXn1/nvrec/temperature` is read, at most once a second. The stock
+`nvme smart-log` cannot reach these drives (they have no `/dev/nvmeX`), so this attribute is
+how a script watches the drives during long recordings (`nvbench-suite.sh` stops a run above
+70 °C). `temperature_warn` and `temperature_crit` are the drive's warning and critical
+composite temperature thresholds (Identify Controller WCTEMP / CCTEMP; 0 = not reported).
 
 ### Queue strategy
 
@@ -144,15 +213,18 @@ context:
 
 `/sys/block/nvrecXn1/nvrec/` holds `ssd_index`, `model`, `serial`, `firmware`, `nsid`,
 `io_path` (`injector`), `nr_io_queues`, `mdts_bytes`, `inflight_cmds`, `pci`,
-`dead`.
+`dead`, and (driver 1.1) `temperature` (composite, °C, read from the drive),
+`temperature_warn`, `temperature_crit` (°C, 0 = not reported) and `apst` (`on`, `off`,
+`unsupported`).
 
 ## Control device `/dev/nvrec`
 
 One process at a time may open it (`-EBUSY` otherwise). The run model:
 
 1. **`NVREC_IOC_SET_RING`** — the ring of `bytes / chunk` slots in PS DDR, 2 to `max_slots`
-   (1024) slots and at most 1 GB (the apps default to 256 MB: 256 MB / chunk slots within
-   256…1024, i.e. 1024 × 256 KB, 512 × 512 KB, 256 × 1 MB). The CMA it takes is the ring plus
+   slots (the hardware slot table: 2048 on the register map 1.2 designs, 1024 on 1.1) and at
+   most 1 GB (the apps default to 512 MB: 512 MB / chunk slots within 256…2048, i.e.
+   2048 × 256 KB, 1024 × 512 KB, 512 × 1 MB). The CMA it takes is the ring plus
    one PRP list per slot (4 KB each up to a 2 MB chunk); see
    [ring size and CMA](apps.md#ring-size-and-cma).
    The hardware addresses slot *s* at `RING_BASE + s × chunk`, so the ring must be **one
@@ -170,12 +242,13 @@ One process at a time may open it (`-EBUSY` otherwise). The run model:
    the command builder (1–63, default 32), FUA. Array chunk *A* goes to member `A mod N` at
    `base_lba + (A div N) × chunk/LBA` — the Linux md RAID0 layout (see
    [Filesystem](filesystem)). The driver checks that the run stays inside every namespace and
-   that all members share one LBA size.
+   that all members share one LBA size. A geometry with **no member** (`nr_members = 0`)
+   is accepted for fabric-only runs only (below).
 3. **`NVREC_IOC_RECORD_START`** (`NVREC_START_TPG`: reset and enable the test pattern
    generator after the recorder is armed) or **`NVREC_IOC_PLAY_START`** (`NVREC_START_CHECK`:
-   reset and enable the checker). Before starting, the page cache of the member block devices
-   is written back and invalidated (the hardware writes behind the block layer); it is
-   invalidated again when the run ends.
+   reset and enable the checker); `NVREC_START_DRY` makes either a fabric-only run. Before
+   starting, the page cache of the member block devices is written back and invalidated (the
+   hardware writes behind the block layer); it is invalidated again when the run ends.
 4. **`NVREC_IOC_WAIT`** / `poll()` until the run has ended (the `nvrec_core` DONE / ABORTED
    interrupt wakes the waiter), **`NVREC_IOC_GET_STATS`** any time, **`NVREC_IOC_STOP`**
    (record: the open chunk is padded to a whole LBA, every command completes) or
@@ -189,6 +262,31 @@ keeps a command could otherwise DMA into memory that was given back.
 Playback with the checker: the sink is enabled only after the ring has been filled (or
 `play_prefill_ms` has passed). The run clock starts when the sink is enabled, so
 `elapsed_ns` is the streaming time; the prefill is reported separately in `prefill_ns`.
+
+### Fabric-only runs (DRY)
+
+With **`NVREC_START_DRY`** (register map 1.2, capability `NVREC_CAP_DRY`) the driver sets
+`CONFIG.DRY` at START and the hardware runs the fabric side alone: no NVMe command is built,
+no SSD and no Host Accelerator register is touched (the CPU command injector keeps working,
+so the block devices stay usable).
+
+* **Record:** the source fills the ring slot by slot through the ingest FIFO and the ring
+  writer, and every slot is released as soon as it is filled. `bytes` is what was written
+  into the ring, `drop_count` the beats the fabric path could not take: the
+  source → ingest FIFO → ring writer → DDR path, measured without any SSD
+  (`nvrec --no-write`).
+* **Playback:** every chunk counts as completed at START, and the ring reader streams chunks
+  0 … `length_chunks − 1` from slot `c mod slots` into the egress FIFO and the sink. With the
+  checker the sink is enabled once the egress FIFO is half full (there is no SSD prefill).
+  Right after a DRY record of `length_chunks = slots`, a DRY playback of `length_chunks =
+  slots` with the same ring plays that recording back: every slot once, in order, sequence
+  numbers continuous — the **ring-resident test** of the ring → egress FIFO → sink path
+  (`nvplay --ring-only`). A longer playback wraps over the same slots and the checker sees
+  the sequence restart.
+
+A DRY run takes a geometry with `nr_members = 0` and a ring set up without any live SSD (such
+a ring serves DRY runs only), and a dead Host Accelerator does not stop it. A DRY start on a
+register map 1.1 bitstream fails with `-EOPNOTSUPP`.
 
 ### When the Host Accelerator stops (evaluation license)
 
@@ -208,16 +306,16 @@ when nothing touches the IP). The driver:
   fails at once with an I/O error, and ends a running recording/playback as
   `NVREC_RUN_FAILED` with `NVREC_STATS_HA_DEAD` in `stats.flags`;
 * reports the state in `nvrec_info.status` (`NVREC_STATUS_HA_DEAD`) and sysfs `ha_dead`;
-  starting a run then fails with `-ENOLINK`, and an SSD that probes after the expiry is not
-  brought up.
+  starting a run then fails with `-ENOLINK` (fabric-only runs still work), and an SSD that
+  probes after the expiry is not brought up.
 
 The system stays up (console, SSH, other devices); only a bitstream reload (power cycle)
 brings the Host Accelerator back. Plan evaluation sessions for less than ~2 h 45 min after
 power-on. A bitstream without the guard (register map 1.0) is accepted with a warning, but an
 expired core then hangs the CPU.
 
-Statistics (`struct nvrec_stats`): run state, `drop_count` = **RUN_DROP_COUNT** (beats
-dropped while the record run accepted data: a recording is valid when it is 0;
+Statistics (`struct nvrec_stats`; units in [Beats and words](#beats-and-words)): run
+state, `drop_count` = **RUN_DROP_COUNT** (beats dropped while the record run accepted data: a recording is valid when it is 0;
 `ing_drop_count` is the ingest FIFO's sticky counter, which keeps counting while the source
 runs on after the run), ingest beats/FIFO high-water, chunks
 filled, commands issued/completed, NVMe errors (with the last failing status/CID),
@@ -273,8 +371,12 @@ in this design, both see the root port BAR windows at the same AXI address).
 (16 bins), `lat_bin0_log2` (bin 0 < 2^this `dp_clk` cycles, bin i = [2^(b0+i-1), 2^(b0+i)); 10),
 `ssd0_inflight_hwm`, `ssd1_inflight_hwm` (per SSD: most commands in flight, of the running
 or the last run, cleared for every SSD slot when a run starts; one file per SSD slot of the IP), `ha_counters` (per SSD: issued, completed, errors of the IP), `src_clk_hz`,
-`dp_clk_hz`, `version`, `ring_slots`, `chunk_bytes`, and the writable `rate_bps` (test pattern
-generator rate) and `tpg_enable`.
+`dp_clk_hz`, `beat_bytes` (bytes per fabric beat), `egr_fifo_depth` (egress FIFO, beats),
+`version` (register map), `ring_slots`, `chunk_bytes`, and the writable `rate_bps` (test
+pattern generator rate, bytes/s) and `tpg_enable`. `fifo_depth` is the ingest FIFO depth in
+beats (256 KB: 8192 × 32 B on the 256-bit targets, 4096 × 64 B on `vck190_fmcp1`;
+`egr_fifo_depth` is 4096 beats on both, 128 KB and 256 KB). The driver version is
+`/sys/module/nvrec/version`.
 
 | parameter | default | meaning |
 |---|---|---|
@@ -282,6 +384,7 @@ generator rate) and `tpg_enable`.
 | `stop_timeout_ms` | 5000 | time allowed for commands in flight at stop/abort |
 | `play_prefill_ms` | 2000 | playback with the checker: the longest wait for the ring to fill before the sink is enabled (0 = no prefill) |
 | `admin_timeout_ms` | 5000 | admin command timeout |
+| `apst` | 0 | NVMe Autonomous Power State Transitions: 0 = switch them off on every SSD at probe, 1 = leave the drive's setting (read-only at run time: set it in `/etc/modprobe.d/`) |
 
 ## Building the module by hand
 

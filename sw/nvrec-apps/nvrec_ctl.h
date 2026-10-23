@@ -29,7 +29,10 @@ extern bool ctl_ha_dead;        /* set by ctl_open() / ctl_run() */
 static inline int ctl_exit_code(void) { return ctl_ha_dead ? NVREC_EXIT_HA_DEAD : 1; }
 void ctl_install_signals(void);
 
-int ctl_open(const char *path, struct nvrec_info *info);
+/* Open /dev/nvrec and read its info (beat_bytes 0 from an old driver -> 16).
+ * fabric_only: a fabric-only (DRY) app, which works with a dead Host
+ * Accelerator too; it also needs NVREC_CAP_DRY (register map >= 1.2). */
+int ctl_open(const char *path, struct nvrec_info *info, bool fabric_only);
 
 /* Fill g->members from a resolved target (disk names -> SSD indices).
  * lba_shift: out, the members' common LBA size. */
@@ -38,12 +41,13 @@ int ctl_members(const struct nvrec_info *info, const struct vol_target *t,
 		char *err, size_t errlen);
 
 /*
- * Ring sizing. Default: 256 MB of slots, i.e. slots = 256 MB / chunk clamped
+ * Ring sizing. Default: 512 MB of slots, i.e. slots = 512 MB / chunk clamped
  * to CTL_RING_MIN_SLOTS .. min(NVREC_RING_MAX_SLOTS, max_slots):
- * 1024 x 256 KB, 512 x 512 KB, 256 x 1 MB (and 256 x 2/4 MB = 512 MB/1 GB).
+ * 2048 x 256 KB, 1024 x 512 KB, 512 x 1 MB, 256 x 2 MB (and 256 x 4 MB =
+ * 1 GB). A 1.1 bitstream (1024 slots) gets 1024 x 256 KB = 256 MB.
  * --buffers N overrides it.
  */
-#define CTL_RING_DEF_BYTES      (256u << 20)
+#define CTL_RING_DEF_BYTES      (512u << 20)
 #define CTL_RING_MIN_SLOTS      256u
 uint32_t ctl_default_slots(uint32_t chunk, uint32_t max_slots);
 
@@ -58,22 +62,25 @@ int ctl_set_ring(int fd, uint32_t chunk, uint32_t slots, struct nvrec_ring *r);
 
 struct ctl_run_opts {
 	double stats;           /* live stats interval, 0 = off */
-	double timeout;         /* abort when no command completes for this long */
+	double timeout;         /* abort when no command completes (DRY: no byte
+				 * moves) for this long */
 	bool quiet;
 	bool play;
+	bool dry;               /* fabric-only run (NVREC_START_DRY) */
 	uint64_t expect_bytes;  /* for the progress percentage */
 };
 
 /* Wait for the run to end (SIGINT/SIGTERM -> STOP), print live stats,
  * return the final statistics. 0 = ended, -ETIMEDOUT = stalled (aborted),
  * -ENOLINK = the Host Accelerator stopped responding (run failed, final
- * statistics valid), other < 0 = ioctl error. */
+ * statistics valid; never for a DRY run), other < 0 = ioctl error. */
 int ctl_run(int fd, const struct nvrec_info *info, const struct ctl_run_opts *o,
 	    struct nvrec_stats *final);
 
 double ctl_cycles_to_us(const struct nvrec_info *info, uint64_t cycles);
+/* dry: a fabric-only run (no command / latency line) */
 void ctl_print_summary(const char *prog, const struct nvrec_info *info,
-		       const struct nvrec_stats *st, double seconds);
+		       const struct nvrec_stats *st, double seconds, bool dry);
 
 /*
  * The machine-readable RESULT line: an app formats its own keys into line[]

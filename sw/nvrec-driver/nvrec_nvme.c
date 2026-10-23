@@ -25,8 +25,16 @@
  *      contiguous, interrupts OFF: the IP watches its own CQ memory) and
  *      Create I/O SQ (qid q+1, CQID q+1), both at the IP's queue window.
  *
- * The admin queue is polled (admin commands are rare: bring-up, teardown),
- * so no MSI/INTx vector of the root port is used by this driver at all.
+ * The admin queue is polled (admin commands are rare: bring-up, teardown,
+ * the SMART temperature on request), so no MSI/INTx vector of the root port
+ * is used by this driver at all.
+ *
+ * After bring-up: Autonomous Power State Transitions (APST) are switched
+ * off (module parameter apst, default 0): a drive that has dropped into a
+ * deep idle state takes tens of ms to wake, which stalls the first chunks
+ * of a recording (the ring is only ~64 ms deep at 8 GB/s). This driver does
+ * not enable APST itself, so the drive's own power-on setting applies when
+ * apst=1. The state before/after is logged per SSD.
  */
 
 #include <linux/module.h>
@@ -46,6 +54,10 @@
 static unsigned int admin_timeout_ms = NVREC_ADMIN_TIMEOUT_MS;
 module_param(admin_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(admin_timeout_ms, "admin command timeout (ms)");
+
+static unsigned int apst;
+module_param(apst, uint, 0444);
+MODULE_PARM_DESC(apst, "NVMe Autonomous Power State Transitions: 0 = switch them off on every SSD at probe (default: a drive waking from a deep idle state stalls the start of a recording), 1 = leave the drive's own setting");
 
 static inline u32 bar_rd(struct nvrec_ssd *s, u32 off)
 {
@@ -209,6 +221,9 @@ static int nvrec_identify_all(struct nvrec_ssd *s)
 			id[512] & 0xf, id[513] & 0xf);
 		return -EINVAL;
 	}
+	s->apsta = id[265] & 1;
+	s->wctemp_k = get_unaligned_le16(id + 266);
+	s->cctemp_k = get_unaligned_le16(id + 268);
 	s->nn = get_unaligned_le32(id + 516);
 	s->dsm = get_unaligned_le16(id + 520) & (1u << 2);
 	s->vwc = id[525] & 1;
@@ -422,6 +437,116 @@ static int nvrec_ctrl_init(struct nvrec_ssd *s)
 	return 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* APST and the SMART temperature (admin commands after bring-up)           */
+
+/* Get Features APST (current value): *enabled = APSTE. log_lock held. */
+static int nvrec_apst_read(struct nvrec_ssd *s, bool *enabled)
+{
+	struct nvme_sqe c;
+	u32 res;
+	int ret;
+
+	nvme_sqe_set(&c, NVME_ADM_GET_FEATURES, 0);
+	c.prp1 = cpu_to_le64(s->logbuf_dma);	/* the APST table comes back here */
+	c.cdw10 = cpu_to_le32(NVME_FEAT_APST);	/* SEL 0 = current */
+	ret = nvrec_admin(s, &c, &res);
+	if (!ret)
+		*enabled = res & 1;
+	return ret;
+}
+
+int nvrec_nvme_apst_get(struct nvrec_ssd *s, bool *enabled)
+{
+	int ret;
+
+	if (!s->apsta)
+		return -EOPNOTSUPP;
+	mutex_lock(&s->log_lock);
+	ret = nvrec_apst_read(s, enabled);
+	mutex_unlock(&s->log_lock);
+	return ret;
+}
+
+/* Log the drive's APST state and, with apst=0, switch APST off (Set
+ * Features APSTE = 0 with an all-zero table, not saved: the drive's own
+ * setting returns at its next power-up). Failures are only logged. */
+static void nvrec_apst_setup(struct nvrec_ssd *s)
+{
+	struct device *dev = &s->pdev->dev;
+	bool before, after;
+	struct nvme_sqe c;
+	int ret;
+
+	if (!s->apsta) {
+		dev_info(dev, "SSD%u: APST not supported by the drive\n", s->index);
+		return;
+	}
+	mutex_lock(&s->log_lock);
+	ret = nvrec_apst_read(s, &before);
+	if (ret) {
+		dev_warn(dev, "SSD%u: Get Features APST failed (%d): APST state unknown\n",
+			 s->index, ret);
+		goto out;
+	}
+	if (apst || !before) {
+		dev_info(dev, "SSD%u: APST %s (the drive's setting%s)\n", s->index,
+			 before ? "enabled" : "disabled",
+			 apst ? ", module parameter apst=1" : "");
+		goto out;
+	}
+	memset(s->logbuf, 0, NVME_APST_TABLE_BYTES);
+	nvme_sqe_set(&c, NVME_ADM_SET_FEATURES, 0);
+	c.prp1 = cpu_to_le64(s->logbuf_dma);
+	c.cdw10 = cpu_to_le32(NVME_FEAT_APST);	/* SV = 0: not saved */
+	c.cdw11 = 0;				/* APSTE = 0 */
+	ret = nvrec_admin(s, &c, NULL);
+	if (!ret)
+		ret = nvrec_apst_read(s, &after);
+	if (ret)
+		dev_warn(dev, "SSD%u: APST enabled by the drive; switching it off failed (%d)\n",
+			 s->index, ret);
+	else
+		dev_info(dev, "SSD%u: APST enabled by the drive -> %s (module parameter apst=0)\n",
+			 s->index, after ? "STILL ENABLED" : "disabled");
+out:
+	mutex_unlock(&s->log_lock);
+}
+
+/* Composite temperature from the SMART / Health Information log (Get Log
+ * Page 02h, controller-wide); read from the drive at most once a second */
+int nvrec_nvme_temperature(struct nvrec_ssd *s, int *temp_c)
+{
+	struct nvme_sqe c;
+	int ret = 0;
+	u16 k;
+
+	mutex_lock(&s->log_lock);
+	if (s->temp_jiffies && time_before(jiffies, s->temp_jiffies + HZ)) {
+		*temp_c = s->temp_c;
+		goto out;
+	}
+	nvme_sqe_set(&c, NVME_ADM_GET_LOG_PAGE, 0);
+	c.nsid = cpu_to_le32(NVME_NSID_ALL);
+	c.prp1 = cpu_to_le64(s->logbuf_dma);
+	c.cdw10 = cpu_to_le32(NVME_LOG_SMART | ((512 / 4 - 1) << 16));	/* NUMDL */
+	memset(s->logbuf, 0, 512);
+	ret = nvrec_admin(s, &c, NULL);
+	if (ret)
+		goto out;
+	k = get_unaligned_le16((u8 *)s->logbuf + 1);	/* bytes 2:1, kelvin */
+	if (!k) {
+		ret = -ENODATA;
+		goto out;
+	}
+	s->temp_c = (int)k - 273;
+	s->temp_jiffies = jiffies;
+	*temp_c = s->temp_c;
+out:
+	mutex_unlock(&s->log_lock);
+	return ret;
+}
+
 /* Fatal controller error: stop all DMA, fail outstanding block I/O */
 void nvrec_nvme_kill(struct nvrec_ssd *s, const char *why)
 {
@@ -451,6 +576,8 @@ static void nvrec_ssd_free(struct nvrec_ssd *s)
 
 	if (s->idbuf)
 		dma_free_coherent(dev, SZ_4K, s->idbuf, s->idbuf_dma);
+	if (s->logbuf)
+		dma_free_coherent(dev, SZ_4K, s->logbuf, s->logbuf_dma);
 	if (s->asq)
 		dma_free_coherent(dev, NVREC_AQ_DEPTH * sizeof(*s->asq), s->asq, s->asq_dma);
 	if (s->acq)
@@ -482,6 +609,7 @@ static int nvrec_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	s->index = index;
 	s->state = NVREC_SSD_FAILED;
 	mutex_init(&s->admin_lock);
+	mutex_init(&s->log_lock);
 	spin_lock_init(&s->inj_lock);
 	atomic_set(&s->inflight, 0);
 	snprintf(s->disk_name, sizeof(s->disk_name), NVREC_DISK_PREFIX "%un1", index);
@@ -503,7 +631,8 @@ static int nvrec_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	s->asq = dma_alloc_coherent(dev, NVREC_AQ_DEPTH * sizeof(*s->asq), &s->asq_dma, GFP_KERNEL);
 	s->acq = dma_alloc_coherent(dev, NVREC_AQ_DEPTH * sizeof(*s->acq), &s->acq_dma, GFP_KERNEL);
 	s->idbuf = dma_alloc_coherent(dev, SZ_4K, &s->idbuf_dma, GFP_KERNEL);
-	if (!s->asq || !s->acq || !s->idbuf) {
+	s->logbuf = dma_alloc_coherent(dev, SZ_4K, &s->logbuf_dma, GFP_KERNEL);
+	if (!s->asq || !s->acq || !s->idbuf || !s->logbuf) {
 		ret = -ENOMEM;
 		goto err_free;
 	}
@@ -521,6 +650,7 @@ static int nvrec_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = nvrec_ctrl_init(s);
 	if (ret)
 		goto err_detach;
+	nvrec_apst_setup(s);
 
 	s->state = NVREC_SSD_LIVE;
 	pci_set_drvdata(pdev, s);
@@ -534,6 +664,14 @@ static int nvrec_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		 NVME_CAP_STRIDE(s->cap), s->nr_io_queues, s->sw_queues, s->hw_queues,
 		 s->io_path == NVREC_PATH_SWQ ? "the IP software queue" : "the CPU command injector",
 		 s->disk_name);
+	{
+		int t;
+
+		if (!nvrec_nvme_temperature(s, &t))
+			dev_info(dev, "SSD%u: composite temperature %d C (warning %d C, critical %d C; 0 = not reported)\n",
+				 index, t, s->wctemp_k ? (int)s->wctemp_k - 273 : 0,
+				 s->cctemp_k ? (int)s->cctemp_k - 273 : 0);
+	}
 	return 0;
 
 err_queues:

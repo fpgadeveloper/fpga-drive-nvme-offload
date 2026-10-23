@@ -38,6 +38,23 @@
  *      completes) or NVREC_IOC_ABORT.
  *   4. close() aborts a run that is still going and frees the ring.
  *
+ * Beats and words (register map 1.2): the fabric datapath is DATA_WIDTH
+ * bits wide (128, 256 or 512); one transfer is a BEAT of
+ * nvrec_info.beat_bytes = 16, 32 or 64 bytes. Every beat counter of
+ * nvrec_stats (drop_count, beats_in/out, fifo_hwm, fifo_depth, chk_beats,
+ * chk_errors, chk_gap_beats, ...) counts those fabric beats. The test
+ * pattern is defined on 16-byte WORDS (a beat carries beat_bytes / 16 of
+ * them): seq_next, chk_last_seq and nvrec_start.first_seq are word numbers.
+ * Rates (NVREC_IOC_SET_RATE, SET_SINK_RATE) are in bytes/s at any width.
+ *
+ * Fabric-only runs (NVREC_START_DRY, register map 1.2, NVREC_CAP_DRY): no
+ * NVMe command is built, no SSD is touched. A DRY record fills the ring
+ * from the source and releases every slot as soon as it is filled; a DRY
+ * playback streams the ring's slots (chunk c from slot c % slots) to the
+ * sink. A DRY playback of length_chunks = slots right after a DRY record of
+ * length_chunks = slots, with the same ring, plays that recording back: the
+ * ring-resident test of the fabric/DDR path (nvplay --ring-only).
+ *
  * Exactly one process may hold /dev/nvrec open (-EBUSY otherwise).
  */
 
@@ -55,8 +72,13 @@
  * 2: register map 1.1 -- nvrec_info.status (NVREC_STATUS_HA_DEAD),
  *    nvrec_stats.flags / run_fifo_hwm / ing_fifo_hwm / prefill_ns; the
  *    ha_* statistics of nvrec_ssd_stats are no longer read (always 0).
+ * 3: register map 1.2 (driver 1.1) -- nvrec_info.beat_bytes from the
+ *    hardware (16, 32 or 64; beat counters in those beats),
+ *    nvrec_info.egr_fifo_depth, NVREC_START_DRY / NVREC_CAP_DRY,
+ *    nr_members = 0 in NVREC_IOC_SET_GEOMETRY (DRY runs only),
+ *    NVREC_RING_MAX_SLOTS 2048. Same structure layout as 2.
  */
-#define NVREC_API_VERSION               2
+#define NVREC_API_VERSION               3
 
 #define NVREC_DEV_NAME                  "nvrec"         /* /dev/nvrec */
 #define NVREC_DISK_PREFIX               "nvrec"         /* /dev/nvrec<ssd>n1 */
@@ -67,7 +89,9 @@
 #define NVREC_HUGEPAGE                  (2u * 1024 * 1024)
 #define NVREC_MIN_CHUNK                 (64u * 1024)    /* chunk: power of 2 */
 #define NVREC_MAX_CHUNK                 (4u * 1024 * 1024)
-#define NVREC_RING_MAX_SLOTS            1024            /* hardware slot table */
+#define NVREC_RING_MAX_SLOTS            2048            /* largest hardware slot table
+							 * (MAX_SLOTS: 2048 on the 1.2
+							 * designs, 1024 before) */
 #define NVREC_RING_MAX_BYTES            (1ull << 30)
 
 /* struct nvrec_info.caps */
@@ -77,6 +101,8 @@
 #define NVREC_CAP_CHECK                 (1u << 3)   /* fdrec_check sink/checker */
 #define NVREC_CAP_INJECTOR              (1u << 4)   /* CPU command injector */
 #define NVREC_CAP_SWQ                   (1u << 5)   /* IP software queue interface */
+#define NVREC_CAP_DRY                   (1u << 6)   /* fabric-only runs (NVREC_START_DRY),
+						     * register map >= 1.2 */
 
 /* struct nvrec_ssd_info.io_path: how /dev/nvrecXn1 reaches the SSD */
 #define NVREC_PATH_NONE                 0
@@ -122,7 +148,8 @@ struct nvrec_info {
 	__u32 hw_version;       /* nvrec_core VERSION: [31:16] major, [15:0] minor */
 	__u64 src_clk_hz;       /* source clock (TPG, checker) */
 	__u64 dp_clk_hz;        /* datapath clock (latency counters count it) */
-	__u32 beat_bytes;       /* 16 */
+	__u32 beat_bytes;       /* bytes per fabric beat: 16, 32 or 64 (BEAT_BYTES;
+				 * 16 on register map 1.0/1.1) */
 	__u32 fifo_depth;       /* ingest FIFO depth in beats */
 	__u32 caps;             /* NVREC_CAP_* */
 	__u32 nr_ssd;           /* SSD slots in the IP (valid entries of ssd[]) */
@@ -133,7 +160,9 @@ struct nvrec_info {
 	__u32 lat_bin0_log2;    /* latency histogram: bin 0 < 2^this dp_clk cycles */
 	__u32 status;           /* NVREC_STATUS_* */
 	struct nvrec_ssd_info ssd[NVREC_MAX_SSD];
-	__u64 reserved[4];
+	__u32 egr_fifo_depth;   /* egress FIFO depth in beats (API 3) */
+	__u32 reserved0;
+	__u64 reserved[3];
 };
 
 /*
@@ -171,12 +200,13 @@ struct nvrec_member {
  * driver checks that the run stays inside every namespace.
  * Playback: length_chunks != 0; last_chunk_bytes (multiple of the LBA size,
  * 0 = full chunk) trims the last chunk.
+ * nr_members = 0 (API 3): no SSD; such a geometry only starts DRY runs.
  */
 #define NVREC_GEO_UNBOUNDED             (1u << 0)
 #define NVREC_GEO_FUA                   (1u << 1)   /* FUA on every Write */
 
 struct nvrec_geometry {
-	__u32 nr_members;       /* 1 or 2 */
+	__u32 nr_members;       /* 1 or 2 (0: DRY runs only) */
 	__u32 flags;            /* NVREC_GEO_* */
 	__u64 start_chunk;      /* array chunk index of the first chunk */
 	__u32 length_chunks;    /* chunks in the run */
@@ -191,12 +221,15 @@ struct nvrec_geometry {
 #define NVREC_START_TPG                 (1u << 0)   /* record: reset + enable the TPG
 						     * (else leave the source alone) */
 #define NVREC_START_CHECK               (1u << 1)   /* play: reset + enable the checker */
+#define NVREC_START_DRY                 (1u << 2)   /* fabric only (CONFIG.DRY): no NVMe
+						     * command; needs NVREC_CAP_DRY */
 
 /* NVREC_IOC_RECORD_START / NVREC_IOC_PLAY_START */
 struct nvrec_start {
 	__u32 flags;            /* in: NVREC_START_* */
 	__u32 reserved0;
-	__u64 first_seq;        /* out: TPG sequence of the first beat (0 after reset) */
+	__u64 first_seq;        /* out: TPG sequence (16-byte word number) of the
+				 * first word recorded (0 after reset) */
 	__u64 start_time_ns;    /* out: CLOCK_REALTIME at start */
 	__u64 reserved[3];
 };
@@ -238,7 +271,7 @@ struct nvrec_stats {
 				 * data (RUN_DROP_COUNT): pass/fail */
 	__u64 beats_in;         /* beats offered by the source */
 	__u64 beats_out;        /* beats the ring writer took */
-	__u64 seq_next;         /* TPG next sequence number */
+	__u64 seq_next;         /* TPG next sequence number (words) */
 	__u32 fifo_hwm;         /* ingest FIFO high-water while the record run
 				 * accepted data (RUN_FIFO_HWM), beats */
 	__u32 fifo_depth;
@@ -248,7 +281,8 @@ struct nvrec_stats {
 	__u64 cmds_issued;      /* recorder SQEs accepted by the IP */
 	__u64 cmds_done;        /* recorder CQEs received */
 	__u64 chunks_released;  /* slots completed and released in order */
-	__u64 bytes;            /* record: data bytes stored (no padding);
+	__u64 bytes;            /* record: data bytes stored (no padding) = beats
+				 * x beat_bytes; DRY: bytes written into the ring;
 				 * play: bytes streamed to the sink */
 	__u32 pad_bytes;        /* zero bytes added to the last chunk at STOP */
 	__u32 unexpected_cqes;
@@ -270,7 +304,7 @@ struct nvrec_stats {
 	__u64 chk_gaps;
 	__u64 chk_gap_beats;
 	__u64 chk_underflows;
-	__u64 chk_last_seq;
+	__u64 chk_last_seq;     /* word 0 of the last good beat (words) */
 	__u64 ing_drop_count;   /* ingest FIFO drops, sticky, counting on after
 				 * the run (drop_count = RUN_DROP_COUNT) */
 	__u32 flags;            /* NVREC_STATS_* */

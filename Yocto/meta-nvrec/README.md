@@ -8,14 +8,15 @@ Contents:
 
 * `conf/layer.conf` -- the layer definition (scarthgap). It also sets `NVREC_REPO_ROOT`, the
   repository root, from which the recipes take their sources.
-* `recipes-kernel/nvrec-mod/` -- the out-of-tree `nvrec` kernel module (`module.bbclass`;
-  sources `sw/nvrec-driver/` and `include/`), auto-loaded at boot. It binds the
+* `recipes-kernel/nvrec-mod/` -- the out-of-tree `nvrec` kernel module, version 1.1
+  (`module.bbclass`; sources `sw/nvrec-driver/` and `include/`), auto-loaded at boot. It binds the
   `opsero,nvrec` node (nvrec_core + NVMe Host Accelerator), claims the NVMe SSDs behind the
   design's PCIe root ports, exposes `/dev/nvrecXn1` block devices and `/dev/nvrec`. The
   recipe also installs `/etc/modprobe.d/nvrec-blacklist-nvme.conf`, which keeps udev from
   autoloading the stock `nvme` driver (still loadable by hand for reference tests).
-* `recipes-apps/nvrec-apps/` -- `nvrec`, `nvplay`, `nvverify`, `nvbench.sh` and
-  `nvsetup-raid0.sh` (sources `sw/nvrec-apps/` and `include/`). The default target name
+* `recipes-apps/nvrec-apps/` -- `nvrec`, `nvplay`, `nvverify`, `nvregs`, `nvbench.sh`,
+  `nvbench-suite.sh` and `nvsetup-raid0.sh`, version 1.1 (sources `sw/nvrec-apps/` and
+  `include/`). The default target name
   written into recording headers is derived from the generated MACHINE (`nvrec-<target>`).
 * `recipes-apps/speed-tests/` -- the base FPGA Drive FMC design's dd speed tests
   (copied verbatim from `fpga-drive-aximm-pcie`), for reference figures.

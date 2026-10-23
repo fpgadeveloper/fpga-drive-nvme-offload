@@ -6,11 +6,16 @@ SUMMARY = "FPGA Drive NVMe-offload recorder apps: nvrec, nvplay, nvverify, nvreg
 DESCRIPTION = "nvrec records the fabric data stream to a contiguous file on an \
 exFAT volume (single SSD or md RAID0) with the hardware NVMe command path, \
 nvplay plays a recording back into the fabric checker the same way, nvverify \
-checks a recording beat by beat, nvbench.sh sweeps the sustained recording \
+checks a recording word by word, nvbench.sh sweeps the sustained recording \
 rate and nvsetup-raid0.sh prepares the recording volume."
 HOMEPAGE = "https://github.com/fpgadeveloper/fpga-drive-nvme-offload"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
+
+# Released together with the driver (nvrec-mod); 1.1: fabric beat size from
+# the driver (16, 32 or 64 bytes), nvrec --no-write, nvplay --ring-only,
+# nvverify per 16-byte word (nvrec and fdrec files), beat-aware benches.
+PV = "1.1"
 
 # Sources come straight from this repository: sw/nvrec-apps plus the shared
 # headers in include/ (NVREC_REPO_ROOT is set by the layer's layer.conf).
@@ -44,6 +49,6 @@ RDEPENDS:${PN} = "mdadm exfatprogs util-linux-blkdiscard util-linux-wipefs \
                   util-linux-lsblk util-linux-mountpoint util-linux-mount util-linux-umount"
 
 # nvbench-suite.sh (installed by the Makefile's SCRIPTS): the benchmark matrix
-# of docs/source/benchmarks.md (bash, flock, findmnt, fsck.exfat; results in
-# /var/lib/nvbench)
-RDEPENDS:${PN} += "bash util-linux-flock util-linux-findmnt exfatprogs"
+# of docs/source/benchmarks.md (bash, flock, findmnt, fsck.exfat, pkill for
+# the drive temperature guard; results in /var/lib/nvbench)
+RDEPENDS:${PN} += "bash util-linux-flock util-linux-findmnt exfatprogs procps"

@@ -71,10 +71,13 @@ stage) also packs the flashable files into
 `bootimages/fpga-drive-nvme-offload_<target>_yocto-2025-2.zip`.
 
 ```{note}
-The Yocto stage is skipped when the gathered images already exist. After you change the
-driver or the apps in `sw/`, delete `Yocto/<target>/images/linux/` so that the next
-`./build.sh yocto` rebuilds the image with your change (incrementally: the workspace is
-kept).
+The Yocto stage is skipped when the gathered images are up to date. The build runner keeps a
+freshness stamp (content hashes) of everything the image is built from: the XSA, the
+target's bsp, the extra layers, and the repository sources the recipes fetch (`sw/` and
+`include/`). After you change the driver, the apps or the shared headers, the next
+`./build.sh yocto` sees the change and rebuilds the image (incrementally: the workspace is
+kept); `./build.sh status --target <target>` marks a stale image. To force a rebuild anyway:
+`./build.sh clean --stage yocto --target <target>`, then `./build.sh yocto --target <target>`.
 ```
 
 ## How the image is put together
@@ -98,15 +101,16 @@ On top of the EDF defaults, two layers are added:
 
   | Recipe / file | What it adds |
   |---------------|--------------|
-  | `recipes-kernel/nvrec-mod` | the `nvrec.ko` kernel module, built from `sw/nvrec-driver` and `include/`, loaded at boot; `/etc/modprobe.d/nvrec-blacklist-nvme.conf` (`blacklist nvme`) |
-  | `recipes-apps/nvrec-apps` | `nvrec`, `nvplay`, `nvverify`, `nvregs`, `nvbench.sh`, `nvbench-suite.sh`, `nvsetup-raid0.sh`, built from `sw/nvrec-apps` |
+  | `recipes-kernel/nvrec-mod` | the `nvrec.ko` kernel module (version 1.1), built from `sw/nvrec-driver` and `include/`, loaded at boot; `/etc/modprobe.d/nvrec-blacklist-nvme.conf` (`blacklist nvme`) |
+  | `recipes-apps/nvrec-apps` | `nvrec`, `nvplay`, `nvverify`, `nvregs`, `nvbench.sh`, `nvbench-suite.sh`, `nvsetup-raid0.sh` (version 1.1), built from `sw/nvrec-apps` |
   | `recipes-apps/speed-tests` | the base design's dd speed tests |
   | `recipes-kernel/linux/linux-xlnx_%.bbappend` + `nvrec.cfg` | kernel options: `CONFIG_BLK_DEV_NVME=m` (+ `NVME_CORE=m`), `CONFIG_DMA_CMA`, `CONFIG_HUGETLBFS`, `CONFIG_MD_RAID0` (+ `CONFIG_BLK_DEV_MD`), `CONFIG_EXFAT_FS`, `CONFIG_NLS_UTF8` |
   | `recipes-core/images/edf-linux-disk-image.bbappend` | image packages: the module and apps, `mdadm`, `exfatprogs`, `nvme-cli`, `fio`, util-linux tools, and bench tools (`devmem2`, `i2c-tools`, `ethtool`, `iproute2`, `iperf3`, `phytool`, `pciutils`, SSH server) |
 
   The recipes take their sources straight from the repository (`file://sw/...` and
-  `file://include` relative to the repository root), so a change to the driver or the apps
-  is picked up by the next `./build.sh yocto`.
+  `file://include` relative to the repository root), so a change to the driver, the apps or
+  the shared headers in `include/` is picked up by the next `./build.sh yocto` (the build
+  runner hashes every repository source a recipe fetches into its freshness stamp).
 
 ### Why the stock nvme driver is a blacklisted module
 
@@ -131,7 +135,7 @@ CMA pool is 1024M; on `vck190_fmcp1` it is 1536M, as on `zcu106_hpc0`.
 The target-specific arguments come from `BSP_EXTRA_BOOTARGS` in
 `Yocto/bsp/<target>/conf/local.conf.append`. `cma=` sizes the contiguous memory pool from
 which the driver allocates the recording ring (one physically contiguous region; by default
-256 MB of chunks of 1 MB or the MDTS, plus 4 KB of PRP list per chunk; at most 1024 chunks
+512 MB of chunks of 1 MB or the MDTS, plus 4 KB of PRP list per chunk; at most 2048 chunks
 and 1 GB): variable `NVREC_CMA` (1536M on `zcu106_hpc0`
 and `vck190_fmcp1`, 1024M on `uzev`). `NVREC_HUGEPAGES` (default 0) adds
 `hugepagesz=2M hugepages=N` for apps that bring their own ring.
@@ -183,16 +187,25 @@ Then boot:
 
 On the VCK190, U-Boot first prints `FPGA Drive FMC: enabling VADJ (1.5V) via IR38164`
 (see [supported carriers](supported_carriers.md#vck190)). During boot, look for the PCIe
-links, the recorder driver and one line per SSD (ZCU106 with two Samsung 980 PRO; values
-depend on the drives):
+links, the recorder driver and its SSD lines (ZCU106 with two Samsung 980 PRO; values
+depend on the drives; the `nvrec 420010000.nvrec` line is one line, wrapped here):
 
 ```none
 xilinx-xdma-pcie 400000000.axi-pcie: PCIe Link is UP
 xilinx-xdma-pcie 500000000.axi-pcie: PCIe Link is UP
-nvrec 420010000.nvrec: /dev/nvrec: nvrec_core v1.1, src_clk 199980011 Hz, dp_clk 249975006 Hz, FIFO 4096 beats; nvmeha: 2 SSDs x 1 queues (SQ window 0x90000000, CQ window 0x90008000), hardware queues, CPU I/O via the injector
+nvrec 420010000.nvrec: /dev/nvrec: driver 1.1, nvrec_core v1.2, src_clk 249975021 Hz, dp_clk 249975021 Hz,
+  beat 32 bytes, FIFO 8192/4096 beats (ingest/egress), 2048 ring slots, DRY; nvmeha: 2 SSDs x 1 queues
+  (SQ window 0x90000000, CQ window 0x90008000), hardware queues, CPU I/O via the injector
+nvrec-nvme 0000:01:00.0: SSD0: APST enabled by the drive -> disabled (module parameter apst=0)
 nvrec-nvme 0000:01:00.0: SSD0: Samsung SSD 980 PRO 1TB (<serial>, fw 5B2QGXA7): 1953525168 x 512-byte LBAs (1000 GB), MDTS 512 KB, DSTRD 0, 1 I/O queues granted, 0 SW + 1 HW queues in the IP, block I/O via the CPU command injector -> /dev/nvrec0n1
-nvrec-nvme 0001:01:00.0: SSD1: Samsung SSD 980 PRO 1TB (<serial>, fw 5B2QGXA7): ... -> /dev/nvrec1n1
+nvrec-nvme 0000:01:00.0: SSD0: composite temperature 34 C (warning 82 C, critical 85 C; 0 = not reported)
+nvrec-nvme 0001:01:00.0: SSD1: ...
 ```
+
+`driver 1.1, nvrec_core v1.2, beat 32 bytes` identifies this revision (256-bit datapath; the
+512-bit `vck190_fmcp1` shows `beat 64 bytes`);
+[Test the design in Linux](linux_test.md#1-check-the-pcie-links-and-the-ssds) explains every
+field.
 
 No `nvme0n1` appears: the stock driver is not loaded (see above).
 

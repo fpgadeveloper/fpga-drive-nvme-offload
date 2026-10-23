@@ -13,7 +13,7 @@ provides an exFAT filesystem (one contiguous file per recording, copied off the 
 `scp`) and reads the statistics. The data source in the design is a test pattern generator
 that models an ADC and that you can replace with your own logic. Every recording reports the
 number of beats dropped (zero for a valid recording), and the `nvverify` tool checks a
-recorded file beat by beat. Recordings can also be played back into the fabric, where a
+recorded file word by word. Recordings can also be played back into the fabric, where a
 hardware checker (or your own data sink, such as a DAC) consumes them at a set rate.
 
 > **License required.** This design contains the AMD NVMe Host Accelerator, an IP core that
@@ -50,9 +50,10 @@ Important links:
 
 ![Block diagram](docs/source/images/nvrec-block-zynqmp.png)
 
-* 128-bit AXI-Stream datapath; the fabric writes the stream into a ring of chunks in PS DDR
-  (256 MB by default; a chunk is 1 MB, or the drive's maximum transfer size (MDTS) when that
-  is smaller: one chunk is one NVMe command).
+* AXI-Stream datapath at 250 MHz: 256 bits (8 GB/s) on the Zynq UltraScale+ targets, 512 bits
+  (16 GB/s) on the Versal target (128, 256 or 512 bits are build options); the fabric writes
+  the stream into a ring of chunks in PS DDR (512 MB by default; a chunk is 1 MB, or the
+  drive's maximum transfer size (MDTS) when that is smaller: one chunk is one NVMe command).
 * For every filled chunk, fabric logic (`nvrec_core`) builds a 64-byte NVMe Write command and
   hands it to the NVMe Host Accelerator, which queues it and rings the SSD's doorbell. The
   SSD reads the data from DDR by itself. Up to 63 commands are in flight per SSD.
@@ -188,7 +189,7 @@ sudo nvsetup-raid0.sh --single /dev/nvrec0n1
 #    errors, 2 = drops, 1 = error or stall, 5 = Host Accelerator stopped (evaluation license)
 sudo nvrec --rate 1000MB --size 10G /mnt/rec/test.dat
 
-# 3. Verify every beat of the recording
+# 3. Verify every word of the recording
 sudo nvverify /mnt/rec/test.dat
 
 # 4. Play it back into the fabric: the hardware checker consumes it at 1 GB/s and checks

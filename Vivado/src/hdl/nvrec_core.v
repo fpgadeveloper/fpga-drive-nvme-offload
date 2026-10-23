@@ -28,15 +28,27 @@
 //
 // The test pattern generator (fdrec_tpg) and the checker (fdrec_check) live
 // OUTSIDE this module (user_data_source / user_data_sink hierarchies).
+//
+// Datapath width (register map 1.2): DATA_WIDTH = 128, 256 or 512 bits on the
+// source/sink streams, both FIFOs and the ring AXI4 master; one beat =
+// BEAT_BYTES = DATA_WIDTH / 8 bytes (register BEAT_BYTES, 0x0BC). FIFO depths
+// and every beat counter are in beats of that width.
+//
+// CONFIG.DRY (bit 2, latched at START): fabric-only run, no NVMe command.
+// Record: slots are released as soon as they are filled (rel = filled_cnt),
+// the command builder is held off, DRAIN ends when the writer is done.
+// Playback: every chunk counts as completed (the reader streams chunks 0 ..
+// LENGTH_CHUNKS-1 straight from the ring), no Read command is issued.
 
 `timescale 1ns / 1ps
 
 module nvrec_core #(
-  parameter integer SRC_CLK_HZ     = 200000000,
+  parameter integer DATA_WIDTH     = 256,        // 128, 256 or 512
+  parameter integer SRC_CLK_HZ     = 250000000,
   parameter integer DP_CLK_HZ      = 250000000,
-  parameter integer FIFO_DEPTH     = 4096,
-  parameter integer EGR_FIFO_DEPTH = 4096,
-  parameter integer SLOT_W         = 10
+  parameter integer FIFO_DEPTH     = 8192,       // ingest, beats (256 KB @ 256 b)
+  parameter integer EGR_FIFO_DEPTH = 4096,       // egress, beats (128 KB @ 256 b)
+  parameter integer SLOT_W         = 11
 ) (
   (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 src_clk CLK" *)
   (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axis:m_axis_snk, ASSOCIATED_RESET src_resetn" *)
@@ -53,12 +65,12 @@ module nvrec_core #(
   input  wire          dp_resetn,
 
   // Data source stream (src_clk); tready is always 1
-  input  wire [127:0]  s_axis_tdata,
+  input  wire [DATA_WIDTH-1:0]   s_axis_tdata,
   input  wire          s_axis_tvalid,
   output wire          s_axis_tready,
 
   // Playback stream to the data sink (src_clk)
-  output wire [127:0]  m_axis_snk_tdata,
+  output wire [DATA_WIDTH-1:0]   m_axis_snk_tdata,
   output wire          m_axis_snk_tlast,
   output wire          m_axis_snk_tvalid,
   input  wire          m_axis_snk_tready,
@@ -93,8 +105,8 @@ module nvrec_core #(
   output wire [2:0]    m_axi_awprot,
   output wire          m_axi_awvalid,
   input  wire          m_axi_awready,
-  output wire [127:0]  m_axi_wdata,
-  output wire [15:0]   m_axi_wstrb,
+  output wire [DATA_WIDTH-1:0]   m_axi_wdata,
+  output wire [DATA_WIDTH/8-1:0] m_axi_wstrb,
   output wire          m_axi_wlast,
   output wire          m_axi_wvalid,
   input  wire          m_axi_wready,
@@ -109,7 +121,7 @@ module nvrec_core #(
   output wire [2:0]    m_axi_arprot,
   output wire          m_axi_arvalid,
   input  wire          m_axi_arready,
-  input  wire [127:0]  m_axi_rdata,
+  input  wire [DATA_WIDTH-1:0]   m_axi_rdata,
   input  wire [1:0]    m_axi_rresp,
   input  wire          m_axi_rlast,
   input  wire          m_axi_rvalid,
@@ -229,12 +241,24 @@ module nvrec_core #(
   input  wire          ha_dead
 );
 
-  localparam integer CNT_W     = $clog2(FIFO_DEPTH) + 1;
-  localparam integer EGR_CNT_W = $clog2(EGR_FIFO_DEPTH) + 1;
-  localparam integer SYNC_FF   = 4;
-  localparam [31:0]  VERSION   = 32'h0001_0001;   // register map 1.1
-  localparam [31:0]  ID_VALUE  = 32'h4E56_5243;
-  localparam integer MAX_SLOTS = 1 << SLOT_W;
+  localparam integer CNT_W      = $clog2(FIFO_DEPTH) + 1;
+  localparam integer EGR_CNT_W  = $clog2(EGR_FIFO_DEPTH) + 1;
+  localparam integer SYNC_FF    = 4;
+  localparam [31:0]  VERSION    = 32'h0001_0002;   // register map 1.2
+  localparam [31:0]  ID_VALUE   = 32'h4E56_5243;
+  localparam integer MAX_SLOTS  = 1 << SLOT_W;
+  localparam integer BEAT_BYTES = DATA_WIDTH / 8;
+  localparam integer BEAT_SHIFT = (DATA_WIDTH == 512) ? 6 : (DATA_WIDTH == 256) ? 5 : 4;
+
+  generate
+    if (DATA_WIDTH != 128 && DATA_WIDTH != 256 && DATA_WIDTH != 512) begin : g_bad_width
+      DATA_WIDTH_must_be_128_256_or_512 u_param_error ();
+    end
+    // the ring writer's committed-beat arithmetic needs CNT_W >= 10
+    if (FIFO_DEPTH < 512) begin : g_bad_depth
+      FIFO_DEPTH_must_be_at_least_512 u_param_error ();
+    end
+  endgenerate
 
   // ===========================================================================
   // Register bus
@@ -454,12 +478,12 @@ module nvrec_core #(
   assign chk_rate_inc = src_chk_rate_inc;
 
   // Ingest FIFO
-  wire [127:0]     fifo_tdata;
+  wire [DATA_WIDTH-1:0] fifo_tdata;
   wire             fifo_tvalid, fifo_tready;
   wire [63:0]      beats_in, drop_count;
   wire [CNT_W-1:0] fifo_count;
 
-  fdrec_ingest #(.FIFO_DEPTH(FIFO_DEPTH)) u_ingest (
+  fdrec_ingest #(.DATA_WIDTH(DATA_WIDTH), .FIFO_DEPTH(FIFO_DEPTH)) u_ingest (
     .src_clk       (src_clk),
     .src_srst      (src_srst),
     .s_axis_tdata  (s_axis_tdata),
@@ -657,7 +681,7 @@ module nvrec_core #(
   reg         stats_rst;
 
   // latched configuration
-  reg         c_play, c_fua, c_two, c_cpc;
+  reg         c_play, c_fua, c_two, c_cpc, c_dry;
   reg  [3:0]  c_lba_shift;
   reg  [4:0]  c_chunk_shift, c_prp_shift;
   reg  [SLOT_W:0] c_num_chunks;
@@ -678,8 +702,12 @@ module nvrec_core #(
   wire [7:0]  inflight0, inflight1;
   reg         st_done_pulse, st_abort_pulse;
 
+  // DRY: completions (record: slot release) come from the ring writer itself
+  wire [31:0] rel_cnt = c_dry ? filled_cnt : cmp_cnt;
+
   always @(posedge dp_clk) begin
     if (eng_rst) begin
+      c_dry      <= 1'b0;
       state      <= ST_IDLE;
       start_pend <= 1'b0;
       run_start  <= 1'b0;
@@ -698,6 +726,7 @@ module nvrec_core #(
         start_pend    <= 1'b1;
         c_play        <= cfg_reg[0];
         c_fua         <= cfg_reg[1];
+        c_dry         <= cfg_reg[2];
         c_two         <= (cfg_reg[5:4] == 2'd2);
         c_cpc         <= credit_per_cqe_r;
         c_lba_shift   <= (lba_shift_r == 32'd12) ? 4'd12 : 4'd9;
@@ -740,7 +769,7 @@ module nvrec_core #(
         ST_DRAIN: begin
           if (ctrl_wr && wr_data[2]) begin
             run_abort <= 1'b1; state <= ST_ABORTING;
-          end else if (wr_done && all_issued && (cmp_cnt == issued_cnt)) begin
+          end else if (wr_done && (c_dry || (all_issued && (cmp_cnt == issued_cnt)))) begin
             state <= ST_DONE; st_done_pulse <= 1'b1;
           end
         end
@@ -796,9 +825,10 @@ module nvrec_core #(
   wire        final_partial;
   wire [22:0] last_bytes;
   wire [63:0] wr_beats_out, wr_run_beats, wr_full_cycles;
+  wire [63:0] wr_run_bytes = wr_run_beats << BEAT_SHIFT;   // BYTES (record)
   wire [31:0] wr_pad_bytes, wr_bresp_errs;
 
-  nvrec_wr #(.SLOT_W(SLOT_W), .CNT_W(CNT_W), .ADDR_W(64)) u_wr (
+  nvrec_wr #(.DATA_WIDTH(DATA_WIDTH), .SLOT_W(SLOT_W), .CNT_W(CNT_W), .ADDR_W(64)) u_wr (
     .clk           (dp_clk),
     .rst           (eng_rst),
     .start         (run_start && !c_play),
@@ -809,7 +839,7 @@ module nvrec_core #(
     .num_chunks    (c_num_chunks),
     .lba_shift     (c_lba_shift),
     .length_chunks (c_length),
-    .rel_cnt       (cmp_cnt),
+    .rel_cnt       (rel_cnt),
     .fifo_tdata    (fifo_tdata),
     .fifo_tvalid   (fifo_tvalid),
     .fifo_tready   (fifo_tready),
@@ -840,12 +870,12 @@ module nvrec_core #(
     .bresp_errs    (wr_bresp_errs)
   );
 
-  assign m_axi_awsize  = 3'd4;        // 16 bytes per beat
+  assign m_axi_awsize  = BEAT_SHIFT[2:0];   // BEAT_BYTES per beat
   assign m_axi_awburst = 2'b01;       // INCR
   assign m_axi_awcache = 4'b0011;     // normal non-cacheable bufferable
   assign m_axi_awprot  = 3'b000;
-  assign m_axi_wstrb   = 16'hFFFF;
-  assign m_axi_arsize  = 3'd4;
+  assign m_axi_wstrb   = {(DATA_WIDTH/8){1'b1}};
+  assign m_axi_arsize  = BEAT_SHIFT[2:0];
   assign m_axi_arburst = 2'b01;
   assign m_axi_arcache = 4'b0011;
   assign m_axi_arprot  = 3'b000;
@@ -895,7 +925,9 @@ module nvrec_core #(
     .rst             (!dp_resetn),
     .cnt_rst         (srst),
     .start           (run_start),
-    .abort           (run_abort || srst),
+    // DRY: the builder is held off for the whole run (start still clears its
+    // run counters; start has priority over abort in nvrec_cmd)
+    .abort           (run_abort || srst || c_dry),
     .mode_play       (c_play),
     .fua             (c_fua),
     .two_members     (c_two),
@@ -1007,13 +1039,14 @@ module nvrec_core #(
   );
 
   // Ring reader (playback) -> egress FIFO
-  wire [127:0]         rd_tdata;
+  wire [DATA_WIDTH-1:0] rd_tdata;
   wire                 rd_tlast, rd_tvalid, rd_tready;
   wire [EGR_CNT_W-1:0] egr_level;
   wire [63:0]          rd_bytes, egr_beats_in, egr_discard;
   wire [31:0]          rd_rresp_errs;
 
-  nvrec_rd #(.SLOT_W(SLOT_W), .ADDR_W(64), .EGR_DEPTH(EGR_FIFO_DEPTH), .EGR_CNT_W(EGR_CNT_W)) u_rd (
+  nvrec_rd #(.DATA_WIDTH(DATA_WIDTH), .SLOT_W(SLOT_W), .ADDR_W(64), .EGR_DEPTH(EGR_FIFO_DEPTH),
+             .EGR_CNT_W(EGR_CNT_W)) u_rd (
     .clk              (dp_clk),
     .rst              (eng_rst),
     .start            (run_start && c_play),
@@ -1023,7 +1056,7 @@ module nvrec_core #(
     .num_chunks       (c_num_chunks),
     .length_chunks    (c_length),
     .last_chunk_bytes (c_last_bytes),
-    .cmp_cnt          (cmp_cnt),
+    .cmp_cnt          (c_dry ? c_length : cmp_cnt),   // DRY: ring-resident data
     .m_axi_araddr     (m_axi_araddr),
     .m_axi_arlen      (m_axi_arlen),
     .m_axi_arvalid    (m_axi_arvalid),
@@ -1059,13 +1092,13 @@ module nvrec_core #(
     end
   end
 
-  fdrec_egress #(.FIFO_DEPTH(EGR_FIFO_DEPTH)) u_egress (
+  fdrec_egress #(.DATA_WIDTH(DATA_WIDTH), .FIFO_DEPTH(EGR_FIFO_DEPTH)) u_egress (
     .dp_clk        (dp_clk),
     .fifo_rst      (egr_fifo_rst),
     .srst          (!dp_resetn || srst),
     .flush         (egr_flush),
     .s_axis_tdata  (rd_tdata),
-    .s_axis_tkeep  (16'hFFFF),
+    .s_axis_tkeep  ({(DATA_WIDTH/8){1'b1}}),
     .s_axis_tlast  (rd_tlast),
     .s_axis_tvalid (rd_tvalid),
     .s_axis_tready (rd_tready),
@@ -1137,7 +1170,7 @@ module nvrec_core #(
   // ===========================================================================
   // Ring fill / HWM, IRQ
   // ===========================================================================
-  wire [31:0] ring_fill = c_play ? (issued_cnt - rd_cnt) : (opened_cnt - cmp_cnt);
+  wire [31:0] ring_fill = c_play ? (c_dry ? 32'd0 : (issued_cnt - rd_cnt)) : (opened_cnt - rel_cnt);
   reg  [31:0] ring_hwm;
   always @(posedge dp_clk) begin
     if (eng_rst || run_start || (wr_req && (wr_addr == 12'h22C)))
@@ -1226,6 +1259,7 @@ module nvrec_core #(
           12'h0A8: begin rd_data <= egr_beats_in[31:0]; hi_latch <= egr_beats_in[63:32]; end
           12'h0B0: begin rd_data <= egr_discard[31:0];  hi_latch <= egr_discard[63:32]; end
           12'h0B8: rd_data <= egr_level;
+          12'h0BC: rd_data <= BEAT_BYTES;
           // HI halves of the 64-bit counters: the value latched by the last *_LO read
           12'h01C, 12'h02C, 12'h034, 12'h04C, 12'h074, 12'h07C, 12'h084, 12'h08C,
           12'h094, 12'h09C, 12'h0AC, 12'h0B4,
@@ -1280,13 +1314,13 @@ module nvrec_core #(
           12'h21C: rd_data <= unexpected;
           12'h220: begin
                      if (c_play) begin rd_data <= rd_bytes[31:0]; hi_latch <= rd_bytes[63:32]; end
-                     else begin rd_data <= {wr_run_beats[27:0], 4'd0}; hi_latch <= wr_run_beats[59:28]; end
+                     else begin rd_data <= wr_run_bytes[31:0]; hi_latch <= wr_run_bytes[63:32]; end
                    end
           12'h228: rd_data <= ring_fill;
           12'h22C: rd_data <= ring_hwm;
           12'h230: rd_data <= err_last_status;
           12'h234: rd_data <= err_last_cid;
-          12'h238: begin rd_data <= c_play ? rd_cnt : cmp_cnt; hi_latch <= 32'd0; end
+          12'h238: begin rd_data <= c_play ? rd_cnt : rel_cnt; hi_latch <= 32'd0; end
           12'h240: rd_data <= wr_pad_bytes;
           12'h248: begin rd_data <= wr_full_cycles[31:0]; hi_latch <= wr_full_cycles[63:32]; end
           12'h250: begin rd_data <= run_drops[31:0]; hi_latch <= run_drops[63:32]; end

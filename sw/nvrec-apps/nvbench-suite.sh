@@ -8,18 +8,23 @@
 #
 # Method = fpga-drive-recorder's benchmarks (recorder.fpgadrive.com), so the
 # two designs compare line by line:
-#   sustained  32 GB per step, 250 MB/s steps, until the first failing step;
-#              fresh trimmed volume + 60 s idle before every step
-#   glance     4000 MiB rate sweep (250..3000) + confirmations of the top step
-#              (the "highest clean" cells of the recorder's at-a-glance table)
+#   sustained  32 GB per step, --step MB/s steps (250), until --stop-after
+#              (1) consecutive failing steps; fresh trimmed volume + 60 s idle
+#              before every step
+#   glance     4000 MiB rate sweep + confirmations of the top step
 #   burst      10 GB / 40 GB recordings at given rates (or a sweep)
 #   playback   nvplay sweep on a 10 GB recording made at 1000 MB/s, until
 #              the first rate with underflows, + confirmations
-#   Sweeps (sustained, 10 GB burst, playback) run 250 MB/s steps up to the
-#   source maximum and end with one step AT the maximum (3200 MB/s) when it
-#   is not on the grid: ..., 2750, 3000, 3200, as the recorder's sweeps. The
-#   4000 MiB glance sweep ends at 3000 (the recorder's never runs 3200).
-#   gaps       only those final source-max steps (+ the confirmations of
+#   fabric     fabric-only record sweep (nvrec --no-write, 64 GiB per step):
+#              the source -> ring -> DDR path without SSD (register map 1.2)
+#   fabricplay fabric-only ring-resident playback sweep (nvplay --ring-only)
+#   Sweeps run --from/--step/--to up to the source maximum (src_clk x
+#   beat_bytes: 8000 MB/s on the 256-bit designs, 3200 on 128-bit ones) and
+#   end with one step AT the maximum when it is not on the grid. With
+#   --stop-after 2 a sweep goes on past a failing step and ends after two
+#   consecutive failing steps; --confirm repeats the top clean step,
+#   --confirm-fail the first failing step above it.
+#   gaps       only the final source-max steps (+ the confirmations of
 #              playback) for layouts swept before the sweeps ended at the max
 #   cpu        10 GB record + play at 1000 MB/s, /proc/stat deltas + time -p
 #   chunk      chunk-size sweep (128K .. the drives' MDTS) at a fixed rate
@@ -34,22 +39,30 @@
 # is reused for the sweep logic), so a session can stop at the evaluation
 # license limit and continue after a power-cycle with the same command.
 #
-# Ring: nvrec/nvplay's default (256 MB of slots: 1024 x 256 KB, 512 x 512 KB,
-# 256 x 1 MB = the recorder's 32 x 8 MB) unless --buffers is given; chunk and
-# inflight keep --ring-mb constant. Every run stores the ring the app set up
-# (ring_slots, ring_bytes from its RESULT line).
+# Ring: nvrec/nvplay's default (512 MB of slots: 2048 x 256 KB, 1024 x
+# 512 KB, 512 x 1 MB) unless --buffers is given (then in the run ids as
+# /slots=N); chunk and inflight keep --ring-mb constant. Every run stores the
+# ring the app set up (ring_slots, ring_bytes from its RESULT line).
+# --tag <word> is appended to every id (/tag=<word>) for A/B runs of the same
+# steps (MaxPayload, APST, ...).
 # --budget-min stops cleanly before a run that would not finish in time.
+# Drive temperature guard (driver 1.1 sysfs temperature): a run is stopped
+# (SIGINT = a clean stop) when a member drive passes --temp-max (70 C), not
+# stored, and repeated once after the drives cooled to --temp-resume (45 C);
+# a second over-temperature stops the suite (exit 4).
 #
 # Exit codes: 0 = everything asked for is in the results file, 3 = stopped
-# for the time budget (power-cycle and run again), 5 = the Host Accelerator
-# stopped responding (power-cycle and run again), 1 = error, 2 = usage.
+# for the time budget (power-cycle and run again), 4 = drive over
+# temperature twice on one run, 5 = the Host Accelerator stopped responding
+# (power-cycle and run again), 1 = error, 2 = usage.
 
 set -u
 
-VERSION=1
+VERSION=2
 SYS_NVREC=${NVBENCH_SYS_NVREC:-/sys/class/misc/nvrec}
 SYS_BLOCK=${NVBENCH_SYS_BLOCK:-/sys/block}
 SYS_PCI=${NVBENCH_SYS_PCI:-/sys/bus/pci/devices}
+SYS_MODULE=${NVBENCH_SYS_MODULE:-/sys/module/nvrec}
 PROC_STAT=${NVBENCH_PROC_STAT:-/proc/stat}
 DEV_DIR=${NVBENCH_DEV_DIR:-/dev}
 
@@ -60,17 +73,26 @@ BUDGET_MIN=150
 T0_AGO=""
 IDLE=60
 IDLE_SET=0
-VERIFY_MBPS=800
+# nvverify read rate assumed by the budget: measured ~461 MB/s on the ZCU106's
+# Cortex-A53 (10 GiB in ~23 s, 200 GiB in ~8 min), the slowest bench CPU
+VERIFY_MBPS=450
 DRY=0
 LAYOUTS="single1 single2 raid0"
 LAYOUT=""
 FROM=250
 STEP=250
 TO=""
-# the 4000 MiB glance sweep's top: the recorder's at-a-glance sweep runs
-# 250..3000 and never 3200 (its loop stops at 3250 > 3200), so ours ends at
-# 3000 too unless --to is given (apples-to-apples "highest clean" cells)
-GLANCE_TO=3000
+FROM_SET=0
+STEP_SET=0
+STOP_AFTER=1
+CONFIRM_FAIL=0
+PASSES=1
+TAG=""
+SOURCE_FRESH=0
+QD=32
+TEMP_MAX=70
+TEMP_RESUME=45
+TEMP_POLL=10
 SIZE=""
 RATES=""
 CONFIRM=""
@@ -78,7 +100,7 @@ RATE=""
 CHUNKS=""
 QDS="1 2 4 8 16 32 63"
 RUNS=2
-RING_MB=256
+RING_MB=512
 BUFFERS=""
 NOTE=""
 
@@ -89,13 +111,17 @@ Usage: nvbench-suite.sh [options] <command> [command options]
 Commands:
   info                 print the fixture (drives, links, versions) as JSON
   status               list the results file, per test and layout
-  sustained            32 GB sweep: --from --step --to, until the first failure
-  glance               4000 MiB sweep (to $GLANCE_TO unless --to) + --confirm runs
-                       of the top step
+  sustained            32 GB sweep: --from --step --to, until --stop-after
+                       consecutive failing steps (1)
+  glance               4000 MiB sweep + --confirm runs of the top step
   burst                --size (10G) at --rates a,b,.. or a --from/--step sweep
   playback             nvplay sweep of a 10 GB recording + --confirm runs
-                       (sustained, burst and playback sweeps end with a step at
-                       the source maximum: .., 2750, 3000, 3200)
+                       (every sweep ends with a step at the source maximum
+                       when the grid misses it)
+  fabric               fabric only, no SSD, no layout: nvrec --no-write sweep,
+                       --size (64G) per step (needs register map 1.2)
+  fabricplay           fabric only: nvplay --ring-only sweep (ring filled once
+                       per run, --passes playbacks of it)
   cpu                  record + play at --rate (1000) x --runs (2), CPU figures
   chunk                chunk sizes 128K .. the drives' MDTS (max 4M) at --rate (auto)
   inflight             --qds "$QDS" at --rate (auto)
@@ -104,9 +130,10 @@ Commands:
   verify [file]        nvverify a recording (default: the last one)
   all                  the whole matrix for --layouts "$LAYOUTS"
   gaps                 per layout of --layouts, only the source-max steps that
-                       sweeps ending at 3000 missed: sustained 32 GB, burst
-                       10 GB (1 run each), playback (1 + 2 confirmations); runs
-                       them only where the sweep's last grid step passed
+                       sweeps ending at the last 250 MB/s grid step below the
+                       maximum missed (results of suite version 1): sustained
+                       32 GB, burst 10 GB (1 run each), playback (1 + 2
+                       confirmations); only where that grid step passed
 
 Options:
   --layout <l>         single1 (/dev/nvrec0n1), single2 (/dev/nvrec1n1) or
@@ -121,28 +148,53 @@ Options:
                        knows when it powered the board on); default: the
                        kernel's boot time minus 30 s
   --idle <sec>         idle time after preparing a fresh volume (default $IDLE)
-  --from/--step/--to   sweep rates in MB/s (10^6 B/s); --to defaults to (and is
-                       capped at) the generator maximum (src_clk x 16 = 3200);
-                       any requested rate above it runs at the maximum and is
-                       stored with rate_req_mbps = the maximum, rate_capped true;
-                       a sweep whose grid misses --to ends with a step at --to
+  --from/--step/--to   sweep rates in MB/s (10^6 B/s, default $FROM/$STEP); --to
+                       defaults to (and is capped at) the generator maximum
+                       (src_clk x beat_bytes, the clock to the nearest MHz:
+                       8000 at 250 MHz x 32 B); any requested rate above it
+                       runs at the maximum and is stored with rate_req_mbps =
+                       the maximum, rate_capped true; a sweep whose grid misses
+                       --to ends with a step at --to. 'all' uses them too
+                       (default 250/250; its 10 GB burst sweep starts at 500)
+  --stop-after <n>     a sweep ends after n consecutive failing steps (default
+                       $STOP_AFTER: at the first failure)
+  --confirm-fail <n>   extra runs at the first failing step above the top
+                       clean step (default $CONFIRM_FAIL)
+  --tag <word>         appended to every run id (/tag=<word>) and stored: A/B
+                       runs of the same steps (MaxPayload, APST, ...)
+  --qd <n>             NVMe commands in flight per SSD for nvrec / nvplay,
+                       1..63 (default 32); any other value than 32 is in the
+                       run ids (/qd=<n>). Not for 'inflight' (--qds) or the
+                       playback source (always 32)
+  --temp-max <C>       stop a run when a member drive passes this composite
+                       temperature (default $TEMP_MAX, 0 = off; needs the sysfs
+                       temperature of driver 1.1); the run is not stored and is
+                       repeated once after --temp-resume
+  --temp-resume <C>    wait until every member drive is at or below this
+                       before repeating (default $TEMP_RESUME)
   --size <bytes>       recording size (nvrec suffixes); per-command default
   --rates <a,b,..>     sustained, glance, burst, playback: run exactly these
                        rates (MB/s), each once, no stop at a failure, each capped
                        at the source maximum; + --confirm <n> repeats of every
                        listed rate when --confirm is given
   --confirm <n>        extra runs at the top clean step (glance, playback: 2;
-                       sustained, burst: 0); with --rates: at every rate (0)
+                       sustained, burst, fabric, fabricplay: 0); with --rates:
+                       at every rate (0)
   --rate <MB/s|auto>   cpu / chunk / inflight rate; auto = the layout's
-                       highest clean 10 GB burst rate in the results (cap 3000);
-                       longrun: one or more rates, a,b,.. (MB suffix allowed)
+                       highest clean 10 GB burst rate in the results (capped at
+                       the source maximum); longrun: one or more rates, a,b,..
+                       (MB suffix allowed)
   --chunks "<..>"      chunk sizes for 'chunk' (default: 128K, 256K, .. up to the MDTS)
   --qds "<..>"         SSD_MAX_INFLIGHT values for 'inflight' (1..63)
   --runs <n>           cpu: runs per direction (default $RUNS)
   --ring-mb <MB>       chunk/inflight: ring size kept constant (default $RING_MB;
-                       slots = MB / chunk, at most 1024)
-  --buffers <n>        ring slots for every other run (default: the apps'
-                       default, 256 MB of slots)
+                       slots = MB / chunk, at most 2048)
+  --buffers <n>        ring slots for every other run, 2..2048 (default: the
+                       apps' default, 512 MB of slots; in the ids as /slots=n)
+  --passes <n>         fabricplay: playbacks of the ring per run (default $PASSES)
+  --source-fresh       record the 10 GB playback source again (once per layout
+                       in this invocation) even when the one on the volume is
+                       still valid for the layout, chunk and beat size
   --verify-mbps <n>    nvverify read rate assumed by the budget (default $VERIFY_MBPS)
   --note <text>        free text stored with every run
   --dry-run            print the plan (run / skip) without touching anything
@@ -164,8 +216,17 @@ while [ $# -gt 0 ]; do
         --budget-min) BUDGET_MIN="${2:?}"; shift 2 ;;
         --t0-ago) T0_AGO="${2:?}"; shift 2 ;;
         --idle) IDLE="${2:?}"; IDLE_SET=1; shift 2 ;;
-        --from) FROM="${2:?}"; shift 2 ;;
-        --step) STEP="${2:?}"; shift 2 ;;
+        --from) FROM="${2:?}"; FROM_SET=1; shift 2 ;;
+        --step) STEP="${2:?}"; STEP_SET=1; shift 2 ;;
+        --stop-after) STOP_AFTER="${2:?}"; shift 2 ;;
+        --confirm-fail) CONFIRM_FAIL="${2:?}"; shift 2 ;;
+        --tag) TAG="${2:?}"; shift 2
+            case "$TAG" in *[!A-Za-z0-9._-]*) echo "nvbench-suite: --tag: letters, digits, . _ - only" >&2; exit 2 ;; esac ;;
+        --temp-max) TEMP_MAX="${2:?}"; shift 2 ;;
+        --temp-resume) TEMP_RESUME="${2:?}"; shift 2 ;;
+        --passes) PASSES="${2:?}"; shift 2 ;;
+        --source-fresh) SOURCE_FRESH=1; shift ;;
+        --qd) QD="${2:?}"; shift 2 ;;
         --to) TO="${2:?}"; shift 2 ;;
         --size) SIZE="${2:?}"; shift 2 ;;
         --rates) RATES="${2:?}"; shift 2 ;;
@@ -177,7 +238,7 @@ while [ $# -gt 0 ]; do
         --ring-mb) RING_MB="${2:?}"; shift 2 ;;
         --buffers) BUFFERS="${2:?}"; shift 2
             case "$BUFFERS" in ''|*[!0-9]*) usage >&2; exit 2 ;; esac
-            [ "$BUFFERS" -ge 2 ] && [ "$BUFFERS" -le 1024 ] || { echo "nvbench-suite: --buffers must be 2..1024" >&2; exit 2; } ;;
+            [ "$BUFFERS" -ge 2 ] && [ "$BUFFERS" -le 2048 ] || { echo "nvbench-suite: --buffers must be 2..2048" >&2; exit 2; } ;;
         --verify-mbps) VERIFY_MBPS="${2:?}"; shift 2 ;;
         --note) NOTE="${2:?}"; shift 2 ;;
         --dry-run) DRY=1; shift ;;
@@ -187,10 +248,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$CMD" ] || { usage >&2; exit 2; }
+for v in STOP_AFTER CONFIRM_FAIL PASSES TEMP_MAX TEMP_RESUME FROM STEP QD; do
+    case "${!v}" in ''|*[!0-9]*) echo "nvbench-suite: --$(echo "$v" | tr 'A-Z_' 'a-z-') must be a number" >&2; exit 2 ;; esac
+done
+[ "$STOP_AFTER" -ge 1 ] && [ "$STEP" -ge 1 ] && [ "$PASSES" -ge 1 ] || { echo "nvbench-suite: --stop-after, --step and --passes must be >= 1" >&2; exit 2; }
+[ "$QD" -ge 1 ] && [ "$QD" -le 63 ] || { echo "nvbench-suite: --qd must be 1..63" >&2; exit 2; }
 [ -n "$RESULTS" ] || RESULTS=$STATE_DIR/results.jsonl
 LOGDIR=$(dirname "$RESULTS")/logs
 EVENTS=$(dirname "$RESULTS")/events.log
 VOLSTATE=$(dirname "$RESULTS")/volume.state
+PS_STATE=$(dirname "$RESULTS")/playsrc.state
 OUT=$DIR/nvbench.dat
 PLAYSRC=$DIR/playsrc.dat
 
@@ -217,17 +284,18 @@ nap() { [ "$TEST" = 1 ] || sleep "$1"; }
 
 # ---------------------------------------------------------------- fixture
 dev_of() { case "$1" in single1) echo nvrec0n1 ;; single2) echo nvrec1n1 ;; esac; }
-members_of() { case "$1" in single1) echo nvrec0n1 ;; single2) echo nvrec1n1 ;; raid0) echo "nvrec0n1 nvrec1n1" ;; *) die "unknown layout '$1'" ;; esac; }
+members_of() { case "$1" in single1) echo nvrec0n1 ;; single2) echo nvrec1n1 ;; raid0) echo "nvrec0n1 nvrec1n1" ;; fabric) echo "" ;; *) die "unknown layout '$1'" ;; esac; }
 drive_json() { # <nvrecXn1>
     local d=$1 s=$SYS_BLOCK/$1/nvrec pci link=""
     pci=$(rd "$s/pci")
     if [ -n "$pci" ] && [ -e "$SYS_PCI/$pci/current_link_speed" ]; then
         link="$(rd "$SYS_PCI/$pci/current_link_speed") x$(rd "$SYS_PCI/$pci/current_link_width")"
     fi
-    printf '{"dev":%s,"model":%s,"serial":%s,"firmware":%s,"mdts_bytes":%s,"nr_io_queues":%s,"pci":%s,"link":%s}' \
+    printf '{"dev":%s,"model":%s,"serial":%s,"firmware":%s,"mdts_bytes":%s,"nr_io_queues":%s,"pci":%s,"link":%s,"apst":%s,"temperature_warn":%s,"temperature_crit":%s}' \
         "$(jstr "$d")" "$(jstr "$(rd "$s/model")")" "$(jstr "$(rd "$s/serial")")" \
         "$(jstr "$(rd "$s/firmware")")" "$(jnum "$(rd "$s/mdts_bytes")")" \
-        "$(jnum "$(rd "$s/nr_io_queues")")" "$(jstr "$pci")" "$(jstr "$link")"
+        "$(jnum "$(rd "$s/nr_io_queues")")" "$(jstr "$pci")" "$(jstr "$link")" \
+        "$(jstr "$(rd "$s/apst")")" "$(jnum "$(rd "$s/temperature_warn")")" "$(jnum "$(rd "$s/temperature_crit")")"
 }
 serials_of() { local d out=""; for d in $(members_of "$1"); do out="$out+$(rd "$SYS_BLOCK/$d/nvrec/serial")"; done; echo "${out#+}"; }
 mdts_of() { # smallest MDTS of the layout's members
@@ -245,13 +313,22 @@ target_name() {
     # nvrec before --print-target: the default in --help
     nvrec --help 2>&1 | sed -n 's/.*--target <name>.*(default \([^)]*\)).*/\1/p' | head -n1
 }
-# the test-pattern generator's maximum rate: src_clk x 16 bytes/beat, from the
-# driver's sysfs src_clk_hz, a measured value (199980011 for the 200 MHz clock)
-# taken to the nearest MHz: 3200 MB/s on every target, 3200 when the attribute
-# is missing. nvrec/nvplay clamp a higher --rate silently, so the suite caps
-# every requested rate here and records the capped value.
-src_max_mbps() { local c; c=$(rd "$SYS_NVREC/src_clk_hz"); [ -n "$c" ] && [ "$c" -gt 0 ] && echo $(( (c + 500000) / 1000000 * 16 )) || echo 3200; }
+# bytes per fabric beat: the driver's sysfs beat_bytes (driver 1.1: 16, 32 or
+# 64), 16 = the 128-bit datapath of drivers without the attribute
+BEAT=$(rd "$SYS_NVREC/beat_bytes"); case "$BEAT" in ''|*[!0-9]*) BEAT=16 ;; esac
+# the test-pattern generator's maximum rate: src_clk x beat_bytes, from the
+# driver's sysfs src_clk_hz, a measured value (249975021 for the 250 MHz
+# clock of zcu106_hpc0, 199980011 for 200 MHz) taken to the nearest MHz:
+# 250 x 32 = 8000 MB/s on the 256-bit designs, 200 x 16 = 3200 on the 128-bit
+# ones; 250 x BEAT when the attribute is missing. nvrec/nvplay clamp a higher
+# --rate silently (to the true maximum), so the suite caps every requested
+# rate here and records the capped value.
+src_max_mbps() { local c; c=$(rd "$SYS_NVREC/src_clk_hz"); [ -n "$c" ] && [ "$c" -gt 0 ] && echo $(( (c + 500000) / 1000000 * BEAT )) || echo $(( 250 * BEAT )); }
 SRC_MAX=$(src_max_mbps)
+# id suffixes: --buffers (/slots=N), --qd other than 32 (/qd=N), --tag
+# (/tag=word); fab_sfx for the fabric-only runs (no NVMe command, no qd)
+id_sfx() { echo "${BUFFERS:+/slots=$BUFFERS}$([ "$QD" != 32 ] && echo "/qd=$QD")${TAG:+/tag=$TAG}"; }
+fab_sfx() { echo "${BUFFERS:+/slots=$BUFFERS}${TAG:+/tag=$TAG}"; }
 cap_rate() { if [ "$1" -gt "$SRC_MAX" ]; then echo "$SRC_MAX"; else echo "$1"; fi; }
 # cap_id <id> <requested> <capped>: the id's rate=<requested> -> rate=<capped>
 cap_id() { echo "$1" | sed "s#/rate=$2\(/\|\$\)#/rate=$3\1#"; }
@@ -264,10 +341,12 @@ fixture_json() {
             [ -e "$SYS_BLOCK/$d/nvrec" ] && drives="$drives,$(drive_json $d)"
         done
         [ -r /etc/os-release ] && os=$(sed -n 's/^\(BUILD_ID\|VERSION_ID\)=//p' /etc/os-release | tr -d '"' | tr '\n' ' ')
-        FIXTURE_JSON=$(printf '"target":%s,"board":%s,"kernel":%s,"image":%s,"hw_version":%s,"src_clk_hz":%s,"dp_clk_hz":%s,"cpus":%s,"drives":[%s]' \
+        FIXTURE_JSON=$(printf '"target":%s,"board":%s,"kernel":%s,"image":%s,"hw_version":%s,"drv_version":%s,"src_clk_hz":%s,"dp_clk_hz":%s,"beat_bytes":%s,"fifo_depth":%s,"egr_fifo_depth":%s,"apst_param":%s,"cpus":%s,"drives":[%s]' \
             "$(jstr "$(target_name)")" "$(jstr "$(rd /proc/device-tree/model)")" "$(jstr "$(uname -r)")" \
-            "$(jstr "$os")" "$(jstr "$(rd "$SYS_NVREC/version")")" "$(jnum "$(rd "$SYS_NVREC/src_clk_hz")")" \
-            "$(jnum "$(rd "$SYS_NVREC/dp_clk_hz")")" "$(grep -c '^cpu[0-9]' "$PROC_STAT")" "${drives#,}")
+            "$(jstr "$os")" "$(jstr "$(rd "$SYS_NVREC/version")")" "$(jstr "$(rd "$SYS_MODULE/version")")" \
+            "$(jnum "$(rd "$SYS_NVREC/src_clk_hz")")" "$(jnum "$(rd "$SYS_NVREC/dp_clk_hz")")" "$BEAT" \
+            "$(jnum "$(rd "$SYS_NVREC/fifo_depth")")" "$(jnum "$(rd "$SYS_NVREC/egr_fifo_depth")")" \
+            "$(jnum "$(rd "$SYS_MODULE/parameters/apst")")" "$(grep -c '^cpu[0-9]' "$PROC_STAT")" "${drives#,}")
     fi
     printf '%s' "$FIXTURE_JSON"
 }
@@ -300,6 +379,101 @@ ha_check() {
     fi
 }
 
+# ---------------------------------------------------------------- temperature
+# temp_of <layout>: the hottest member drive's composite temperature (C),
+# empty when no member reports one (driver before 1.1, fabric runs)
+temp_of() {
+    local d t max=""
+    [ "$1" = fabric ] && return 0
+    for d in $(members_of "$1"); do
+        t=$(rd "$SYS_BLOCK/$d/nvrec/temperature")
+        case "$t" in ''|*[!0-9-]*) continue ;; esac
+        if [ -z "$max" ] || [ "$t" -gt "$max" ]; then max=$t; fi
+    done
+    echo "$max"
+}
+wnap() { if [ "$TEST" = 1 ]; then sleep 0.1; else sleep "$1"; fi; }
+# cool_wait <layout> [trigger C]: when the hottest member is above the
+# trigger (default --temp-max), wait until every member is at or below
+# --temp-resume (the budget still applies: exit 3 when it runs out while
+# waiting). Before every run with the default trigger; after a temperature
+# stop with --temp-resume as the trigger.
+cool_wait() {
+    local t
+    [ "$TEMP_MAX" -gt 0 ] && [ "$DRY" -eq 0 ] || return 0
+    t=$(temp_of "$1"); [ -n "$t" ] || return 0
+    [ "$t" -gt "${2:-$TEMP_MAX}" ] || return 0
+    say "drives at $t C: waiting for <= $TEMP_RESUME C"
+    while t=$(temp_of "$1"); [ -n "$t" ] && [ "$t" -gt "$TEMP_RESUME" ]; do
+        budget_ok 60
+        wnap 10
+    done
+    say "drives at ${t:-?} C: continuing"
+}
+# temp_watch <layout> <app name> <flag file>: while the flag file exists, the
+# hottest member's temperature every TEMP_POLL (10) s into <flag>.max; above
+# --temp-max: <flag>.over and SIGINT to the app (a clean stop)
+temp_watch() {
+    local t m=""
+    while [ -e "$3" ]; do
+        t=$(temp_of "$1")
+        if [ -n "$t" ]; then
+            if [ -z "$m" ] || [ "$t" -gt "$m" ]; then m=$t; echo "$m" >"$3.max"; fi
+            if [ "$TEMP_MAX" -gt 0 ] && [ "$t" -gt "$TEMP_MAX" ]; then
+                echo "$t" >"$3.over"
+                pkill -INT -x "$2"
+                break
+            fi
+        fi
+        wnap "$TEMP_POLL"
+    done
+}
+# run_app <layout> <log> <cmd...>: run an app (time -p, RC= in its log) with
+# the temperature watch; sets APP_TIME (time -p output), TEMP_START, TEMP_END,
+# TEMP_MAX_SEEN (the hottest sample incl. start and end; C or empty) and
+# TEMP_OVER (C when the run was stopped)
+run_app() {
+    local l=$1 log=$2 flag wpid="" t
+    shift 2
+    flag=$LOGDIR/.tempwatch.$$
+    rm -f "$flag" "$flag.max" "$flag.over"
+    TEMP_START=$(temp_of "$l"); TEMP_END=""; TEMP_MAX_SEEN=""; TEMP_OVER=""
+    if [ -n "$TEMP_START" ]; then
+        : >"$flag"
+        # 9>&-: the watcher (and its sleep, which can outlive a kill of
+        # the subshell by up to TEMP_POLL s) must not hold the suite lock
+        temp_watch "$l" "$1" "$flag" 9>&- &
+        wpid=$!
+    fi
+    APP_TIME=$( { time -p "$@" >"$log" 2>&1; echo "RC=$?" >>"$log"; } 2>&1 )
+    if [ -n "$wpid" ]; then
+        rm -f "$flag"
+        kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+        TEMP_MAX_SEEN=$(cat "$flag.max" 2>/dev/null)
+        TEMP_OVER=$(cat "$flag.over" 2>/dev/null)
+        rm -f "$flag.max" "$flag.over"
+        TEMP_END=$(temp_of "$l")
+        for t in "$TEMP_START" "$TEMP_END"; do
+            [ -n "$t" ] || continue
+            if [ -z "$TEMP_MAX_SEEN" ] || [ "$t" -gt "$TEMP_MAX_SEEN" ]; then TEMP_MAX_SEEN=$t; fi
+        done
+    fi
+    return 0
+}
+temp_json() { printf '"temp_start_c":%s,"temp_end_c":%s,"temp_max_c":%s' "$(jnum "$TEMP_START")" "$(jnum "$TEMP_END")" "$(jnum "$TEMP_MAX_SEEN")"; }
+# temp_stopped <id> <layout>: the run was stopped over temperature: not
+# stored; 0 = cooled down, repeat it; exit 4 when it happened twice
+temp_stopped() {
+    say "  drive at $TEMP_OVER C > $TEMP_MAX C: run stopped, not stored"
+    echo "$(date -Is) temperature stop ($TEMP_OVER C) in '$1'" >>"$EVENTS"
+    if [ "${TEMP_RETRY_ID:-}" = "$1" ]; then
+        say "second over-temperature on '$1': stopping (cool the drives, then re-run)"
+        exit 4
+    fi
+    TEMP_RETRY_ID=$1
+    cool_wait "$2" "$TEMP_RESUME"
+}
+
 # ---------------------------------------------------------------- results
 have() { [ -f "$RESULTS" ] && grep -qF "\"id\":\"$1\"" "$RESULTS"; }
 # field of the stored line for <id>: pass (true/false), rate_mbps, ...
@@ -316,6 +490,8 @@ prep_volume() {
     if [ "$DRY" -eq 1 ]; then echo "      prep: nvsetup-raid0.sh $args; sleep $IDLE"; return 0; fi
     say "prep: nvsetup-raid0.sh $args"
     # shellcheck disable=SC2086
+    # a fresh volume: the playback source on the old one is gone
+    rm -f "$PS_STATE"
     nvsetup-raid0.sh $args >>"$LOGDIR/prep.log" 2>&1 || die "nvsetup-raid0.sh $args failed (see $LOGDIR/prep.log)"
     echo "$l $c" >"$VOLSTATE"
     sync
@@ -385,14 +561,17 @@ ring_json() { # <app log> <requested slots|"">
     printf '"buffers":%s,"buffers_req":%s,"ring_slots":%s,"ring_bytes":%s' "$(jnum "$rs")" "$(jnum "$2")" \
         "$(jnum "$(res_get "$1" ring_slots)")" "$(jnum "$(res_get "$1" ring_bytes)")"
 }
+# nvverify 1.1 reports 16-byte words: "GAP at word N (file offset X)",
+# "discontinuities D, words missing W (B beats...)", "corrupted words C"
 verify_json() { # <rc> <nvverify log> <seconds>
     local first
-    first=$(sed -n 's/^GAP at beat [0-9]* (file offset \([0-9]*\)).*/\1/p' "$2" | head -n1)
-    printf '"verify":{"rc":%s,"result":%s,"discontinuities":%s,"beats_missing":%s,"corrupted":%s,"first_gap_offset":%s,"seconds":%s}' \
+    first=$(sed -n 's/^GAP at \(word\|beat\) [0-9]* (file offset \([0-9]*\)).*/\2/p' "$2" | head -n1)
+    printf '"verify":{"rc":%s,"result":%s,"discontinuities":%s,"words_missing":%s,"beats_missing":%s,"corrupted":%s,"first_gap_offset":%s,"seconds":%s}' \
         "$1" "$(jstr "$(sed -n 's/^RESULT //p' "$2" | tail -n1)")" \
         "$(jnum "$(sed -n 's/^  discontinuities \([0-9]*\).*/\1/p' "$2")")" \
-        "$(jnum "$(sed -n 's/.*beats missing \([0-9]*\)$/\1/p' "$2")")" \
-        "$(jnum "$(sed -n 's/^  corrupted beats \([0-9]*\).*/\1/p' "$2")")" "$(jnum "$first")" "$3"
+        "$(jnum "$(sed -n 's/.*words missing \([0-9]*\) .*/\1/p' "$2")")" \
+        "$(jnum "$(sed -n 's/.*words missing [0-9]* (\([0-9]*\) beats.*/\1/p' "$2")")" \
+        "$(jnum "$(sed -n 's/^  corrupted \(words\|beats\) \([0-9]*\).*/\2/p' "$2")")" "$(jnum "$first")" "$3"
 }
 
 # emit <id> <test> <layout> <json body without braces>
@@ -412,7 +591,7 @@ emit() {
 # returns 0 when the run passed (rc 0 and nvverify PASS), 1 otherwise.
 rec_run() {
     local id=$1 test=$2 l=$3 bytes=$4 rate=$5 chunk=$6 qd=$7 slots=$8 prep=$9 f=${10:-$OUT}
-    local log vlog rc vrc s0 s1 t pass vt0 vt1 achieved st capped=false
+    local log vlog rc vrc s0 s1 t pass vt0 vt1 achieved st capped=false args=("$@")
     if [ "$rate" -gt "$SRC_MAX" ]; then
         id=$(cap_id "$id" "$rate" "$SRC_MAX"); say "  rate $rate MB/s > source max $SRC_MAX MB/s: capped ($id)"; rate=$SRC_MAX; capped=true
     fi
@@ -430,6 +609,7 @@ rec_run() {
         [ "$rate" -le "$DRY_MAXRATE" ]; return
     fi
     ha_check
+    cool_wait "$l"
     if [ "$prep" = trim ]; then
         budget_ok $(( $(est_rec "$bytes" "$rate" 1) + IDLE + 20 ))
         prep_volume "$l" "$chunk"
@@ -440,11 +620,16 @@ rec_run() {
     fi
     say "record $id"
     s0=$(cpusnap)
-    t=$( { time -p nvrec --rate "${rate}MB" --size "$bytes" --chunk "$chunk" --qd "$qd" \
-              ${slots:+--buffers "$slots"} --stats 0 --force "$f" >"$log" 2>&1; echo "RC=$?" >>"$log"; } 2>&1 )
+    run_app "$l" "$log" nvrec --rate "${rate}MB" --size "$bytes" --chunk "$chunk" --qd "$qd" \
+        ${slots:+--buffers "$slots"} --stats 0 --force "$f"
+    t=$APP_TIME
     s1=$(cpusnap)
     rc=$(sed -n 's/^RC=//p' "$log" | tail -n1)
     if [ "$rc" = 5 ]; then ha_check; exit 5; fi
+    if [ -n "$TEMP_OVER" ]; then
+        rm -f "$f"; temp_stopped "$id" "$l"
+        rec_run "${args[@]}"; return
+    fi
     if [ "$rc" != 0 ] && [ "$rc" != 2 ] && ! grep -q '^RESULT ' "$log"; then
         die "nvrec failed before recording (rc $rc), not stored as a result: see $log"
     fi
@@ -457,12 +642,13 @@ rec_run() {
     fi
     pass=false; [ "$rc" = 0 ] && [ "$vrc" = 0 ] && pass=true
     achieved=$(awk -v b="$(res_get "$log" bytes)" -v s="$(res_get "$log" seconds)" 'BEGIN { if (s > 0) printf "%.1f", b / s / 1e6; else print "null" }')
-    emit "$id" "$test" "$l" "$(printf '"direction":"record","size_bytes":%s,"rate_req_mbps":%s,"rate_capped":%s,"rate_mbps":%s,"seconds":%s,"bytes":%s,"chunk":%s,"qd":%s,%s,"prep":%s,"idle_s":%s,"exit":%s,"pass":%s,"drops":%s,"nvme_errors":%s,"fifo_hwm":%s,"fifo_depth":%s,%s,%s,%s' \
+    emit "$id" "$test" "$l" "$(printf '"direction":"record","size_bytes":%s,"rate_req_mbps":%s,"rate_capped":%s,"rate_mbps":%s,"seconds":%s,"bytes":%s,"chunk":%s,"qd":%s,%s,"prep":%s,"idle_s":%s,"exit":%s,"pass":%s,"drops":%s,"nvme_errors":%s,"fifo_hwm":%s,"fifo_depth":%s,"beat_bytes":%s,"tag":%s,%s,%s,%s,%s' \
         "$bytes" "$rate" "$capped" "$achieved" "$(jnum "$(res_get "$log" seconds)")" "$(jnum "$(res_get "$log" bytes)")" \
         "$chunk" "$qd" "$(ring_json "$log" "$slots")" "$(jstr "$([ "$prep" = trim ] && echo 'blkdiscard+mkfs.exfat' || echo 'rm+sync')")" \
         "$([ "$prep" = trim ] && echo "$IDLE" || echo 10)" "$(jnum "$rc")" "$pass" \
         "$(jnum "$(res_get "$log" drops)")" "$(jnum "$(res_get "$log" nvme_errors)")" \
         "$(jnum "$(res_get "$log" fifo_hwm)")" "$(jnum "$(res_get "$log" fifo_depth)")" \
+        "$(jnum "$(res_get "$log" beat_bytes)")" "$(jstr "$TAG")" "$(temp_json)" \
         "$st" "$(verify_json "$vrc" "$vlog" "$(awk -v a="$vt0" -v b="$vt1" 'BEGIN{printf "%.1f", b - a}')")" \
         "$(cpu_json "$s0" "$s1" "$t")")${REC_EXTRA:+,$REC_EXTRA}"
     say "  -> rc=$rc verify=$(sed -n 's/^RESULT //p' "$vlog" | tail -n1) pass=$pass ($achieved MB/s)"
@@ -472,7 +658,7 @@ rec_run() {
 # play_run <id> <test> <layout> <rate> <file> <qd> <slots|"">  (0 = clean)
 play_run() {
     local id=$1 test=$2 l=$3 rate=$4 f=$5 qd=$6 slots=$7
-    local log rc s0 s1 t pass bytes capped=false
+    local log rc s0 s1 t pass bytes capped=false args=("$@")
     if [ "$rate" -gt "$SRC_MAX" ]; then
         id=$(cap_id "$id" "$rate" "$SRC_MAX"); say "  rate $rate MB/s > source max $SRC_MAX MB/s: capped ($id)"; rate=$SRC_MAX; capped=true
     fi
@@ -487,26 +673,33 @@ play_run() {
         [ "$rate" -le "$DRY_MAXRATE" ]; return
     fi
     ha_check
+    cool_wait "$l"
     bytes=$(stat -c %s "$f" 2>/dev/null || echo 0)
     budget_ok "$(est_rec "$bytes" "$rate" 0)"
     sync; echo 3 2>/dev/null >/proc/sys/vm/drop_caches; nap 5
     say "play $id"
     s0=$(cpusnap)
-    t=$( { time -p nvplay --rate "${rate}MB" --qd "$qd" ${slots:+--buffers "$slots"} --stats 0 "$f" >"$log" 2>&1; echo "RC=$?" >>"$log"; } 2>&1 )
+    run_app "$l" "$log" nvplay --rate "${rate}MB" --qd "$qd" ${slots:+--buffers "$slots"} --stats 0 "$f"
+    t=$APP_TIME
     s1=$(cpusnap)
     rc=$(sed -n 's/^RC=//p' "$log" | tail -n1)
     if [ "$rc" = 5 ]; then ha_check; exit 5; fi
+    if [ -n "$TEMP_OVER" ]; then
+        temp_stopped "$id" "$l"
+        play_run "${args[@]}"; return
+    fi
     if [ "$rc" != 0 ] && [ "$rc" != 2 ] && ! grep -q '^RESULT ' "$log"; then
         die "nvplay failed before playing (rc $rc), not stored as a result: see $log"
     fi
     pass=false; [ "$rc" = 0 ] && pass=true
-    emit "$id" "$test" "$l" "$(printf '"direction":"play","file_bytes":%s,"rate_req_mbps":%s,"rate_capped":%s,"rate_mbps":%s,"seconds":%s,"bytes":%s,"qd":%s,%s,"exit":%s,"pass":%s,"underflows":%s,"chk_errors":%s,"gaps":%s,"gap_beats":%s,"drop_count":%s,"beats":%s,"complete":%s,"nvme_errors":%s,"prefill_s":%s,%s,%s' \
+    emit "$id" "$test" "$l" "$(printf '"direction":"play","file_bytes":%s,"rate_req_mbps":%s,"rate_capped":%s,"rate_mbps":%s,"seconds":%s,"bytes":%s,"qd":%s,%s,"exit":%s,"pass":%s,"underflows":%s,"chk_errors":%s,"gaps":%s,"gap_beats":%s,"drop_count":%s,"beats":%s,"complete":%s,"nvme_errors":%s,"prefill_s":%s,"beat_bytes":%s,"file_beat_bytes":%s,"tag":%s,%s,%s,%s' \
         "$bytes" "$rate" "$capped" \
         "$(awk -v b="$(res_get "$log" bytes)" -v s="$(res_get "$log" seconds)" 'BEGIN { if (s > 0) printf "%.1f", b / s / 1e6; else print "null" }')" \
         "$(jnum "$(res_get "$log" seconds)")" "$(jnum "$(res_get "$log" bytes)")" "$qd" "$(ring_json "$log" "$slots")" "$(jnum "$rc")" "$pass" \
         "$(jnum "$(res_get "$log" underflows)")" "$(jnum "$(res_get "$log" errors)")" "$(jnum "$(res_get "$log" gaps)")" \
         "$(jnum "$(res_get "$log" gap_beats)")" "$(jnum "$(res_get "$log" drop_count)")" "$(jnum "$(res_get "$log" beats)")" \
         "$(jnum "$(res_get "$log" complete)")" "$(jnum "$(res_get "$log" nvme_errors)")" "$(jnum "$(res_get "$log" prefill_seconds)")" \
+        "$(jnum "$(res_get "$log" beat_bytes)")" "$(jnum "$(res_get "$log" file_beat_bytes)")" "$(jstr "$TAG")" "$(temp_json)" \
         "$(stats_json "$log")" "$(cpu_json "$s0" "$s1" "$t")")"
     say "  -> rc=$rc underflows=$(res_get "$log" underflows) pass=$pass"
     [ "$pass" = true ]
@@ -514,9 +707,8 @@ play_run() {
 
 # ---------------------------------------------------------------- tests
 fx() { echo "$1-$(chunk_name "$2"):$(serials_of "$1")"; }   # layout tag in ids
-need_layout() { [ -n "$LAYOUT" ] || die "$CMD needs --layout single1|single2|raid0"; members_of "$LAYOUT" >/dev/null; }
+need_layout() { [ -n "$LAYOUT" ] && [ "$LAYOUT" != fabric ] || die "$CMD needs --layout single1|single2|raid0"; members_of "$LAYOUT" >/dev/null; }
 top_rate() { [ -n "$TO" ] && cap_rate "$TO" || echo "$SRC_MAX"; }   # sweeps skip steps above the source max
-glance_top() { [ -n "$TO" ] && cap_rate "$TO" || cap_rate "$GLANCE_TO"; }
 # grid_last <from> <step> <to>: the last grid rate from + k*step <= to
 grid_last() { echo $(( $1 + ( ($3 - $1) / $2 ) * $2 )); }
 # rate_list: --rates as MB/s integers, one per line (dies on a bad value)
@@ -536,50 +728,71 @@ rates_rec() {
     for r in $(rate_list); do
         # a rate above the source max runs at the max, rate_capped
         for i in $(seq 1 $(( ${CONFIRM:-0} + 1 ))); do
-            rec_run "$test/$(fx "$l" "$c")/size=$bytes/rate=$r$(run_sfx "$i")" "$test" "$l" "$bytes" "$r" "$c" 32 "$BUFFERS" "$prep" \
+            rec_run "$test/$(fx "$l" "$c")/size=$bytes/rate=$r$(run_sfx "$i")$(id_sfx)" "$test" "$l" "$bytes" "$r" "$c" "$QD" "$BUFFERS" "$prep" \
                 && [ "$(cap_rate "$r")" -gt "$best" ] && best=$(cap_rate "$r")
         done
     done
     SWEEP_BEST=$best
 }
 
-# sweep <test> <layout> <bytes> <from> <step> <to> <prep> <confirm>
-# rates from..to until the first failure, the last step AT <to> when the grid
-# misses it (250, .., 3000, 3200); then <confirm> repeats of the top clean
-# step. SWEEP_BEST = the top clean rate (0 = none).
-sweep() {
-    local test=$1 l=$2 bytes=$3 r=$4 step=$5 to=$6 prep=$7 confirm=$8
-    local c q s best=0 i last=0
-    c=$(default_chunk "$l"); q=32; s=$BUFFERS
+# gsweep <runner> <from> <step> <to> <confirm>: the sweep logic of every
+# command. Rates from..to, the last step AT <to> when the grid misses it
+# (.., 7500, 7750, 8000 / .., 3000, 3200), until --stop-after consecutive
+# failing steps (1: the first failure ends it); then <confirm> repeats of the
+# top clean step and --confirm-fail repeats of the first failing step above
+# it. "<runner> <rate> <run#>" runs one step (run# > 1 = a repeat), 0 = clean.
+# SWEEP_BEST = the top clean rate (0 = none), SWEEP_FAIL = the first failing
+# step above it (0 = none).
+gsweep() {
+    local fn=$1 r=$2 step=$3 to=$4 confirm=$5 best=0 fails=0 failed="" ff=0 i f
     while [ "$r" -le "$to" ]; do
-        if rec_run "$test/$(fx "$l" "$c")/size=$bytes/rate=$r" "$test" "$l" "$bytes" "$r" "$c" "$q" "$s" "$prep"; then
-            best=$r; last=$r
+        if "$fn" "$r" 1; then
+            best=$r; fails=0
         else
-            last=-1; break
+            fails=$(( fails + 1 )); failed="$failed $r"
+            [ "$fails" -ge "$STOP_AFTER" ] && break
         fi
-        # the grid's last step passed and is below <to>: one more step at <to>
-        if [ $(( r + step )) -gt "$to" ] && [ "$r" -lt "$to" ]; then r=$to; else r=$(( r + step )); fi
-        [ "$last" -eq "$to" ] && break
+        [ "$r" -ge "$to" ] && break
+        # one more step at <to> when the grid misses it
+        if [ $(( r + step )) -gt "$to" ]; then r=$to; else r=$(( r + step )); fi
+    done
+    for f in $failed; do
+        if [ "$f" -gt "$best" ]; then ff=$f; break; fi
     done
     for i in $(seq 2 $(( confirm + 1 ))); do
         [ "$best" -gt 0 ] || break
-        rec_run "$test/$(fx "$l" "$c")/size=$bytes/rate=$best/run=$i" "$test" "$l" "$bytes" "$best" "$c" "$q" "$s" "$prep" || true
+        "$fn" "$best" "$i" || true
     done
-    SWEEP_BEST=$best
+    for i in $(seq 2 $(( CONFIRM_FAIL + 1 ))); do
+        [ "$ff" -gt 0 ] || break
+        "$fn" "$ff" "$i" || true
+    done
+    SWEEP_BEST=$best; SWEEP_FAIL=$ff
+}
+
+# sweep <test> <layout> <bytes> <from> <step> <to> <prep> <confirm>: nvrec
+# recordings (+ nvverify) as gsweep steps
+sweep() {
+    SW_TEST=$1; SW_L=$2; SW_BYTES=$3; SW_PREP=$7; SW_C=$(default_chunk "$2")
+    gsweep sweep_step "$4" "$5" "$6" "$8"
+}
+sweep_step() { # <rate> <run#>
+    rec_run "$SW_TEST/$(fx "$SW_L" "$SW_C")/size=$SW_BYTES/rate=$1$(run_sfx "$2")$(id_sfx)" \
+        "$SW_TEST" "$SW_L" "$SW_BYTES" "$1" "$SW_C" "$QD" "$BUFFERS" "$SW_PREP"
 }
 
 t_sustained() {
     need_layout
     local bytes; bytes=$(to_bytes "${SIZE:-32G}")
     if [ -n "$RATES" ]; then rates_rec sustained "$LAYOUT" "$bytes" trim
-    else sweep sustained "$LAYOUT" "$bytes" "$FROM" "$STEP" "$(top_rate)" trim 0; fi
+    else sweep sustained "$LAYOUT" "$bytes" "$FROM" "$STEP" "$(top_rate)" trim "${CONFIRM:-0}"; fi
     say "sustained ($LAYOUT): highest clean step $SWEEP_BEST MB/s"
 }
 t_glance() {
     need_layout
     local bytes; bytes=$(to_bytes "${SIZE:-4000M}")
     if [ -n "$RATES" ]; then rates_rec glance "$LAYOUT" "$bytes" none
-    else sweep glance "$LAYOUT" "$bytes" "$FROM" "$STEP" "$(glance_top)" none "${CONFIRM:-2}"; fi
+    else sweep glance "$LAYOUT" "$bytes" "$FROM" "$STEP" "$(top_rate)" none "${CONFIRM:-2}"; fi
     say "glance ($LAYOUT): highest clean step $SWEEP_BEST MB/s"
 }
 t_burst() {
@@ -604,46 +817,61 @@ auto_rate() { # <layout>
     if [ -n "$RATE" ] && [ "$RATE" != auto ]; then echo "$RATE"; return; fi
     r=$(best_of burst "$1" "$(to_bytes 10G)")
     [ "$r" -gt 0 ] || r=1000
-    [ "$r" -gt 3000 ] && r=3000
-    echo "$r"
+    cap_rate "$r"
 }
-# the playback source: a 10 GB recording at 1000 MB/s on a fresh volume
-# (the recorder's playback method); reused while the volume and file survive
+# The playback source: a 10 GB recording at 1000 MB/s (qd 32) on a fresh
+# volume (the recorder's playback method). It is reused only while it is
+# valid for what is being played: the mounted volume is this layout's
+# (volume.state), playsrc.state names this layout, chunk, fabric beat, qd,
+# path and size, and the file is a complete, drop-free test-pattern
+# recording of that size, chunk and beat size (nvverify --header-only;
+# a 512-bit image never plays a source recorded with 32-byte beats).
+# Otherwise it is recorded again, under a new id (/ts=<epoch>: a source
+# recorded earlier, in this boot or not, never blocks a new one).
+# --source-fresh records it again once per layout in this invocation.
+playsrc_valid() { # <layout> <chunk> <bytes>
+    local l=$1 c=$2 sbytes=$3 h off size
+    [ "$(cat "$PS_STATE" 2>/dev/null)" = "$l $c $BEAT 32 $PLAYSRC $sbytes" ] || return 1
+    [ -f "$PLAYSRC" ] || return 1
+    h=$(nvverify --header-only "$PLAYSRC" 2>/dev/null)
+    echo "$h" | grep -q "(test pattern, complete)" || return 1
+    echo "$h" | grep -q "^  header .* $BEAT-byte beats\$" || return 1
+    echo "$h" | grep -q '^  drop_count *0\( beats\)\?$' || return 1
+    echo "$h" | grep -q "^  data_bytes *$sbytes\$" || return 1
+    echo "$h" | grep -q "^  chunk / members $c bytes /" || return 1
+    off=$(echo "$h" | sed -n 's/^  header .*, data at \([0-9]*\),.*/\1/p')
+    size=$(stat -c %s "$PLAYSRC" 2>/dev/null)
+    [ -n "$off" ] && [ "$size" = "$(( off + sbytes ))" ]
+}
 ensure_playsrc() { # <layout> <chunk>
     local l=$1 c=$2 sbytes; sbytes=$(to_bytes 10G)
     [ "$DRY" -eq 1 ] && [ -n "${PLAYSRC_OK:-}" ] && return 0
-    if [ "$DRY" -eq 0 ] && mount_volume "$l" "$c" && [ -f "$PLAYSRC" ] && \
-       nvverify --header-only "$PLAYSRC" 2>/dev/null | grep -q 'drop_count *0$'; then
+    if [ "$DRY" -eq 0 ] && { [ "$SOURCE_FRESH" = 0 ] || [[ " $FRESH_DONE " == *" $l:$c "* ]]; } && \
+       mount_volume "$l" "$c" && playsrc_valid "$l" "$c" "$sbytes"; then
         return 0
     fi
-    rec_run "playsrc/$(fx "$l" "$c")/size=$sbytes/rate=1000/boot=$BOOT_EPOCH" playsrc "$l" "$sbytes" 1000 "$c" 32 "$BUFFERS" trim "$PLAYSRC" \
+    [ "$DRY" -eq 0 ] && rm -f "$PS_STATE"
+    rec_run "playsrc/$(fx "$l" "$c")/size=$sbytes/rate=1000/beat=$BEAT/qd=32/ts=$(now_s)" playsrc "$l" "$sbytes" 1000 "$c" 32 "$BUFFERS" trim "$PLAYSRC" \
         || die "playback source recording failed"
+    [ "$DRY" -eq 0 ] && echo "$l $c $BEAT 32 $PLAYSRC $sbytes" >"$PS_STATE"
+    FRESH_DONE="$FRESH_DONE $l:$c"
     PLAYSRC_OK=1
 }
-play_id() { echo "playback/$(fx "$1" "$2")/size=$(to_bytes 10G)/rate=$3${4:+/run=$4}"; }
+play_id() { echo "playback/$(fx "$1" "$2")/size=$(to_bytes 10G)/rate=$3${4:+/run=$4}$(id_sfx)"; }
 run_sfx() { [ "$1" -gt 1 ] && echo "/run=$1"; }
 # play1 <layout> <chunk> <rate> [run]: one playback (the source recorded first
 # when the run is not in the results yet); 0 = clean
 play1() {
     local id cr; id=$(play_id "$1" "$2" "$3" "${4:-}"); cr=$(cap_rate "$3")
     have "$(cap_id "$id" "$3" "$cr")" || ensure_playsrc "$1" "$2"
-    play_run "$id" playback "$1" "$3" "$PLAYSRC" 32 "$BUFFERS"
+    play_run "$id" playback "$1" "$3" "$PLAYSRC" "$QD" "$BUFFERS"
 }
 # play_sweep <layout> <from> <step> <to> <confirm>: as sweep(), for nvplay
 play_sweep() {
-    local l=$1 r=$2 step=$3 to=$4 confirm=$5 c best=0 i last=0
-    c=$(default_chunk "$l"); PLAYSRC_OK=""
-    while [ "$r" -le "$to" ]; do
-        if play1 "$l" "$c" "$r"; then best=$r; last=$r; else break; fi
-        if [ $(( r + step )) -gt "$to" ] && [ "$r" -lt "$to" ]; then r=$to; else r=$(( r + step )); fi
-        [ "$last" -eq "$to" ] && break
-    done
-    for i in $(seq 2 $(( confirm + 1 ))); do
-        [ "$best" -gt 0 ] || break
-        play1 "$l" "$c" "$best" "$i" || true
-    done
-    SWEEP_BEST=$best
+    PS_L=$1; PS_C=$(default_chunk "$1"); PLAYSRC_OK=""
+    gsweep play_step "$2" "$3" "$4" "$5"
 }
+play_step() { play1 "$PS_L" "$PS_C" "$1" "$([ "$2" -gt 1 ] && echo "$2")"; }
 t_playback() {
     need_layout
     local c r i best=0
@@ -668,11 +896,11 @@ t_cpu() {
     c=$(default_chunk "$LAYOUT"); bytes=$(to_bytes "${SIZE:-10G}"); r=${RATE:-1000}; [ "$r" = auto ] && r=1000
     PLAYSRC_OK=""
     for i in $(seq 1 "$RUNS"); do
-        rec_run "cpu/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/run=$i" cpu "$LAYOUT" "$bytes" "$r" "$c" 32 "$BUFFERS" none "$DIR/cpu.dat" || true
+        rec_run "cpu/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/run=$i$(id_sfx)" cpu "$LAYOUT" "$bytes" "$r" "$c" "$QD" "$BUFFERS" none "$DIR/cpu.dat" || true
         [ "$DRY" -eq 0 ] && rm -f "$DIR/cpu.dat" && nap 20
-        id="cpuplay/$(fx "$LAYOUT" "$c")/size=$(to_bytes 10G)/rate=$r/run=$i"
+        id="cpuplay/$(fx "$LAYOUT" "$c")/size=$(to_bytes 10G)/rate=$r/run=$i$(id_sfx)"
         have "$id" || ensure_playsrc "$LAYOUT" "$c"
-        play_run "$id" cpuplay "$LAYOUT" "$r" "$PLAYSRC" 32 "$BUFFERS" || true
+        play_run "$id" cpuplay "$LAYOUT" "$r" "$PLAYSRC" "$QD" "$BUFFERS" || true
         [ "$DRY" -eq 0 ] && nap 20
     done
     return 0
@@ -688,18 +916,18 @@ t_chunk() {
     for c in $list; do
         c=$(to_bytes "$c")
         [ "$c" -le "$m" ] || { say "chunk $(chunk_name "$c") > MDTS $(chunk_name "$m"): skipped"; continue; }
-        slots=$(( RING_MB * 1048576 / c )); [ "$slots" -gt 1024 ] && slots=1024
-        rec_run "chunk/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/chunk=$c/slots=$slots" chunk "$LAYOUT" "$bytes" "$r" "$c" 32 "$slots" trim || true
+        slots=$(( RING_MB * 1048576 / c )); [ "$slots" -gt 2048 ] && slots=2048
+        rec_run "chunk/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/chunk=$c/slots=$slots$([ "$QD" != 32 ] && echo "/qd=$QD")${TAG:+/tag=$TAG}" chunk "$LAYOUT" "$bytes" "$r" "$c" "$QD" "$slots" trim || true
     done
 }
 t_inflight() {
     need_layout
     local c q r bytes slots
     c=$(default_chunk "$LAYOUT"); r=$(auto_rate "$LAYOUT"); bytes=$(to_bytes "${SIZE:-10G}")
-    slots=$(( RING_MB * 1048576 / c )); [ "$slots" -gt 1024 ] && slots=1024
+    slots=$(( RING_MB * 1048576 / c )); [ "$slots" -gt 2048 ] && slots=2048
     for q in $QDS; do
         [ "$q" -ge 1 ] && [ "$q" -le 63 ] || { say "qd $q outside 1..63: skipped"; continue; }
-        rec_run "inflight/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/qd=$q" inflight "$LAYOUT" "$bytes" "$r" "$c" "$q" "$slots" trim || true
+        rec_run "inflight/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/qd=$q${TAG:+/tag=$TAG}" inflight "$LAYOUT" "$bytes" "$r" "$c" "$q" "$slots" trim || true
     done
 }
 # longrun: the post-SLC-cache sustained rate (the recorder's long recordings):
@@ -716,10 +944,87 @@ t_longrun() {
     for r in ${list//,/ }; do
         r=${r%[Mm][Bb]}
         case "$r" in ''|*[!0-9]*) die "longrun: invalid rate '$r' (MB/s)" ;; esac
-        rec_run "longrun/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/idle=$IDLE" longrun "$LAYOUT" "$bytes" "$r" "$c" 32 "$BUFFERS" trim || true
+        rec_run "longrun/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/idle=$IDLE$(id_sfx)" longrun "$LAYOUT" "$bytes" "$r" "$c" "$QD" "$BUFFERS" trim || true
     done
     REC_EXTRA=""
 }
+# ---------------------------------------------------------------- fabric only
+# fab_run <id> <test> <rec|play> <rate>: one fabric-only run (no SSD, no
+# volume): nvrec --no-write of --size, or nvplay --ring-only (--passes)
+fab_run() {
+    local id=$1 test=$2 kind=$3 rate=$4 log rc s0 s1 t pass capped=false est
+    if [ "$rate" -gt "$SRC_MAX" ]; then
+        id=$(cap_id "$id" "$rate" "$SRC_MAX"); say "  rate $rate MB/s > source max $SRC_MAX MB/s: capped ($id)"; rate=$SRC_MAX; capped=true
+    fi
+    log=$LOGDIR/$(echo "$id" | tr '/:+=' '____').log
+    CUR_ID=$id
+    if [ "$kind" = rec ]; then est=$(( FB_BYTES * 3 / 2 / (rate * 1000000) + 10 )); else est=$(( 10 + PASSES )); fi
+    if have "$id"; then
+        [ "$DRY" -eq 1 ] && echo "  skip $id ($(field "$id" pass))"
+        passed "$id"; return
+    fi
+    if [ "$DRY" -eq 1 ]; then
+        echo "  RUN  $id (~$est s)"; DRY_EST=$(( DRY_EST + est ))
+        [ "$rate" -le "$DRY_MAXRATE" ]; return
+    fi
+    budget_ok "$est"
+    say "fabric $kind $id"
+    s0=$(cpusnap)
+    if [ "$kind" = rec ]; then
+        run_app fabric "$log" nvrec --no-write --rate "${rate}MB" --size "$FB_BYTES" ${BUFFERS:+--buffers "$BUFFERS"} --stats 0
+    else
+        run_app fabric "$log" nvplay --ring-only --rate "${rate}MB" --passes "$PASSES" ${BUFFERS:+--buffers "$BUFFERS"} --stats 0
+    fi
+    t=$APP_TIME
+    s1=$(cpusnap)
+    rc=$(sed -n 's/^RC=//p' "$log" | tail -n1)
+    if [ "$rc" != 0 ] && [ "$rc" != 2 ] && ! grep -q '^RESULT ' "$log"; then
+        die "$test failed before running (rc $rc), not stored as a result: see $log"
+    fi
+    pass=false; [ "$rc" = 0 ] && pass=true
+    emit "$id" "$test" fabric "$(printf '"direction":%s,"fabric_only":true,"size_bytes":%s,"rate_req_mbps":%s,"rate_capped":%s,"rate_mbps":%s,"seconds":%s,"bytes":%s,"chunk":%s,%s,"exit":%s,"pass":%s,"drops":%s,"fifo_hwm":%s,"fifo_depth":%s,"underflows":%s,"chk_errors":%s,"gaps":%s,"gap_beats":%s,"beats":%s,"complete":%s,"passes":%s,"fill_rate_bps":%s,"prefill_s":%s,"beat_bytes":%s,"tag":%s,%s' \
+        "$(jstr "$([ "$kind" = rec ] && echo record || echo play)")" "$([ "$kind" = rec ] && echo "$FB_BYTES" || echo null)" \
+        "$rate" "$capped" \
+        "$(awk -v b="$(res_get "$log" bytes)" -v s="$(res_get "$log" seconds)" 'BEGIN { if (s > 0) printf "%.1f", b / s / 1e6; else print "null" }')" \
+        "$(jnum "$(res_get "$log" seconds)")" "$(jnum "$(res_get "$log" bytes)")" "$(jnum "$(res_get "$log" chunk)")" \
+        "$(ring_json "$log" "$BUFFERS")" "$(jnum "$rc")" "$pass" \
+        "$(jnum "$(res_get "$log" drops)")" "$(jnum "$(res_get "$log" fifo_hwm)")" "$(jnum "$(res_get "$log" fifo_depth)")" \
+        "$(jnum "$(res_get "$log" underflows)")" "$(jnum "$(res_get "$log" errors)")" "$(jnum "$(res_get "$log" gaps)")" \
+        "$(jnum "$(res_get "$log" gap_beats)")" "$(jnum "$(res_get "$log" beats)")" "$(jnum "$(res_get "$log" complete)")" \
+        "$(jnum "$(res_get "$log" passes)")" "$(jnum "$(res_get "$log" fill_rate_bps)")" "$(jnum "$(res_get "$log" prefill_seconds)")" \
+        "$(jnum "$(res_get "$log" beat_bytes)")" "$(jstr "$TAG")" "$(cpu_json "$s0" "$s1" "$t")")"
+    if [ "$kind" = rec ]; then
+        say "  -> rc=$rc drops=$(res_get "$log" drops) pass=$pass"
+    else
+        say "  -> rc=$rc underflows=$(res_get "$log" underflows) errors=$(res_get "$log" errors) pass=$pass"
+    fi
+    [ "$pass" = true ]
+}
+fab_rec_step() { fab_run "fabric/dry/size=$FB_BYTES/rate=$1$(run_sfx "$2")$(fab_sfx)" fabric rec "$1"; }
+fab_play_step() { fab_run "fabricplay/dry/passes=$PASSES/rate=$1$(run_sfx "$2")$(fab_sfx)" fabricplay play "$1"; }
+fab_sweep() { # <runner>
+    local fn=$1 r i best=0
+    if [ -n "$RATES" ]; then
+        for r in $(rate_list); do
+            for i in $(seq 1 $(( ${CONFIRM:-0} + 1 ))); do
+                "$fn" "$r" "$i" && [ "$(cap_rate "$r")" -gt "$best" ] && best=$(cap_rate "$r")
+            done
+        done
+        SWEEP_BEST=$best
+    else
+        gsweep "$fn" "$FROM" "$STEP" "$(top_rate)" "${CONFIRM:-0}"
+    fi
+}
+t_fabric() {
+    FB_BYTES=$(to_bytes "${SIZE:-64G}")
+    fab_sweep fab_rec_step
+    say "fabric record (no SSD, $FB_BYTES bytes): highest clean step $SWEEP_BEST MB/s"
+}
+t_fabricplay() {
+    fab_sweep fab_play_step
+    say "fabric ring-resident playback (no SSD, $PASSES pass(es)): highest clean step $SWEEP_BEST MB/s"
+}
+
 t_verify() {
     local f=${CMD_ARGS[0]:-$OUT} log rc
     [ -f "$f" ] || f=$PLAYSRC
@@ -746,20 +1051,24 @@ layout_ok() {
 }
 # all: the matrix per layout, ordered so that the auto rates exist when needed
 t_all() {
-    local l s40 best r
+    local l s40 best r f0=250 st0=250 fb=500
+    # --from / --step given: the floor and grid of every sweep (the burst
+    # sweep starts at 500 otherwise, as the recorder's)
+    [ "$FROM_SET" = 1 ] && { f0=$FROM; fb=$FROM; }
+    [ "$STEP_SET" = 1 ] && st0=$STEP
     for l in $LAYOUTS; do
         LAYOUT=$l
         layout_ok "$l" || continue
         say "=== layout $l ($(serials_of "$l"))"
-        FROM=250; STEP=250; SIZE=""; RATES=""; CONFIRM=""; RATE=""
+        FROM=$f0; STEP=$st0; SIZE=""; RATES=""; CONFIRM=""; RATE=""
         t_sustained
         best=$SWEEP_BEST
         t_glance
-        FROM=500; SIZE=10G; t_burst; SIZE=""; FROM=250
+        FROM=$fb; SIZE=10G; t_burst; SIZE=""; FROM=$f0
         # 40 GB at the sustained rate and the next step (the recorder's 40 GB rows)
         # (the next step capped at the source max; skipped when that is no step up)
-        s40=$best; [ "$s40" -gt 0 ] || s40=250
-        r=$(( s40 + 250 )); RATES=$s40; [ "$(cap_rate "$r")" -gt "$(cap_rate "$s40")" ] && RATES="$s40,$r"
+        s40=$best; [ "$s40" -gt 0 ] || s40=$f0
+        r=$(( s40 + st0 )); RATES=$s40; [ "$(cap_rate "$r")" -gt "$(cap_rate "$s40")" ] && RATES="$s40,$r"
         SIZE=40G; t_burst; SIZE=""; RATES=""
         t_playback
         t_cpu
@@ -769,12 +1078,13 @@ t_all() {
 }
 
 # gaps: results from suites whose sweeps ended at the last 250-grid step
-# (3000) get the final step at the source maximum that 'all' now runs: per
+# below the maximum (3000 of 3200 with suite version 1 on the 128-bit
+# designs) get the final step at the source maximum that 'all' now runs: per
 # layout the 32 GB sustained, the 10 GB burst (from 500, as in 'all') and the
 # playback sweeps, each continued from its last grid step -- only where that
 # step is in the results and passed (a sweep that failed earlier ended there,
 # as it would now). The ids are those 'all' produces (resume skips them); the
-# 4000 MiB glance sweep ends at 3000 (as the recorder's) and has no gap.
+# 4000 MiB glance sweep is not continued.
 # gap_due <test> <id of the last grid step> <last grid rate> <to>: 0 = run the gap step
 gap_due() {
     if [ "$3" -ge "$4" ]; then say "$1 ($LAYOUT): the grid ends at $4 MB/s: no gap"; return 1; fi
@@ -816,13 +1126,19 @@ if [ "$DRY" -eq 0 ] && [ "$CMD" != info ] && [ "$CMD" != status ]; then
     [ "$TEST" = 1 ] || [ -c "$DEV_DIR/nvrec" ] || die "$DEV_DIR/nvrec not found (modprobe nvrec)"
     mkdir -p "$LOGDIR" || die "cannot create $LOGDIR"
     exec 9>"$(dirname "$RESULTS")/lock"
-    flock -n 9 || die "another nvbench-suite is running"
+    # -w 15: a child of the previous call (a watcher sleep) may still hold
+    # the lock for a few seconds after it exited
+    flock -w 15 9 || die "another nvbench-suite is running"
     trap 'echo $? >"$(dirname "$RESULTS")/last_exit"' EXIT
     echo "$(date -Is) start: $CMD layout=${LAYOUT:-$LAYOUTS} budget=${BUDGET_MIN}min left=$(left_s)s" >>"$EVENTS"
 fi
 DRY_MAXRATE=${NVBENCH_DRY_MAXRATE:-1500}   # dry run: pretend rates up to this pass
 CUR_ID=""
 SWEEP_BEST=0
+SWEEP_FAIL=0
+FRESH_DONE=""
+FB_BYTES=0
+TEMP_RETRY_ID=""
 DRY_EST=0
 REC_EXTRA=""
 [ "$DRY" -eq 1 ] && say "dry run: deadline in $(left_s) s; results $RESULTS"
@@ -838,6 +1154,8 @@ case "$CMD" in
     chunk) t_chunk ;;
     inflight) t_inflight ;;
     longrun) t_longrun ;;
+    fabric) t_fabric ;;
+    fabricplay) t_fabricplay ;;
     verify) t_verify; exit $? ;;
     all) t_all ;;
     gaps) t_gaps ;;

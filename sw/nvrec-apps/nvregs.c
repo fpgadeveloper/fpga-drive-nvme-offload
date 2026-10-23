@@ -71,6 +71,10 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	printf("nvrec_core ID 0x%08x VERSION 0x%08x\n", rc(NVREC_ID), rc(NVREC_VERSION));
+	/* BEAT_BYTES reads 0 on register map 1.0/1.1 (128-bit datapath) */
+	printf("  beat %u bytes, ingest FIFO %u beats, egress FIFO %u beats, %u ring slots\n",
+	       rc(NVREC_BEAT_BYTES_REG) ? rc(NVREC_BEAT_BYTES_REG) : NVREC_BEAT_BYTES_DEFAULT,
+	       rc(NVREC_ING_FIFO_DEPTH), rc(NVREC_EGR_FIFO_DEPTH), rc(NVREC_MAX_SLOTS));
 	ha_dead = rc(NVREC_VERSION) >= NVREC_VERSION_1_1 && (rc(NVREC_STATE) & NVREC_STATE_HA_DEAD);
 	if (ha_dead)
 		printf("Host Accelerator: NOT RESPONDING (STATE.HA_DEAD; evaluation license expired?) -- its registers are not read\n");

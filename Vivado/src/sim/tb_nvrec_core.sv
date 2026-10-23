@@ -6,6 +6,11 @@
 // command builder (nvrec_cmd), completion router (nvrec_cq), ring reader
 // (nvrec_rd), command injector (nvrec_inj), registers.
 //
+// Runs for DATA_WIDTH 128, 256 and 512 (sim.tcl, see the sim_runs line below).
+// The DDR model keeps 16-byte words (any beat width), the FIFOs are 64 KB deep
+// at every width and the TPG / checker rates are scaled so that the byte
+// rates are the same in every run.
+//
 //   fdrec_tpg (src_clk 200 MHz) -> nvrec_core -> AXI4 DDR model (dp_clk 250 MHz)
 //   nvrec_core m_axis_sqe -> NVMe Host Accelerator + SSD behavioural model
 //                            -> s_axis_cqe (completions, random delay, OUT OF ORDER)
@@ -33,12 +38,32 @@
 //      INJ_COMPLETED are cleared together by SOFT_RST (regression: the issue
 //      counters used to survive it), RUN_FIFO_HWM vs ING_FIFO_HWM
 //   7. HA_DEAD input: STATE bit 12, IRQ_STATUS bit 6 (W1C), irq output
+//   8. CONFIG.DRY (fabric-only): record until STOP over a wrapping ring with
+//      no SSD command (slots released as filled, BYTES = TPG words x 16),
+//      then a DRY record of exactly NUM_CHUNKS chunks played back from the
+//      ring (ring-resident) into fdrec_check: no Read command, no error/gap
 //
 // Prints PASS / FAIL and calls $finish (sim.tcl contract).
+//
+// sim_runs: DATA_WIDTH=128 DATA_WIDTH=256 DATA_WIDTH=512
 
 `timescale 1ns / 1ps
 
-module tb_nvrec_core;
+module tb_nvrec_core #(
+  parameter integer DATA_WIDTH = 256
+);
+
+  localparam integer BB         = DATA_WIDTH / 8;      // bytes per beat
+  localparam integer WPB        = DATA_WIDTH / 128;    // pattern words per beat
+  localparam integer BEAT_SHIFT = (DATA_WIDTH == 512) ? 6 : (DATA_WIDTH == 256) ? 5 : 4;
+  localparam integer FDEPTH     = 65536 / BB;          // ingest FIFO, 64 KB
+  localparam integer EDEPTH     = 65536 / BB;          // egress FIFO, 64 KB
+  localparam integer SLOT_W     = 11;
+
+  // TPG / checker rate for the same byte rate at every width (r = 128-bit value)
+  function automatic [31:0] rate(input [31:0] r);
+    return r / WPB;
+  endfunction
 
   // ---------------------------------------------------------------------------
   // Clocks / resets
@@ -59,17 +84,17 @@ module tb_nvrec_core;
   // ---------------------------------------------------------------------------
   // DUT + source + sink
   // ---------------------------------------------------------------------------
-  wire [127:0] src_tdata;   wire src_tvalid, src_tready;
+  wire [DATA_WIDTH-1:0] src_tdata;   wire src_tvalid, src_tready;
   wire tpg_enable, tpg_seq_rst; wire [31:0] tpg_rate_inc; wire [63:0] tpg_seq_next;
-  wire [127:0] snk_tdata;   wire snk_tlast, snk_tvalid, snk_tready;
+  wire [DATA_WIDTH-1:0] snk_tdata;   wire snk_tlast, snk_tvalid, snk_tready;
   wire chk_enable, chk_reset; wire [31:0] chk_rate_inc;
   wire [63:0] chk_beats, chk_errors, chk_gaps, chk_gap_beats, chk_underflows, chk_last_seq;
 
-  fdrec_tpg tpg (.src_clk(src_clk), .src_resetn(src_resetn), .tpg_enable(tpg_enable),
+  fdrec_tpg #(.DATA_WIDTH(DATA_WIDTH)) tpg (.src_clk(src_clk), .src_resetn(src_resetn), .tpg_enable(tpg_enable),
     .tpg_seq_rst(tpg_seq_rst), .tpg_rate_inc(tpg_rate_inc), .tpg_seq_next(tpg_seq_next),
     .m_axis_tdata(src_tdata), .m_axis_tvalid(src_tvalid), .m_axis_tready(src_tready));
 
-  fdrec_check chk (.snk_clk(src_clk), .snk_resetn(src_resetn), .chk_enable(chk_enable),
+  fdrec_check #(.DATA_WIDTH(DATA_WIDTH)) chk (.snk_clk(src_clk), .snk_resetn(src_resetn), .chk_enable(chk_enable),
     .chk_reset(chk_reset), .chk_rate_inc(chk_rate_inc), .chk_beats(chk_beats),
     .chk_errors(chk_errors), .chk_gaps(chk_gaps), .chk_gap_beats(chk_gap_beats),
     .chk_underflows(chk_underflows), .chk_last_seq(chk_last_seq),
@@ -89,8 +114,8 @@ module tb_nvrec_core;
   wire [1:0] awburst, arburst; wire [3:0] awcache, arcache;
   wire awvalid, wvalid, wlast, bready, arvalid, rready;
   reg  awready = 0, wready = 0, bvalid = 0, arready = 0, rvalid = 0, rlast = 0;
-  wire [127:0] wdata; wire [15:0] wstrb;
-  reg  [127:0] rdata = 0; reg [1:0] bresp = 0, rresp = 0;
+  wire [DATA_WIDTH-1:0] wdata; wire [BB-1:0] wstrb;
+  reg  [DATA_WIDTH-1:0] rdata = 0; reg [1:0] bresp = 0, rresp = 0;
 
   // SQ / CQ streams
   wire [511:0] sqe_tdata; wire [63:0] sqe_tkeep; wire [15:0] sqe_tuser; wire sqe_tvalid;
@@ -100,8 +125,8 @@ module tb_nvrec_core;
   wire         irq;
   reg          ha_dead_in = 1'b0;
 
-  nvrec_core #(.SRC_CLK_HZ(200000000), .DP_CLK_HZ(250000000), .FIFO_DEPTH(4096),
-               .EGR_FIFO_DEPTH(4096), .SLOT_W(10)) dut (
+  nvrec_core #(.DATA_WIDTH(DATA_WIDTH), .SRC_CLK_HZ(200000000), .DP_CLK_HZ(250000000),
+               .FIFO_DEPTH(FDEPTH), .EGR_FIFO_DEPTH(EDEPTH), .SLOT_W(SLOT_W)) dut (
     .src_clk(src_clk), .src_resetn(src_resetn), .dp_clk(dp_clk), .dp_resetn(dp_resetn),
     .s_axis_tdata(src_tdata), .s_axis_tvalid(src_tvalid), .s_axis_tready(src_tready),
     .m_axis_snk_tdata(snk_tdata), .m_axis_snk_tlast(snk_tlast), .m_axis_snk_tvalid(snk_tvalid),
@@ -199,7 +224,7 @@ module tb_nvrec_core;
   // ---------------------------------------------------------------------------
   longint cfg_ring_base, cfg_prp_base, cfg_start_chunk;
   int     cfg_chunk_shift, cfg_lba_shift, cfg_num_chunks, cfg_prp_shift, cfg_two;
-  int     cfg_play, cfg_fua;
+  int     cfg_play, cfg_fua, cfg_dry = 0;
   longint cfg_lba [2];
   int     cfg_nsid [2];
   int     cfg_ssd [2];
@@ -214,12 +239,12 @@ module tb_nvrec_core;
   // ---------------------------------------------------------------------------
   // DDR model (AXI4 slave)
   // ---------------------------------------------------------------------------
-  reg [127:0] mem [longint];
-  bit slot_busy [1024];        // write command in flight on this slot
+  reg [127:0] mem [longint];    // 16-byte words, keyed by byte address
+  bit slot_busy [1 << SLOT_W];   // write command in flight on this slot
 
   typedef struct { longint addr; int len; } burst_t;
   burst_t awq [$], arq [$];
-  reg [128:0] wbq [$];
+  reg [DATA_WIDTH:0] wbq [$];
   longint wa; int wb, wl; bit wact = 0; int bpend = 0;
   longint ra; int rb, rl; bit ract = 0;
 
@@ -233,22 +258,22 @@ module tb_nvrec_core;
     arready <= ($urandom_range(2) != 0);
     if (awvalid && awready) begin
       burst_t b; b.addr = awaddr; b.len = awlen + 1;
-      if (awburst != 2'b01 || awsize != 3'd4) fail("AW not INCR/16B");
-      if ((awaddr[11:0] + b.len * 16) > 4096) fail("AW crosses 4 KB");
+      if (awburst != 2'b01 || awsize != BEAT_SHIFT) fail("AW not INCR / BEAT_BYTES");
+      if ((awaddr[11:0] + b.len * BB) > 4096) fail("AW crosses 4 KB");
       if (slot_busy[slot_of(awaddr)])
         fail($sformatf("ring writer overwrote slot %0d before its command completed", slot_of(awaddr)));
       awq.push_back(b);
     end
     if (wvalid && wready) begin
-      if (wstrb != 16'hFFFF) fail("WSTRB");
+      if (wstrb != {BB{1'b1}}) fail("WSTRB");
       wbq.push_back({wlast, wdata});
     end
     while (wbq.size() > 0 && (wact || awq.size() > 0)) begin
       if (!wact) begin wa = awq[0].addr; wl = awq[0].len; wb = 0; wact = 1; void'(awq.pop_front()); end
-      mem[wa + wb * 16] = wbq[0][127:0];
-      if (wbq[0][128] != (wb == wl - 1)) fail("WLAST");
+      for (int w = 0; w < WPB; w++) mem[wa + wb * BB + w * 16] = wbq[0][128*w +: 128];
+      if (wbq[0][DATA_WIDTH] != (wb == wl - 1)) fail("WLAST");
       wb++;
-      if (wbq[0][128]) begin wact = 0; bpend++; end
+      if (wbq[0][DATA_WIDTH]) begin wact = 0; bpend++; end
       void'(wbq.pop_front());
     end
     if (bvalid && bready) bvalid <= 0;
@@ -256,7 +281,8 @@ module tb_nvrec_core;
     // reads
     if (arvalid && arready) begin
       burst_t b; b.addr = araddr; b.len = arlen + 1;
-      if ((araddr[11:0] + b.len * 16) > 4096) fail("AR crosses 4 KB");
+      if (arburst != 2'b01 || arsize != BEAT_SHIFT) fail("AR not INCR / BEAT_BYTES");
+      if ((araddr[11:0] + b.len * BB) > 4096) fail("AR crosses 4 KB");
       arq.push_back(b);
     end
     if (rvalid && rready) begin
@@ -268,7 +294,8 @@ module tb_nvrec_core;
     end
     if (ract && (!rvalid || rready) && $urandom_range(3) != 0) begin
       rvalid <= 1;
-      rdata  <= mem.exists(ra + rb * 16) ? mem[ra + rb * 16] : 128'hDEAD;
+      for (int w = 0; w < WPB; w++)
+        rdata[128*w +: 128] <= mem.exists(ra + rb * BB + w * 16) ? mem[ra + rb * BB + w * 16] : 128'hDEAD;
       rlast  <= (rb == rl - 1);
       rresp  <= 0;
     end else if (rvalid && rready) begin
@@ -472,7 +499,7 @@ module tb_nvrec_core;
   task automatic configure(input int play);
     begin
       cfg_play = play;
-      wr32(12'h104, (play ? 1 : 0) | (cfg_fua ? 2 : 0) | ((cfg_two ? 2 : 1) << 4));
+      wr32(12'h104, (play ? 1 : 0) | (cfg_fua ? 2 : 0) | (cfg_dry ? 4 : 0) | ((cfg_two ? 2 : 1) << 4));
       wr32(12'h120, cfg_ring_base[31:0]);   wr32(12'h124, cfg_ring_base[63:32]);
       wr32(12'h128, cfg_num_chunks);
       wr32(12'h12C, 1 << cfg_chunk_shift);
@@ -520,10 +547,13 @@ module tb_nvrec_core;
 
     // ---- Test 0: identification / reset values
     $display("Test 0: identification and reset values");
-    expect32(12'h000, 32'h0001_0001, "VERSION");
+    expect32(12'h000, 32'h0001_0002, "VERSION");
+    expect32(12'h0BC, BB, "BEAT_BYTES");
+    expect32(12'h038, FDEPTH, "ING_FIFO_DEPTH");
+    expect32(12'h0A4, EDEPTH, "EGR_FIFO_DEPTH");
     expect32(12'h258, 0, "RUN_FIFO_HWM reset");
     expect32(12'h03C, 32'h4E56_5243, "ID");
-    expect32(12'h150, 1024, "MAX_SLOTS");
+    expect32(12'h150, 1 << SLOT_W, "MAX_SLOTS");
     expect32(12'h128, 256, "NUM_CHUNKS reset");
     expect32(12'h12C, 32'h0010_0000, "CHUNK_SIZE reset");
     expect32(12'h154, 63, "CREDIT_INIT reset");
@@ -549,7 +579,7 @@ module tb_nvrec_core;
     configure(0);
     wr32(12'h148, 24);                          // LENGTH_CHUNKS
     wr32(12'h1C0, 4);                           // MAX_INFLIGHT ssd0
-    wr32(12'h014, 32'h4000_0000);               // TPG 1.6 GB/s
+    wr32(12'h014, rate(32'h4000_0000));         // TPG 1.6 GB/s
     wr32(12'h100, 1);                           // START
     wr32(12'h010, 1);                           // TPG on
     wait_state(3, 4000);
@@ -560,14 +590,16 @@ module tb_nvrec_core;
     rd32(12'h10C, v); if (v[2]) fail("T1 OVERFLOW IRQ set by drops after the run");
     rd32(12'h024, v); rd32(12'h258, v2);
     $display("  T1: ING_FIFO_HWM %0d (post-run fill), RUN_FIFO_HWM %0d", v, v2);
-    if (v < 4096) fail($sformatf("T1 ING_FIFO_HWM %0d, expected the post-run fill", v));
-    if (v2 == 0 || v2 >= 4096) fail($sformatf("T1 RUN_FIFO_HWM %0d", v2));
+    if (v < FDEPTH) fail($sformatf("T1 ING_FIFO_HWM %0d, expected the post-run fill", v));
+    if (v2 == 0 || v2 >= FDEPTH) fail($sformatf("T1 RUN_FIFO_HWM %0d", v2));
     expect32(12'h1CC, 24, "T1 SSD_ISSUED(0)");
     expect32(12'h1D0, 24, "T1 SSD_COMPLETED(0)");
     wr32(12'h010, 0);
     rd64(12'h200, v64); if (v64 != 24) fail($sformatf("T1 CHUNKS_FILLED %0d", v64));
     rd64(12'h208, v64); if (v64 != 24) fail($sformatf("T1 CMDS_ISSUED %0d", v64));
     rd64(12'h210, v64); if (v64 != 24) fail($sformatf("T1 CMDS_DONE %0d", v64));
+    rd64(12'h220, v64); if (v64 != 24 * 65536) fail($sformatf("T1 BYTES %0d", v64));
+    rd64(12'h048, v64); if (v64 != 24 * 65536 / BB) fail($sformatf("T1 ING_BEATS_OUT %0d", v64));
     expect32(12'h218, 0, "T1 CMD_ERRORS");
     expect32(12'h21C, 0, "T1 UNEXPECTED");
     rd32(12'h22C, v); if (v > 8 || v < 2) fail($sformatf("T1 RING_HWM %0d", v));
@@ -596,7 +628,7 @@ module tb_nvrec_core;
     configure(0);
     wr32(12'h148, 0);                           // until STOP
     wr32(12'h1C0, 3); wr32(12'h1E0, 5);
-    wr32(12'h014, 32'h5000_0000);
+    wr32(12'h014, rate(32'h5000_0000));
     wr32(12'h100, 1);
     wr32(12'h010, 1);
     // injector: 6 commands alternating SSDs while the builder runs
@@ -662,7 +694,7 @@ module tb_nvrec_core;
     wr32(12'h148, t1_chunks);
     wr32(12'h14C, 0);
     wr32(12'h1C0, 6);
-    wr32(12'h064, 32'h4000_0000);               // sink 1.6 GB/s
+    wr32(12'h064, rate(32'h4000_0000));         // sink 1.6 GB/s
     wr32(12'h060, 2);                           // checker reset
     #2000;
     wr32(12'h100, 1);
@@ -670,10 +702,10 @@ module tb_nvrec_core;
     wr32(12'h060, 1);                           // checker on
     wait_state(3, 6000);
     #50000;
-    rd64(12'h070, v64); if (v64 != t1_chunks * 4096) fail($sformatf("T3 CHK_BEATS %0d", v64));
+    rd64(12'h070, v64); if (v64 != t1_chunks * 65536 / BB) fail($sformatf("T3 CHK_BEATS %0d", v64));
     rd64(12'h078, v64); if (v64 != 0) fail($sformatf("T3 CHK_ERRORS %0d", v64));
     rd64(12'h080, v64); if (v64 != 0) fail($sformatf("T3 CHK_GAPS %0d", v64));
-    rd64(12'h098, v64); if (v64 != t1_chunks * 4096 - 1) fail($sformatf("T3 CHK_LAST_SEQ %0d", v64));
+    rd64(12'h098, v64); if (v64 != t1_chunks * 4096 - WPB) fail($sformatf("T3 CHK_LAST_SEQ %0d", v64));
     rd64(12'h220, v64); if (v64 != t1_chunks * 65536) fail($sformatf("T3 BYTES %0d", v64));
     wr32(12'h060, 0);
 
@@ -686,7 +718,7 @@ module tb_nvrec_core;
     seq_base = 0;
     configure(0);
     wr32(12'h148, 5);
-    wr32(12'h014, 32'h2000_0000);
+    wr32(12'h014, rate(32'h2000_0000));
     wr32(12'h100, 1);
     wr32(12'h010, 1);
     wait_state(3, 4000);
@@ -715,7 +747,7 @@ module tb_nvrec_core;
     configure(0);
     wr32(12'h148, 40);
     wr32(12'h1C0, 4); wr32(12'h1E0, 4);
-    wr32(12'h014, 32'h6000_0000);               // 2.4 GB/s
+    wr32(12'h014, rate(32'h6000_0000));         // 2.4 GB/s
     wr32(12'h100, 1);
     wr32(12'h010, 1);
     wait_state(3, 20000);
@@ -775,6 +807,85 @@ module tb_nvrec_core;
     rd32(12'h108, v); if (!v[12]) fail("T7 STATE.HA_DEAD must stay while the input is high");
     #20; if (irq) fail("T7 irq still high after W1C");
     wr32(12'h110, 32'h3F);
+    ha_dead_in = 1'b0;
+
+    // ---- Test 8: DRY (fabric-only) record and ring-resident playback
+    $display("Test 8: CONFIG.DRY record (STOP, ring wrap) and ring-resident playback");
+    begin
+      int sqe_before, nf;
+      sqe_before = n_bld_sqe + n_inj_sqe;
+      // 8a: DRY record until STOP, 8-slot ring wrapped more than twice
+      soft_reset();
+      wr32(12'h10C, 32'h7F);
+      cfg_dry = 1; cfg_two = 0; cfg_fua = 0; cfg_start_chunk = 0; cfg_num_chunks = 8;
+      cfg_chunk_shift = 16; cfg_lba_shift = 9; cfg_prp_shift = 12;
+      cfg_ring_base = 64'h0000_0000_6000_0000; cfg_prp_base = 64'h0000_0000_7000_0000;
+      configure(0);
+      rd32(12'h104, v); if (!v[2]) fail("T8 CONFIG.DRY readback");
+      wr32(12'h148, 0);                         // until STOP
+      wr32(12'h014, rate(32'h4000_0000));       // 1.6 GB/s
+      wr32(12'h100, 1);
+      wr32(12'h010, 1);
+      nf = 0;
+      while (nf < 20) begin #5000; rd32(12'h200, nf); end
+      rd32(12'h228, v); if (v > 2) fail($sformatf("T8 RING_FILL %0d during a DRY record", v));
+      wr32(12'h010, 0);                         // source off
+      #3000;
+      wr32(12'h100, 2);                         // STOP
+      wait_state(3, 4000);
+      rd64(12'h200, v64); rd64(12'h238, k);
+      if (v64 != k) fail($sformatf("T8 CHUNKS_RELEASED %0d != CHUNKS_FILLED %0d", k, v64));
+      rd64(12'h208, v64); if (v64 != 0) fail($sformatf("T8 CMDS_ISSUED %0d in DRY", v64));
+      rd64(12'h210, v64); if (v64 != 0) fail($sformatf("T8 CMDS_DONE %0d in DRY", v64));
+      rd64(12'h250, v64); if (v64 != 0) fail($sformatf("T8 RUN_DROP_COUNT %0d", v64));
+      rd32(12'h22C, v); if (v > 2) fail($sformatf("T8 RING_HWM %0d in DRY", v));
+      // BYTES (beats << BEAT_SHIFT) = every TPG word x 16 (no drops, no padding counted)
+      rd64(12'h220, v64);
+      begin
+        reg [63:0] words;
+        rd64(12'h018, words);
+        if (v64 != words * 16) fail($sformatf("T8 BYTES %0d != TPG words %0d x 16", v64, words));
+        $display("  T8: DRY record of %0d bytes (%0d words), %0d chunks", v64, words, k);
+      end
+      rd32(12'h10C, v); if (!v[0]) fail("T8 IRQ DONE not set (DRY record)");
+      wr32(12'h10C, 32'h7F);
+      // 8b: DRY record of exactly NUM_CHUNKS chunks from TPG seq 0
+      soft_reset();
+      configure(0);
+      wr32(12'h148, 8);
+      wr32(12'h014, rate(32'h6000_0000));       // 2.4 GB/s
+      wr32(12'h100, 1);
+      wr32(12'h010, 1);
+      wait_state(3, 4000);
+      wr32(12'h010, 0);
+      rd64(12'h200, v64); if (v64 != 8) fail($sformatf("T8 CHUNKS_FILLED %0d (exp 8)", v64));
+      rd64(12'h220, v64); if (v64 != 8 * 65536) fail($sformatf("T8 BYTES %0d (exp 8 chunks)", v64));
+      rd64(12'h250, v64); if (v64 != 0) fail($sformatf("T8 RUN_DROP_COUNT %0d (8 chunks)", v64));
+      // ring-resident playback of those 8 chunks
+      configure(1);
+      wr32(12'h148, 8);
+      wr32(12'h14C, 0);
+      wr32(12'h064, rate(32'h8000_0000));       // sink at full rate
+      wr32(12'h060, 2);                         // checker reset
+      #2000;
+      wr32(12'h100, 1);
+      #5000;
+      wr32(12'h060, 1);                         // checker on
+      wait_state(3, 4000);
+      #20000;
+      rd64(12'h070, v64); if (v64 != 8 * 65536 / BB) fail($sformatf("T8 CHK_BEATS %0d", v64));
+      rd64(12'h078, v64); if (v64 != 0) fail($sformatf("T8 CHK_ERRORS %0d", v64));
+      rd64(12'h080, v64); if (v64 != 0) fail($sformatf("T8 CHK_GAPS %0d", v64));
+      rd64(12'h098, v64); if (v64 != 8 * 4096 - WPB) fail($sformatf("T8 CHK_LAST_SEQ %0d", v64));
+      rd64(12'h220, v64); if (v64 != 8 * 65536) fail($sformatf("T8 playback BYTES %0d", v64));
+      rd64(12'h238, v64); if (v64 != 8) fail($sformatf("T8 playback CHUNKS_RELEASED %0d", v64));
+      rd64(12'h208, v64); if (v64 != 0) fail($sformatf("T8 playback CMDS_ISSUED %0d", v64));
+      expect32(12'h22C, 0, "T8 playback RING_HWM");
+      wr32(12'h060, 0);
+      if (n_bld_sqe + n_inj_sqe != sqe_before)
+        fail($sformatf("T8 %0d SQEs reached the Host Accelerator in DRY mode", n_bld_sqe + n_inj_sqe - sqe_before));
+      cfg_dry = 0;
+    end
 
     if (errors == 0) $display("PASS: tb_nvrec_core (%0d builder SQEs, %0d injector SQEs, %0d CQEs)",
                               n_bld_sqe, n_inj_sqe, n_cqe);

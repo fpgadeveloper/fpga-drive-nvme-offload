@@ -6,9 +6,9 @@
 //
 // Streams the chunks that the SSDs have read into the ring (NVMe Read
 // commands completed IN ORDER: chunk c is ready when c < cmp_cnt) out as a
-// 128-bit AXI-Stream into the egress FIFO (fdrec_egress), with TLAST on the
-// last beat of each chunk. AXI4 INCR read bursts of up to 256 beats, never
-// crossing 4 KB. A burst is only issued when the egress FIFO has room for it
+// DATA_WIDTH-bit AXI-Stream (128, 256 or 512) into the egress FIFO
+// (fdrec_egress), with TLAST on the last beat of each chunk. AXI4 INCR read
+// bursts of up to 4 KB (4096 / BEAT_BYTES beats), never crossing 4 KB. A burst is only issued when the egress FIFO has room for it
 // (fifo depth - level - beats already requested >= burst length), so the R
 // channel is normally never stalled (rready still follows the stream ready).
 //
@@ -21,7 +21,8 @@
 `timescale 1ns / 1ps
 
 module nvrec_rd #(
-  parameter integer SLOT_W   = 10,
+  parameter integer DATA_WIDTH = 256,  // 128, 256 or 512
+  parameter integer SLOT_W   = 11,
   parameter integer ADDR_W   = 64,
   parameter integer EGR_DEPTH = 4096,
   parameter integer EGR_CNT_W = 13
@@ -42,14 +43,14 @@ module nvrec_rd #(
   output reg  [7:0]         m_axi_arlen,
   output reg                m_axi_arvalid,
   input  wire               m_axi_arready,
-  input  wire [127:0]       m_axi_rdata,
+  input  wire [DATA_WIDTH-1:0] m_axi_rdata,
   input  wire [1:0]         m_axi_rresp,
   input  wire               m_axi_rlast,
   input  wire               m_axi_rvalid,
   output wire               m_axi_rready,
 
   // Stream to the egress FIFO
-  output wire [127:0]       m_axis_tdata,
+  output wire [DATA_WIDTH-1:0] m_axis_tdata,
   output wire               m_axis_tlast,
   output wire               m_axis_tvalid,
   input  wire               m_axis_tready,
@@ -63,7 +64,19 @@ module nvrec_rd #(
   output reg  [31:0]        rresp_errs
 );
 
-  localparam integer RQ_D = 16;
+  localparam integer BEAT_BYTES = DATA_WIDTH / 8;
+  localparam integer BEAT_SHIFT = (DATA_WIDTH == 512) ? 6 : (DATA_WIDTH == 256) ? 5 : 4;
+  localparam integer BURST      = 4096 / BEAT_BYTES;          // beats per 4 KB
+  localparam [8:0]   BURST_M1   = BURST - 1;
+  // R queue: 16 bursts x 4 KB outstanding, 32 at 512 bits
+  localparam integer RQ_D  = (DATA_WIDTH == 512) ? 32 : 16;
+  localparam integer RQ_AW = (DATA_WIDTH == 512) ? 5 : 4;     // log2(RQ_D)
+
+  generate
+    if (DATA_WIDTH != 128 && DATA_WIDTH != 256 && DATA_WIDTH != 512) begin : g_bad_width
+      DATA_WIDTH_must_be_128_256_or_512 u_param_error ();
+    end
+  endgenerate
 
   reg         act;
   reg         closing;
@@ -73,14 +86,14 @@ module nvrec_rd #(
   reg  [ADDR_W-1:0] chunk_addr;
   reg  [12:0] pend_r;        // beats requested, not yet received
 
-  wire [18:0] chunk_beats_full = 19'd1 << (chunk_shift - 5'd4);
+  wire [18:0] chunk_beats_full = 19'd1 << (chunk_shift - BEAT_SHIFT);
 
   // R queue: ends_chunk per burst
   reg         rq_mem [0:RQ_D-1];
-  reg  [4:0]  rq_wr, rq_rd;
-  wire [4:0]  rq_cnt   = rq_wr - rq_rd;
+  reg  [RQ_AW:0] rq_wr, rq_rd;
+  wire [RQ_AW:0] rq_cnt   = rq_wr - rq_rd;
   wire        rq_full  = (rq_cnt == RQ_D);
-  wire        rq_empty = (rq_cnt == 5'd0);
+  wire        rq_empty = (rq_cnt == {(RQ_AW+1){1'b0}});
 
   wire signed [19:0] space = $signed(EGR_DEPTH) - $signed({1'b0, egr_level}) - $signed({1'b0, pend_r});
 
@@ -108,15 +121,16 @@ module nvrec_rd #(
           a_ready <= (cidx < length_chunks) && (cidx < cmp_cnt);
         end
         2'd1: begin
-          b_chunk_beats <= (a_last && (last_chunk_bytes != 23'd0)) ? last_chunk_bytes[22:4] : chunk_beats_full;
-          b_to4k        <= 9'd256 - {1'b0, off_beats[7:0]};
+          // last_chunk_bytes is a whole number of LBAs (>= 512 B) = whole beats
+          b_chunk_beats <= (a_last && (last_chunk_bytes != 23'd0)) ? (last_chunk_bytes >> BEAT_SHIFT) : chunk_beats_full;
+          b_to4k        <= (BURST_M1 + 9'd1) - (off_beats[8:0] & BURST_M1);
           b_ready       <= a_ready;
         end
         2'd2: begin
           c_blen     <= ({10'd0, b_to4k} < (b_chunk_beats - off_beats)) ? b_to4k : (b_chunk_beats[8:0] - off_beats[8:0]);
           c_off_next <= off_beats + {10'd0, (({10'd0, b_to4k} < (b_chunk_beats - off_beats)) ? b_to4k : (b_chunk_beats[8:0] - off_beats[8:0]))};
           c_ends     <= !({10'd0, b_to4k} < (b_chunk_beats - off_beats));
-          c_addr     <= chunk_addr + {{(ADDR_W-23){1'b0}}, off_beats, 4'd0};
+          c_addr     <= chunk_addr + ({{(ADDR_W-19){1'b0}}, off_beats} << BEAT_SHIFT);
           c_ok       <= b_ready;
         end
         default: ;
@@ -144,7 +158,7 @@ module nvrec_rd #(
       m_axi_arvalid <= 1'b0;
       m_axi_araddr  <= {ADDR_W{1'b0}};
       m_axi_arlen   <= 8'd0;
-      rq_wr         <= 5'd0;
+      rq_wr         <= {(RQ_AW+1){1'b0}};
     end else begin
       if (m_axi_arvalid && m_axi_arready)
         m_axi_arvalid <= 1'b0;
@@ -162,8 +176,8 @@ module nvrec_rd #(
           m_axi_arvalid <= 1'b1;
           m_axi_araddr  <= c_addr;
           m_axi_arlen   <= blen[7:0] - 8'd1;
-          rq_mem[rq_wr[3:0]] <= ends_chunk;
-          rq_wr <= rq_wr + 5'd1;
+          rq_mem[rq_wr[RQ_AW-1:0]] <= ends_chunk;
+          rq_wr <= rq_wr + 1'b1;
           if (ends_chunk) begin
             off_beats <= 19'd0;
             cidx      <= cidx + 32'd1;
@@ -190,7 +204,7 @@ module nvrec_rd #(
   end
 
   // R channel -> stream
-  wire rq_head = rq_mem[rq_rd[3:0]];
+  wire rq_head = rq_mem[rq_rd[RQ_AW-1:0]];
   assign m_axis_tdata  = m_axi_rdata;
   assign m_axis_tvalid = m_axi_rvalid;
   assign m_axis_tlast  = m_axi_rlast && rq_head;
@@ -198,7 +212,7 @@ module nvrec_rd #(
 
   always @(posedge clk) begin
     if (rst) begin
-      rq_rd      <= 5'd0;
+      rq_rd      <= {(RQ_AW+1){1'b0}};
       rd_cnt     <= 32'd0;
       done       <= 1'b0;
       bytes      <= 64'd0;
@@ -210,11 +224,11 @@ module nvrec_rd #(
       rresp_errs <= 32'd0;
     end else begin
       if (r_fire) begin
-        bytes <= bytes + 64'd16;
+        bytes <= bytes + BEAT_BYTES;
         if (m_axi_rresp != 2'b00)
           rresp_errs <= rresp_errs + 32'd1;
         if (m_axi_rlast) begin
-          rq_rd <= rq_rd + 5'd1;
+          rq_rd <= rq_rd + 1'b1;
           if (rq_head)
             rd_cnt <= rd_cnt + 32'd1;
         end

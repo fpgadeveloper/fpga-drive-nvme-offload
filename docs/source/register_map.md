@@ -24,6 +24,27 @@ which is shared by the kernel driver and the apps. Keep this page, the header an
   LBAs) are plain RW pairs.
 * "Latched at START" means the engine copies the register when a run starts; writing it
   during a run has no effect on that run.
+* **Beats and words** (map 1.2). The fabric datapath (source and sink streams, ingest and
+  egress FIFOs, the ring writer / reader AXI4 master) is `DATA_WIDTH` bits wide, an RTL
+  parameter of 128, 256 or 512 bits (256 on the Zynq UltraScale+ designs, 512 on
+  `vck190_fmcp1`). One transfer on it is
+  a **beat** of `BEAT_BYTES` = `DATA_WIDTH` / 8 bytes: read it from the `BEAT_BYTES`
+  register (0x0BC). The test pattern is defined on 16-byte **words**; a beat carries
+  `BEAT_BYTES` / 16 consecutive words.
+
+  | Unit | Registers |
+  |---|---|
+  | fabric beats | `ING_BEATS_IN`, `ING_BEATS_OUT`, `ING_DROP_COUNT`, `RUN_DROP_COUNT`, `ING_FIFO_DEPTH`, `ING_FIFO_HWM`, `RUN_FIFO_HWM`, `EGR_FIFO_DEPTH`, `EGR_FIFO_LEVEL`, `EGR_BEATS_IN`, `EGR_DISCARD`, `CHK_BEATS`, `CHK_ERRORS` (a beat with any bad word counts once), `CHK_GAPS` (events), `CHK_GAP_BEATS` |
+  | 16-byte words | `TPG_SEQ_NEXT`, `CHK_LAST_SEQ` (and `first_seq` in the recording's file header) |
+  | bytes | `BYTES`, `PAD_BYTES`, `CHUNK_SIZE`, `LAST_CHUNK_BYTES` |
+  | chunks / slots | `CHUNKS_*`, `CMDS_*`, `RING_FILL`, `RING_HWM`, `NUM_CHUNKS`, `MAX_SLOTS`, `LENGTH_CHUNKS` |
+  | `src_clk` ticks | `CHK_UNDERFLOWS` |
+  | `dp_clk` cycles | `TIMESTAMP`, `RING_FULL_CYCLES`, `LAT_*` |
+
+  Source and sink rates: `bytes/s = INC / 2^31 × SRC_CLK_HZ × BEAT_BYTES` (`TPG_RATE_INC`,
+  `CHK_RATE_INC`); `INC = rate × 2^31 / (SRC_CLK_HZ × BEAT_BYTES)`. At `SRC_CLK_HZ` =
+  250 MHz the maximum (`INC` = `0x8000_0000`) is 8.0 GB/s with `BEAT_BYTES` = 32 and
+  16.0 GB/s with 64.
 
 ## nvrec_core: fdrec-compatible registers (0x000-0x0BF)
 
@@ -31,8 +52,9 @@ These offsets and their behaviour are identical to the
 [fpga-drive-recorder register map](https://recorder.fpgadrive.com/register_map.html), so
 code written for a custom data source or sink carries over. Differences:
 
-* `VERSION` reads the **nvrec** register map version (`0x0001_0001` = 1.1), and the new
-  `ID` register at `0x03C` reads `0x4E56_5243` ("NVRC").
+* `VERSION` reads the **nvrec** register map version (`0x0001_0002` = 1.2, the same
+  numbering as fdrec since the offsets are shared), and the new `ID` register at `0x03C`
+  reads `0x4E56_5243` ("NVRC").
 * There is no packetizer: `0x040` / `0x044` (`PKT_CTRL`, `PKT_LEN`) are reserved. The ring
   writer frames the data itself. `0x048` / `0x04C` are `ING_BEATS_OUT`: beats the ring
   writer took from the ingest FIFO (fdrec's `PKT_BEATS_OUT`).
@@ -43,28 +65,29 @@ code written for a custom data source or sink carries over. Differences:
 
 | Offset | Name | Access | Reset | Description |
 |---|---|---|---|---|
-| 0x000 | `VERSION` | RO | `0x0001_0001` | [31:16] major, [15:0] minor |
+| 0x000 | `VERSION` | RO | `0x0001_0002` | [31:16] major, [15:0] minor (1.2 = `0x0001_0002`) |
 | 0x004 | `SRC_CLK_HZ` | RO | parameter | `src_clk` frequency in Hz |
 | 0x008 | `DP_CLK_HZ` | RO | parameter | `dp_clk` frequency in Hz |
 | 0x00C | `GLOBAL_CTRL` | RW | 0 | bit0 `SOFT_RST` (SC, reads 1 while in progress) |
 | 0x010 | `TPG_CTRL` | RW | 0 | bit0 `ENABLE`, bit1 `SEQ_RST` (SC) |
 | 0x014 | `TPG_RATE_INC` | RW | 0 | Q1.31 beats per `src_clk` (`0x8000_0000` = 1 beat/clock) |
-| 0x018/0x01C | `TPG_SEQ_NEXT` | RO | 0 | next sequence number (64-bit) |
+| 0x018/0x01C | `TPG_SEQ_NEXT` | RO | 0 | sequence number of word 0 of the next beat, in words (64-bit; + `BEAT_BYTES` / 16 per beat) |
 | 0x020 | `ING_STATUS` | RW | 0 | bit0 `OVERFLOW` (sticky, W1C) |
 | 0x024 | `ING_FIFO_HWM` | RW | 0 | FIFO high-water mark in beats; any write clears. Also counts the fill after a run when the source keeps running: use `RUN_FIFO_HWM` (0x258) for a recording |
 | 0x028/0x02C | `ING_DROP_COUNT` | RO | 0 | beats dropped (64-bit) |
 | 0x030/0x034 | `ING_BEATS_IN` | RO | 0 | beats offered by the source (64-bit) |
-| 0x038 | `ING_FIFO_DEPTH` | RO | parameter | ingest FIFO depth in beats |
+| 0x038 | `ING_FIFO_DEPTH` | RO | parameter | ingest FIFO depth in beats (256 KB on the reference designs: 8192 beats on Zynq UltraScale+ (256 bits), 4096 on `vck190_fmcp1` (512 bits)) |
 | 0x03C | `ID` | RO | `0x4E56_5243` | "NVRC" |
 | 0x048/0x04C | `ING_BEATS_OUT` | RO | 0 | beats taken by the ring writer (64-bit) |
 | 0x060 | `CHK_CTRL` | RW | 0 | bit0 `ENABLE`, bit1 `RESET` (SC, reads 1 while busy) |
 | 0x064 | `CHK_RATE_INC` | RW | `0x8000_0000` | sink rate, Q1.31 beats per `src_clk` |
-| 0x070-0x09C | `CHK_BEATS`, `CHK_ERRORS`, `CHK_GAPS`, `CHK_GAP_BEATS`, `CHK_UNDERFLOWS`, `CHK_LAST_SEQ` | RO | 0 | checker counters (64-bit each), as fdrec |
+| 0x070-0x09C | `CHK_BEATS`, `CHK_ERRORS`, `CHK_GAPS`, `CHK_GAP_BEATS`, `CHK_UNDERFLOWS`, `CHK_LAST_SEQ` | RO | 0 | checker counters (64-bit each), as fdrec 1.2: beats, bad beats, gap events, missing beats (sum of (seq - expected) / (`BEAT_BYTES` / 16)), starved `src_clk` ticks, word-0 seq of the last good beat in words |
 | 0x0A0 | `EGR_CTRL` | RW | 0 | bit0 `FLUSH` |
-| 0x0A4 | `EGR_FIFO_DEPTH` | RO | parameter | egress FIFO depth in beats |
+| 0x0A4 | `EGR_FIFO_DEPTH` | RO | parameter | egress FIFO depth in beats: 4096 on every reference design (128 KB on Zynq UltraScale+ at 256 bits, 256 KB on `vck190_fmcp1` at 512 bits) |
 | 0x0A8/0x0AC | `EGR_BEATS_IN` | RO | 0 | beats written into the egress FIFO |
 | 0x0B0/0x0B4 | `EGR_DISCARD` | RO | 0 | beats discarded while `FLUSH` = 1 |
 | 0x0B8 | `EGR_FIFO_LEVEL` | RO | 0 | egress FIFO fill level |
+| 0x0BC | `BEAT_BYTES` | RO | parameter | bytes per fabric beat = `DATA_WIDTH` / 8 (16, 32 or 64; 32 on the Zynq UltraScale+ designs, 64 on `vck190_fmcp1`). Reads 0 on map 1.0 / 1.1, whose datapath is 128 bits (16 bytes) |
 
 ## nvrec_core: the NVMe offload engine (0x100-0x3FF)
 
@@ -98,6 +121,19 @@ and counted (`ING_DROP_COUNT`) -- the only failure mode, as in fdrec.
 free slots; the ring reader (`nvrec_rd`) streams completed chunks in order into the egress
 FIFO and `user_data_sink`.
 
+**Fabric-only runs (`CONFIG.DRY`, map 1.2)**: no NVMe command is built; the SSDs, the Host
+Accelerator and its credits are not touched (`CMDS_*` and `LAT_*` stay 0, `SSD_*` do not
+change; the command injector keeps working). A DRY record runs the ring writer as usual and
+releases every slot as soon as it is filled (`CHUNKS_RELEASED` = `CHUNKS_FILLED`), so the
+run measures the source, the ingest FIFO and the ring path into DDR; STOP, `LENGTH_CHUNKS`
+and ABORT work as usual and `DRAIN` ends when the writer is done. A DRY playback counts
+every chunk as completed at START: the ring reader streams chunks `0 .. LENGTH_CHUNKS-1`
+from slot `c % NUM_CHUNKS` into the egress FIFO and the sink. After a DRY record with
+`LENGTH_CHUNKS` = `NUM_CHUNKS`, a DRY playback with the same `RING_BASE`, `CHUNK_SIZE`,
+`NUM_CHUNKS` and `LENGTH_CHUNKS` reads that recording back from the ring (the
+**ring-resident** test); a longer playback wraps over the same slots and the checker sees
+the sequence restart.
+
 The SQE built by the hardware (little-endian dwords):
 
 | Dword | Content |
@@ -125,7 +161,7 @@ injector always have CID bit 15 = 1 (the hardware forces it).
 | Offset | Name | Access | Reset | Description |
 |---|---|---|---|---|
 | 0x100 | `CTRL` | W, SC | 0 | bit0 `START`, bit1 `STOP`, bit2 `ABORT`, bit4 `CREDIT_RST` (both SSDs: credits := `CREDIT_INIT`, in-flight counters := 0), bit5 `STATS_RST` (clear the completion statistics and latency), bit6 / bit7 `CREDIT_RST` for SSD 0 / SSD 1 only |
-| 0x104 | `CONFIG` | RW | `0x10` | bit0 `MODE_PLAY` (0 record, 1 playback), bit1 `FUA`, [5:4] `N_MEMBERS` (1 or 2; 0 = 1), bit8 `CREDIT_PER_CQE` (ignore the credit in `M_AXIS` tuser, +1 per CQE). Latched at START |
+| 0x104 | `CONFIG` | RW | `0x10` | bit0 `MODE_PLAY` (0 record, 1 playback), bit1 `FUA`, bit2 `DRY` (1.2: fabric-only run, see above), [5:4] `N_MEMBERS` (1 or 2; 0 = 1), bit8 `CREDIT_PER_CQE` (ignore the credit in `M_AXIS` tuser, +1 per CQE). Latched at START |
 | 0x108 | `STATE` | RO | 0 | [3:0] 0 `IDLE`, 1 `RUN`, 2 `DRAIN`, 3 `DONE`, 4 `ABORTING`, 5 `ABORTED`; bit8 writer busy, bit9 reader busy, bit10 ring full now, bit11 injector busy, bit12 `HA_DEAD` (the Host Accelerator register interface stopped answering, see [below](#host-accelerator-timeout-guard); sticky until the bitstream is reloaded) |
 | 0x10C | `IRQ_STATUS` | W1C | 0 | bit0 `DONE`, bit1 `CMD_ERROR`, bit2 `OVERFLOW` (ingest drop while the run accepted data), bit3 `INJ_CQE` (level: injector CQE FIFO not empty, not W1C), bit4 `UNEXPECTED_CQE`, bit5 `ABORTED`, bit6 `HA_DEAD` (set when `STATE.HA_DEAD` goes to 1, and again after a `SOFT_RST` while it is 1) |
 | 0x110 | `IRQ_ENABLE` | RW | 0 | same bits; the `irq` output is `|(IRQ_STATUS & IRQ_ENABLE)` (level, active high) |
@@ -160,7 +196,7 @@ injector always have CID bit 15 = 1 (the hardware forces it).
 | 0x140/0x144 | `START_CHUNK` | RW | 0 | array chunk index of the first chunk of the run (64-bit) |
 | 0x148 | `LENGTH_CHUNKS` | RW | 0 | chunks to record (0 = until STOP) or to play |
 | 0x14C | `LAST_CHUNK_BYTES` | RW | 0 | playback: bytes in the last chunk (0 = full), multiple of the LBA size |
-| 0x150 | `MAX_SLOTS` | RO | parameter | slot table size (1024) |
+| 0x150 | `MAX_SLOTS` | RO | parameter | slot table size = 2^`SLOT_W` (2048 on the 1.2 reference designs; 1024 before) |
 | 0x154 | `CREDIT_INIT` | RW | 63 | initial credit per SSD (number of HW SQs x (depth - 1)) |
 
 ### Stripe members (m = 0, 1; latched at START)
@@ -203,15 +239,15 @@ bit 4). Every CQE returns credit (`M_AXIS` tuser[15:5], or +1 per CQE with
 | 0x210/0x214 | `CMDS_DONE` | builder CQEs received |
 | 0x218 | `CMD_ERRORS` | builder CQEs with status != 0 |
 | 0x21C | `UNEXPECTED_CQES` | CQEs whose slot was not in flight |
-| 0x220/0x224 | `BYTES` | record: data bytes stored (without padding); playback: bytes streamed |
-| 0x228 | `RING_FILL` | slots in use now |
+| 0x220/0x224 | `BYTES` | record: data bytes stored, without padding (= beats taken from the ingest FIFO in this run × `BEAT_BYTES`); playback: bytes streamed (`BEAT_BYTES` per beat) |
+| 0x228 | `RING_FILL` | slots in use now (DRY record: chunks opened by the writer and not yet filled, at most 2; DRY playback: 0) |
 | 0x22C | `RING_HWM` | highest `RING_FILL`; any write clears |
 | 0x230 | `ERR_LAST_STATUS` | last error: [14:0] CQE status field (DW3[31:17]), [20:16] SSD, [31] valid |
 | 0x234 | `ERR_LAST_CID` | last error: [15:0] CID, [31:16] SQID |
-| 0x238/0x23C | `CHUNKS_RELEASED` | slots completed and released in order |
+| 0x238/0x23C | `CHUNKS_RELEASED` | slots completed and released in order (DRY record: = `CHUNKS_FILLED`) |
 | 0x240 | `PAD_BYTES` | zero bytes appended to the last chunk at STOP |
 | 0x248/0x24C | `RING_FULL_CYCLES` | `dp_clk` cycles the writer waited for a free slot |
-| 0x250/0x254 | `RUN_DROP_COUNT` | ingest drops while the record run was accepting data (START until STOP seen / `LENGTH_CHUNKS` reached / ABORT); taken from the ingest snapshot, so drops in the last ~0.5 us may be missed |
+| 0x250/0x254 | `RUN_DROP_COUNT` | ingest drops (beats) while the record run was accepting data (START until STOP seen / `LENGTH_CHUNKS` reached / ABORT); taken from the ingest snapshot, so drops in the last ~0.5 us may be missed |
 | 0x258 | `RUN_FIFO_HWM` | ingest FIFO high-water mark (beats) while the record run was accepting data (same window as `RUN_DROP_COUNT`); the figure to report for a recording |
 
 ### Completion latency (builder commands, `dp_clk` cycles from SQE accepted to CQE)
@@ -262,7 +298,8 @@ outstanding (a full FIFO stalls the IP's completion stream for both sources).
 Configuration in this design: 2 SSDs (`SSD 0` = SSD1 on `xdma_0`, `SSD 1` = SSD2 on
 `xdma_1`), **one hardware queue per SSD and no software queues** (`C_NUM_SQ` = 1,
 `C_EN_SW_IF` = 0), depth 64, full 64-byte commands, QoS off, statistics registers on,
-CQ FIFO depth 64. `clk_core` = `dp_clk` (250 MHz), `clk_axi_lite` = `pl_clk0` (100 MHz).
+CQ FIFO depth 64. `clk_core` = `dp_clk` (250 MHz, the PG328 maximum), `clk_axi_lite` =
+`pl_clk0` (100 MHz) on Zynq UltraScale+, `pl3_ref_clk` (100 MHz) on Versal.
 
 Why hardware-only: PG328 (Ch. 3, Product Specification) numbers an SSD's software queues
 before its hardware queues. With one software and one hardware queue per SSD, the hardware
@@ -362,3 +399,10 @@ them only during bring-up, error interrupts and explicit debug requests (sysfs
 * 1.1 (2026-10-17, backwards compatible): Host Accelerator timeout guard with
   `STATE.HA_DEAD` / `IRQ_STATUS.HA_DEAD` (bit 6); `RUN_FIFO_HWM` (0x258); `SSD_ISSUED` and
   `INJ_SUBMITTED` cleared by `SOFT_RST` like the completion counters.
+* 1.2 (2026-10-22): `DATA_WIDTH` 128 / 256 / 512 bits (256 on Zynq UltraScale+, 512 on
+  `vck190_fmcp1`):
+  `BEAT_BYTES` (0x0BC); every beat counter, FIFO depth, level and HWM in beats of that
+  width; `BYTES` = beats × `BEAT_BYTES` in record; `CONFIG.DRY` (bit 2) fabric-only runs;
+  `MAX_SLOTS` 2048. Same offsets and numbering as fdrec 1.2. Recordings made on a 1.1
+  bitstream (16-byte beats) stay valid: the byte stream of the test pattern is the same
+  at every width.

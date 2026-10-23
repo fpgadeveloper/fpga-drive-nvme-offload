@@ -33,7 +33,8 @@
  *
  * Addresses: PRP1 = RING_BASE + slot * chunk is used by the SSD (PCI DMA
  * view) and by the ring writer (fabric view) alike, so SET_RING refuses a
- * system where the two views of DDR differ.
+ * system where the two views of DDR differ. A ring set up while no SSD is
+ * live cannot be checked: it serves fabric-only (DRY) runs only.
  */
 
 #include <linux/module.h>
@@ -154,7 +155,8 @@ static void nvrec_stop_run(struct nvrec_dev *nv, bool abort);
 
 static void nvrec_update_state(struct nvrec_dev *nv)
 {
-	if (nvrec_running(nv) && nvrec_hw_ha_dead(nv)) {
+	/* a DRY run uses no NVMe path: a dead Host Accelerator does not end it */
+	if (nvrec_running(nv) && !nv->run_dry && nvrec_hw_ha_dead(nv)) {
 		dev_err(nv->dev, "run failed: the Host Accelerator stopped responding\n");
 		nvrec_stop_run(nv, true);	/* -> NVREC_RUN_FAILED */
 		return;
@@ -174,7 +176,8 @@ void nvrec_run_event(struct nvrec_dev *nv)
 
 static bool nvrec_run_finished(struct nvrec_dev *nv)
 {
-	return !nvrec_running(nv) || nvrec_hw_finished(nv) || nvrec_hw_ha_dead(nv);
+	return !nvrec_running(nv) || nvrec_hw_finished(nv) ||
+	       (!nv->run_dry && nvrec_hw_ha_dead(nv));
 }
 
 /* The Host Accelerator is dead: every NVMe command path goes through it,
@@ -267,6 +270,7 @@ static void nvrec_ring_free(struct nvrec_dev *nv)
 	nv->prp_lists_bytes = 0;
 	nv->ring_dma = 0;
 	nv->ring_bytes = 0;
+	nv->ring_ssd_ok = false;
 	nv->slots = 0;
 	nv->chunk = 0;
 	nv->geo_valid = false;
@@ -351,7 +355,7 @@ static int nvrec_set_ring(struct nvrec_dev *nv, struct nvrec_ring __user *uarg)
 	    a.bytes > NVREC_RING_MAX_BYTES)
 		return -EINVAL;
 	if (!is_power_of_2(a.chunk) || a.chunk < NVREC_MIN_CHUNK ||
-	    a.chunk > NVREC_MAX_CHUNK)
+	    a.chunk > NVREC_MAX_CHUNK || a.chunk % nv->beat_bytes)
 		return -EINVAL;
 	if (a.bytes / a.chunk < 2 || a.bytes / a.chunk > nv->cfg.max_slots)
 		return -EINVAL;
@@ -364,8 +368,9 @@ static int nvrec_set_ring(struct nvrec_dev *nv, struct nvrec_ring __user *uarg)
 			return -EINVAL;
 		}
 	}
-	if (nvrec_ssd_addr(nv, 0) == ~0ull)
-		return -ENODEV;		/* no live SSD: PRPs need their DMA view */
+	/* no live SSD: the SSD view of the ring cannot be checked, the ring
+	 * serves DRY runs only (nvrec_start) */
+	nv->ring_ssd_ok = nvrec_ssd_addr(nv, 0) != ~0ull;
 
 	nv->ring_bytes = a.bytes;
 	if (a.addr) {
@@ -382,7 +387,7 @@ static int nvrec_set_ring(struct nvrec_dev *nv, struct nvrec_ring __user *uarg)
 	if (ret)
 		goto err;
 	ring_pa = dma_to_phys(nv->dev, nv->ring_dma);
-	if (nvrec_ssd_addr(nv, ring_pa) != nv->ring_dma) {
+	if (nv->ring_ssd_ok && nvrec_ssd_addr(nv, ring_pa) != nv->ring_dma) {
 		dev_err(nv->dev, "ring: fabric address 0x%llx and SSD address 0x%llx differ: unsupported address map\n",
 			(u64)nv->ring_dma, nvrec_ssd_addr(nv, ring_pa));
 		ret = -EIO;
@@ -407,7 +412,8 @@ static int nvrec_set_ring(struct nvrec_dev *nv, struct nvrec_ring __user *uarg)
 			ret = -ENOMEM;
 			goto err;
 		}
-		if (nvrec_ssd_addr(nv, dma_to_phys(nv->dev, nv->prp_lists_dma)) !=
+		if (nv->ring_ssd_ok &&
+		    nvrec_ssd_addr(nv, dma_to_phys(nv->dev, nv->prp_lists_dma)) !=
 		    nv->prp_lists_dma) {
 			ret = -EIO;
 			goto err;
@@ -436,9 +442,9 @@ static int nvrec_set_ring(struct nvrec_dev *nv, struct nvrec_ring __user *uarg)
 		ret = -EFAULT;
 		goto err;
 	}
-	dev_dbg(nv->dev, "ring: %u slots x %u bytes at 0x%llx (%s), PRP lists 0x%llx\n",
+	dev_dbg(nv->dev, "ring: %u slots x %u bytes at 0x%llx (%s), PRP lists 0x%llx%s\n",
 		nv->slots, nv->chunk, (u64)nv->ring_dma, nv->ring_ours ? "CMA" : "user",
-		(u64)nv->prp_lists_dma);
+		(u64)nv->prp_lists_dma, nv->ring_ssd_ok ? "" : ", no live SSD: DRY runs only");
 	return 0;
 err:
 	nvrec_ring_free(nv);
@@ -458,8 +464,8 @@ static int nvrec_set_geometry(struct nvrec_dev *nv, struct nvrec_geometry __user
 		return -ENXIO;		/* SET_RING first: the chunk size */
 	if (g.flags & ~(NVREC_GEO_UNBOUNDED | NVREC_GEO_FUA))
 		return -EINVAL;
-	if (!g.nr_members || g.nr_members > NVREC_MAX_MEMBERS ||
-	    g.nr_members > nv->cfg.nr_ssd)
+	/* nr_members 0: no SSD, for fabric-only (DRY) runs (nvrec_start) */
+	if (g.nr_members > NVREC_MAX_MEMBERS || g.nr_members > nv->cfg.nr_ssd)
 		return -EINVAL;
 	if (!g.length_chunks && !(g.flags & NVREC_GEO_UNBOUNDED))
 		return -EINVAL;
@@ -513,6 +519,9 @@ static int nvrec_set_geometry(struct nvrec_dev *nv, struct nvrec_geometry __user
 			return -ERANGE;
 		}
 	}
+	/* whole beats (an LBA is >= 512 bytes, so this holds for members) */
+	if (g.last_chunk_bytes % nv->beat_bytes)
+		return -EINVAL;
 	nv->geo = g;
 	nv->geo_valid = true;
 	return 0;
@@ -521,27 +530,41 @@ static int nvrec_set_geometry(struct nvrec_dev *nv, struct nvrec_geometry __user
 static int nvrec_start(struct nvrec_dev *nv, struct nvrec_start __user *uarg, bool play)
 {
 	struct nvrec_start a;
+	bool dry;
 	int ret;
 
 	if (copy_from_user(&a, uarg, sizeof(a)))
 		return -EFAULT;
-	if (a.flags & ~(NVREC_START_TPG | NVREC_START_CHECK))
+	if (a.flags & ~(NVREC_START_TPG | NVREC_START_CHECK | NVREC_START_DRY))
 		return -EINVAL;
+	dry = a.flags & NVREC_START_DRY;
 	if (play && !(nv->caps & NVREC_CAP_PLAY))
 		return -EOPNOTSUPP;
+	if (dry && !(nv->caps & NVREC_CAP_DRY))
+		return -EOPNOTSUPP;	/* register map < 1.2 */
 	if (nvrec_running(nv))
 		return -EBUSY;
 	if (!nv->slots || !nv->geo_valid)
 		return -ENXIO;
 	if (play && !nv->geo.length_chunks)
 		return -EINVAL;
-	if (nvrec_hw_ha_dead(nv))
-		return -ENOLINK;
+	if (!dry) {
+		/* NVMe runs: members, a ring checked against the SSDs' view */
+		if (!nv->geo.nr_members)
+			return -EINVAL;
+		if (!nv->ring_ssd_ok) {
+			dev_err(nv->dev, "the ring was set up while no SSD was live: set it up again\n");
+			return -ENXIO;
+		}
+		if (nvrec_hw_ha_dead(nv))
+			return -ENOLINK;
+	}
 
 	/* The hardware writes behind the block layer's back: commit and drop
 	 * whatever the page cache of the member devices holds */
 	nvrec_invalidate_members(nv, true);
 
+	nv->run_dry = dry;	/* fabric only: a dead Host Accelerator does not end it */
 	ret = nvrec_hw_start(nv, play, a.flags);
 	if (ret)
 		return ret;
@@ -610,8 +633,9 @@ static void nvrec_fill_info(struct nvrec_dev *nv, struct nvrec_info *info)
 	info->hw_version = nv->hw_version;
 	info->src_clk_hz = nv->src_clk_hz;
 	info->dp_clk_hz = nv->dp_clk_hz;
-	info->beat_bytes = 16;
+	info->beat_bytes = nv->beat_bytes;
 	info->fifo_depth = nv->fifo_depth;
+	info->egr_fifo_depth = nv->egr_fifo_depth;
 	info->caps = nv->caps;
 	info->nr_ssd = nv->cfg.nr_ssd;
 	info->min_chunk = NVREC_MIN_CHUNK;
@@ -851,6 +875,8 @@ static DEVICE_ATTR_RO(_name)
 NVREC_RO_ATTR(src_clk_hz, "%u", nv->src_clk_hz);
 NVREC_RO_ATTR(dp_clk_hz, "%u", nv->dp_clk_hz);
 NVREC_RO_ATTR(fifo_depth, "%u", nv->fifo_depth);
+NVREC_RO_ATTR(egr_fifo_depth, "%u", nv->egr_fifo_depth);
+NVREC_RO_ATTR(beat_bytes, "%u", nv->beat_bytes);
 NVREC_RO_ATTR(version, "%u.%u", nv->hw_version >> 16, nv->hw_version & 0xffff);
 NVREC_RO_ATTR(ring_slots, "%u", nv->slots);
 NVREC_RO_ATTR(chunk_bytes, "%u", nv->chunk);
@@ -974,6 +1000,8 @@ static struct attribute *nvrec_attrs[] = {
 	&dev_attr_ring_full_cycles.attr,
 	&dev_attr_fifo_hwm.attr,
 	&dev_attr_fifo_depth.attr,
+	&dev_attr_egr_fifo_depth.attr,
+	&dev_attr_beat_bytes.attr,
 	&dev_attr_overflow.attr,
 	&dev_attr_ha_dead.attr,
 	&dev_attr_lat_min_cycles.attr,
@@ -1080,9 +1108,11 @@ static int nvrec_probe(struct platform_device *pdev)
 	list_add_tail(&nv->node_list, &nvrec_list);
 	mutex_unlock(&nvrec_list_lock);
 
-	dev_info(dev, "/dev/%s: nvrec_core v%u.%u, src_clk %u Hz, dp_clk %u Hz, FIFO %u beats; nvmeha: %u SSDs x %u queues (SQ window 0x%llx, CQ window 0x%llx)%s\n",
-		 nv->name, nv->hw_version >> 16, nv->hw_version & 0xffff,
-		 nv->src_clk_hz, nv->dp_clk_hz, nv->fifo_depth,
+	dev_info(dev, "/dev/%s: driver %s, nvrec_core v%u.%u, src_clk %u Hz, dp_clk %u Hz, beat %u bytes, FIFO %u/%u beats (ingest/egress), %u ring slots%s; nvmeha: %u SSDs x %u queues (SQ window 0x%llx, CQ window 0x%llx)%s\n",
+		 nv->name, NVREC_DRV_VERSION, nv->hw_version >> 16, nv->hw_version & 0xffff,
+		 nv->src_clk_hz, nv->dp_clk_hz, nv->beat_bytes, nv->fifo_depth,
+		 nv->egr_fifo_depth, nv->cfg.max_slots,
+		 (nv->caps & NVREC_CAP_DRY) ? ", DRY" : "",
 		 nv->cfg.nr_ssd, nv->cfg.max_sq, nv->cfg.sq_base, nv->cfg.cq_base,
 		 ", hardware queues, CPU I/O via the injector");
 	return 0;

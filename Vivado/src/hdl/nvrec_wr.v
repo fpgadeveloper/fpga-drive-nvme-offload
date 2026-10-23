@@ -6,8 +6,9 @@
 //
 // Writes the ingested stream (first-word-fall-through read port of the
 // fdrec_ingest FIFO) into a ring of num_chunks chunks of 2^chunk_shift bytes at
-// ring_base in memory, with AXI4 INCR write bursts of up to 256 x 128-bit beats
-// (4 KB, never crossing a 4 KB boundary).
+// ring_base in memory, with AXI4 INCR write bursts of up to 4 KB (4096 /
+// BEAT_BYTES beats: 256 x 128-bit, 128 x 256-bit, 64 x 512-bit), never
+// crossing a 4 KB boundary. DATA_WIDTH = 128, 256 or 512 bits per beat.
 //
 //   * A burst is only issued when its data is already in the FIFO
 //     (fifo_count - beats committed to earlier bursts >= burst length), so the
@@ -33,8 +34,9 @@
 `timescale 1ns / 1ps
 
 module nvrec_wr #(
-  parameter integer SLOT_W = 10,       // log2(max slots)
-  parameter integer CNT_W  = 13,       // ingest FIFO count width
+  parameter integer DATA_WIDTH = 256,  // 128, 256 or 512
+  parameter integer SLOT_W = 11,       // log2(max slots)
+  parameter integer CNT_W  = 14,       // ingest FIFO count width (>= 10)
   parameter integer ADDR_W = 64
 ) (
   input  wire               clk,
@@ -52,7 +54,7 @@ module nvrec_wr #(
   input  wire [31:0]        rel_cnt,      // chunks released (slot reusable)
 
   // Ingest FIFO read port (FWFT)
-  input  wire [127:0]       fifo_tdata,
+  input  wire [DATA_WIDTH-1:0] fifo_tdata,
   input  wire               fifo_tvalid,
   output wire               fifo_tready,
   input  wire [CNT_W-1:0]   fifo_count,
@@ -62,7 +64,7 @@ module nvrec_wr #(
   output reg  [7:0]         m_axi_awlen,
   output reg                m_axi_awvalid,
   input  wire               m_axi_awready,
-  output wire [127:0]       m_axi_wdata,
+  output wire [DATA_WIDTH-1:0] m_axi_wdata,
   output wire               m_axi_wlast,
   output wire               m_axi_wvalid,
   input  wire               m_axi_wready,
@@ -86,8 +88,21 @@ module nvrec_wr #(
   output reg  [31:0]        bresp_errs
 );
 
-  localparam integer WQ_D = 8;    // W queue (bursts issued, data not yet sent)
-  localparam integer BQ_D = 16;   // B queue (bursts issued, response pending)
+  localparam integer BEAT_BYTES = DATA_WIDTH / 8;
+  localparam integer BEAT_SHIFT = (DATA_WIDTH == 512) ? 6 : (DATA_WIDTH == 256) ? 5 : 4;
+  localparam integer BURST      = 4096 / BEAT_BYTES;          // beats per 4 KB
+  localparam [8:0]   BURST_M1   = BURST - 1;
+  localparam integer WQ_D  = 8;    // W queue (bursts issued, data not yet sent)
+  // B queue (bursts issued, response pending): 16 x 4 KB = 64 KB in flight,
+  // 32 at 512 bits (4 us at 16 GB/s is thin for the NoC)
+  localparam integer BQ_D  = (DATA_WIDTH == 512) ? 32 : 16;
+  localparam integer BQ_AW = (DATA_WIDTH == 512) ? 5 : 4;     // log2(BQ_D)
+
+  generate
+    if (DATA_WIDTH != 128 && DATA_WIDTH != 256 && DATA_WIDTH != 512) begin : g_bad_width
+      DATA_WIDTH_must_be_128_256_or_512 u_param_error ();
+    end
+  endgenerate
 
   // ---------------------------------------------------------------------------
   // Run state
@@ -104,9 +119,9 @@ module nvrec_wr #(
   reg  [22:0] close_bytes;
   reg  [11:0] pend_w;      // data beats committed to issued bursts, not yet sent
 
-  wire [18:0] chunk_beats = 19'd1 << (chunk_shift - 5'd4);
-  wire [8:0]  lba_beats   = 9'd1 << (lba_shift - 4'd4);
-  wire [8:0]  to4k        = 9'd256 - {1'b0, off_beats[7:0]};
+  wire [18:0] chunk_beats = 19'd1 << (chunk_shift - BEAT_SHIFT);
+  wire [8:0]  lba_beats   = 9'd1 << (lba_shift - BEAT_SHIFT);
+  wire [8:0]  to4k        = (BURST_M1 + 9'd1) - (off_beats[8:0] & BURST_M1);
   wire        at_chunk_start = (off_beats == 19'd0);
   wire        lba_aligned = ((off_beats[8:0] & (lba_beats - 9'd1)) == 9'd0);
   wire        ring_space  = ((opened_cnt - rel_cnt) < {{(31-SLOT_W){1'b0}}, num_chunks});
@@ -126,10 +141,10 @@ module nvrec_wr #(
   wire        wq_empty = (wq_cnt == 4'd0);
   // B queue entry: ends_chunk (the burst completes a full chunk)
   reg         bq_mem [0:BQ_D-1];
-  reg  [4:0]  bq_wr, bq_rd;
-  wire [4:0]  bq_cnt  = bq_wr - bq_rd;
+  reg  [BQ_AW:0] bq_wr, bq_rd;
+  wire [BQ_AW:0] bq_cnt  = bq_wr - bq_rd;
   wire        bq_full = (bq_cnt == BQ_D);
-  wire        bq_empty = (bq_cnt == 5'd0);
+  wire        bq_empty = (bq_cnt == {(BQ_AW+1){1'b0}});
 
   // ---------------------------------------------------------------------------
   // Burst decision: a 4-phase pipeline (timing). The state that a decision
@@ -137,7 +152,7 @@ module nvrec_wr #(
   // the candidate computed in phases 0-2 is consistent when phase 3 issues
   // it. The inputs that change on their own (FIFO count, released slots)
   // only ever become more permissive between phase 0 and phase 3. One burst
-  // per 4 cycles is far more than the W channel can drain (256 beats).
+  // per 4 cycles is far more than the W channel can drain (>= 64 beats).
   // ---------------------------------------------------------------------------
   reg  [1:0]  ph;
   // phase 0 results
@@ -199,7 +214,7 @@ module nvrec_wr #(
         2'd2: begin
           c_off_next <= off_beats + {10'd0, c_len};
           c_ends     <= ((off_beats + {10'd0, c_len}) == chunk_beats);
-          c_addr     <= chunk_addr + {{(ADDR_W-23){1'b0}}, off_beats, 4'd0};
+          c_addr     <= chunk_addr + ({{(ADDR_W-19){1'b0}}, off_beats} << BEAT_SHIFT);
         end
         default: ;
       endcase
@@ -232,7 +247,7 @@ module nvrec_wr #(
       stop_pend     <= 1'b0;
       abort_pend    <= 1'b0;
       wq_wr         <= 4'd0;
-      bq_wr         <= 5'd0;
+      bq_wr         <= {(BQ_AW+1){1'b0}};
     end else begin
       if (m_axi_awvalid && m_axi_awready)
         m_axi_awvalid <= 1'b0;
@@ -256,7 +271,7 @@ module nvrec_wr #(
         if (stop && act)  stop_pend  <= 1'b1;
 
         if (act && !closing && need_slot && !ring_space && !flushing &&
-            (avail >= 256))
+            (avail >= BURST))
           full_cycles <= full_cycles + 64'd1;
 
         if (ph3) begin
@@ -283,7 +298,7 @@ module nvrec_wr #(
             closing <= 1'b1;
             if (!at_chunk_start) begin
               close_req   <= 1'b1;
-              close_bytes <= {off_beats, 4'd0};
+              close_bytes <= off_beats << BEAT_SHIFT;
             end
           end
           // length reached at a chunk boundary
@@ -297,14 +312,14 @@ module nvrec_wr #(
           m_axi_awlen   <= iss_len[7:0] - 8'd1;
           wq_mem[wq_wr[2:0]] <= {iss_pad, iss_len[7:0] - 8'd1};
           wq_wr <= wq_wr + 4'd1;
-          bq_mem[bq_wr[3:0]] <= c_ends;
-          bq_wr <= bq_wr + 5'd1;
+          bq_mem[bq_wr[BQ_AW-1:0]] <= c_ends;
+          bq_wr <= bq_wr + 1'b1;
           if (at_chunk_start)
             opened_cnt <= opened_cnt + 32'd1;
           if (flushing && !iss_pad)
             flush_rem <= flush_rem - {{(CNT_W-8){1'b0}}, iss_len};
           if (iss_pad)
-            pad_bytes <= pad_bytes + {19'd0, iss_len, 4'd0};
+            pad_bytes <= pad_bytes + ({23'd0, iss_len} << BEAT_SHIFT);
           if (c_ends) begin
             off_beats <= 19'd0;
             if ({1'b0, slot} == num_chunks - 1'b1) begin
@@ -340,7 +355,7 @@ module nvrec_wr #(
   wire [7:0] w_lenm1 = wq_head[7:0];
 
   assign m_axi_wvalid = !wq_empty && (w_pad || fifo_tvalid);
-  assign m_axi_wdata  = w_pad ? 128'd0 : fifo_tdata;
+  assign m_axi_wdata  = w_pad ? {DATA_WIDTH{1'b0}} : fifo_tdata;
   assign m_axi_wlast  = (wbeat == w_lenm1);
   assign fifo_tready  = !wq_empty && !w_pad && m_axi_wready;
   wire   w_fire       = m_axi_wvalid && m_axi_wready;
@@ -374,11 +389,11 @@ module nvrec_wr #(
   // B channel: chunk completion
   // ---------------------------------------------------------------------------
   assign m_axi_bready = 1'b1;
-  wire bq_head = bq_mem[bq_rd[3:0]];
+  wire bq_head = bq_mem[bq_rd[BQ_AW-1:0]];
 
   always @(posedge clk) begin
     if (rst) begin
-      bq_rd         <= 5'd0;
+      bq_rd         <= {(BQ_AW+1){1'b0}};
       filled_cnt    <= 32'd0;
       final_partial <= 1'b0;
       last_bytes    <= 23'd0;
@@ -396,7 +411,7 @@ module nvrec_wr #(
       if (close_req)
         close_partial <= 1'b1;
       if (m_axi_bvalid && !bq_empty) begin
-        bq_rd <= bq_rd + 5'd1;
+        bq_rd <= bq_rd + 1'b1;
         if (m_axi_bresp != 2'b00)
           bresp_errs <= bresp_errs + 32'd1;
         if (bq_head)

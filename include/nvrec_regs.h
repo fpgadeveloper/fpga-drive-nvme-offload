@@ -32,6 +32,28 @@
  * _LO latches the matching HI half; read _LO first, then _HI. 64-bit CONFIG
  * registers (addresses, LBAs) are plain RW pairs.
  *
+ * Beats and words (1.2). The fabric datapath (source stream, ingest FIFO,
+ * ring writer/reader AXI4 master, egress FIFO, sink stream) is DATA_WIDTH
+ * bits wide, an RTL parameter: 128, 256 or 512. One transfer on it is a
+ * fabric BEAT of BEAT_BYTES = DATA_WIDTH / 8 bytes (16, 32 or 64; register
+ * BEAT_BYTES at 0x0BC); BEAT_SHIFT = log2(BEAT_BYTES). The test pattern is
+ * defined on 16-byte WORDS: a beat carries BEAT_BYTES / 16 consecutive words.
+ * Units of the counters:
+ *   fabric beats  : ING_BEATS_IN, ING_BEATS_OUT, ING_DROP_COUNT,
+ *                   RUN_DROP_COUNT, ING_FIFO_DEPTH, ING_FIFO_HWM,
+ *                   RUN_FIFO_HWM, EGR_FIFO_DEPTH, EGR_FIFO_LEVEL,
+ *                   EGR_BEATS_IN, EGR_DISCARD, CHK_BEATS, CHK_ERRORS (a beat
+ *                   with any bad word counts once), CHK_GAP_BEATS
+ *   16-byte words : TPG_SEQ_NEXT, CHK_LAST_SEQ (and first_seq in the file
+ *                   header written by the apps)
+ *   bytes         : BYTES, PAD_BYTES, CHUNK_SIZE, LAST_CHUNK_BYTES
+ *   chunks / slots: CHUNKS_*, CMDS_*, RING_FILL, RING_HWM, NUM_CHUNKS,
+ *                   MAX_SLOTS, LENGTH_CHUNKS
+ *   src_clk ticks : CHK_UNDERFLOWS
+ *   dp_clk cycles : TIMESTAMP, RING_FULL_CYCLES, LAT_*
+ * Source / sink rates (TPG_RATE_INC, CHK_RATE_INC):
+ *     bytes/s = INC / 2^31 * SRC_CLK_HZ * BEAT_BYTES
+ *
  * Changelog:
  *   1.0 (2026-10-16) first version.
  *   1.0 rev b (2026-10-16, before any bitstream): Host Accelerator built with
@@ -44,6 +66,11 @@
  *       bit 12 HA_DEAD, IRQ_STATUS/IRQ_ENABLE bit 6 HA_DEAD; RUN_FIFO_HWM
  *       (0x258); SSD_ISSUED and INJ_SUBMITTED are now cleared by SOFT_RST like
  *       SSD_COMPLETED / SSD_ERRORS / INJ_COMPLETED (they used to survive it).
+ *   1.2 (2026-10-22): DATA_WIDTH 128/256/512 (same numbering as fdrec 1.2,
+ *       the offsets are shared): BEAT_BYTES (0x0BC, RO); every beat counter,
+ *       FIFO depth/level/HWM in fabric beats of BEAT_BYTES; BYTES (0x220) =
+ *       beats << BEAT_SHIFT in record; CONFIG bit 2 DRY (fabric-only run, no
+ *       NVMe command); MAX_SLOTS 2048 on the reference designs.
  */
 
 #ifndef NVREC_REGS_H
@@ -111,7 +138,11 @@
 #define NVREC_VERSION                   0x000
 #define NVREC_VERSION_1_0               0x00010000u
 #define NVREC_VERSION_1_1               0x00010001u
-#define NVREC_VERSION_EXPECTED          NVREC_VERSION_1_1   /* same major accepted */
+#define NVREC_VERSION_1_2               0x00010002u   /* 1.2: + BEAT_BYTES (DATA_WIDTH), DRY */
+#define NVREC_VERSION_EXPECTED          NVREC_VERSION_1_2
+#define NVREC_VERSION_MAJOR_SHIFT       16
+#define NVREC_VERSION_MAJOR_MASK        0xFFFF0000u
+#define NVREC_VERSION_MINOR_MASK        0x0000FFFFu
 
 /* 0x004 SRC_CLK_HZ (RO), 0x008 DP_CLK_HZ (RO): clock frequencies in Hz */
 #define NVREC_SRC_CLK_HZ                0x004
@@ -130,15 +161,22 @@
 #define NVREC_GLOBAL_CTRL_SOFT_RST      (1u << 0)
 
 /* ---- Test pattern generator (fdrec_tpg), identical to fdrec ------------- */
+/* Pattern on 16-byte words: word[63:0] = seq, word[127:64] = ~seq; a beat
+ * carries BEAT_BYTES / 16 consecutive words, word k in TDATA[128k+127:128k]
+ * with seq + k. The byte stream is the same at every DATA_WIDTH. */
 #define NVREC_TPG_CTRL                  0x010
 #define NVREC_TPG_CTRL_ENABLE           (1u << 0)
 #define NVREC_TPG_CTRL_SEQ_RST          (1u << 1)   /* SC: seq := 0 */
-#define NVREC_TPG_RATE_INC              0x014       /* Q1.31 beats per src_clk */
+/* Q1.31 fraction of one BEAT per src_clk (0x8000_0000 = 1 beat/clock):
+ *     bytes/s = TPG_RATE_INC / 2^31 * SRC_CLK_HZ * BEAT_BYTES */
+#define NVREC_TPG_RATE_INC              0x014
 #define NVREC_TPG_RATE_INC_ONE          0x80000000u
+/* seq of word 0 of the next beat (in 16-byte WORDS; + BEAT_BYTES/16 per beat) */
 #define NVREC_TPG_SEQ_NEXT_LO           0x018
 #define NVREC_TPG_SEQ_NEXT_HI           0x01C
 
 /* ---- Ingest (fdrec_ingest), identical to fdrec ------------------------- */
+/* All ING_ values in fabric beats. */
 #define NVREC_ING_STATUS                0x020
 #define NVREC_ING_STATUS_OVERFLOW       (1u << 0)   /* sticky, W1C */
 #define NVREC_ING_FIFO_HWM              0x024       /* any write clears */
@@ -146,6 +184,9 @@
 #define NVREC_ING_DROP_COUNT_HI         0x02C
 #define NVREC_ING_BEATS_IN_LO           0x030
 #define NVREC_ING_BEATS_IN_HI           0x034
+/* RO: ingest FIFO depth in beats (RTL parameter; 256 KB on the reference
+ * designs = 8192 beats on Zynq UltraScale+ (256 bits), 4096 on vck190_fmcp1
+ * (512 bits)) */
 #define NVREC_ING_FIFO_DEPTH            0x038
 
 /* 0x03C ID (RO): 0x4E56_5243 ("NVRC"), tells nvrec_core from fdrec_core */
@@ -164,18 +205,23 @@
 #define NVREC_CHK_CTRL                  0x060
 #define NVREC_CHK_CTRL_ENABLE           (1u << 0)
 #define NVREC_CHK_CTRL_RESET            (1u << 1)   /* SC, reads 1 while busy */
-#define NVREC_CHK_RATE_INC              0x064       /* reset 0x8000_0000 */
-#define NVREC_CHK_BEATS_LO              0x070
+/* reset 0x8000_0000: bytes/s = CHK_RATE_INC / 2^31 * SRC_CLK_HZ * BEAT_BYTES */
+#define NVREC_CHK_RATE_INC              0x064
+#define NVREC_CHK_BEATS_LO              0x070       /* beats accepted */
 #define NVREC_CHK_BEATS_HI              0x074
+/* bad beats (a beat in which any word is bad counts once) + good beats whose
+ * seq is lower than expected */
 #define NVREC_CHK_ERRORS_LO             0x078
 #define NVREC_CHK_ERRORS_HI             0x07C
-#define NVREC_CHK_GAPS_LO               0x080
+#define NVREC_CHK_GAPS_LO               0x080       /* gap events */
 #define NVREC_CHK_GAPS_HI               0x084
+/* missing beats: sum over the gap events of (seq - expected) / (BEAT_BYTES/16)
+ * (= the recording's drop count for a TPG recording of the same BEAT_BYTES) */
 #define NVREC_CHK_GAP_BEATS_LO          0x088
 #define NVREC_CHK_GAP_BEATS_HI          0x08C
-#define NVREC_CHK_UNDERFLOWS_LO         0x090
+#define NVREC_CHK_UNDERFLOWS_LO         0x090       /* src_clk throttle ticks without data */
 #define NVREC_CHK_UNDERFLOWS_HI         0x094
-#define NVREC_CHK_LAST_SEQ_LO           0x098
+#define NVREC_CHK_LAST_SEQ_LO           0x098       /* seq of word 0 of the last good beat (WORDS) */
 #define NVREC_CHK_LAST_SEQ_HI           0x09C
 
 /* ---- Egress FIFO (fdrec_egress), identical to fdrec -------------------- */
@@ -183,6 +229,9 @@
  * AXI DMA MM2S of fdrec; TLAST marks the end of each chunk. */
 #define NVREC_EGR_CTRL                  0x0A0
 #define NVREC_EGR_CTRL_FLUSH            (1u << 0)
+/* RO: egress FIFO depth in beats (RTL parameter; 4096 beats on the reference
+ * designs = 128 KB on Zynq UltraScale+ (256 bits), 256 KB on vck190_fmcp1
+ * (512 bits)) */
 #define NVREC_EGR_FIFO_DEPTH            0x0A4
 #define NVREC_EGR_BEATS_IN_LO           0x0A8
 #define NVREC_EGR_BEATS_IN_HI           0x0AC
@@ -190,7 +239,12 @@
 #define NVREC_EGR_DISCARD_HI            0x0B4
 #define NVREC_EGR_FIFO_LEVEL            0x0B8
 
-/* 0x0BC-0x0FF: reserved */
+/* 0x0BC BEAT_BYTES (RO, 1.2): bytes per fabric beat = DATA_WIDTH / 8 (16, 32
+ * or 64). Reads 0 on register map 1.0/1.1, whose datapath is 128 bits: use
+ * NVREC_BEAT_BYTES_DEFAULT then. Same offset as fdrec's FDREC_BEAT_BYTES_REG. */
+#define NVREC_BEAT_BYTES_REG            0x0BC
+
+/* 0x0C0-0x0FF: reserved */
 
 /* ===========================================================================
  * NVMe offload engine (nvrec_wr ring writer, nvrec_cmd command builder,
@@ -256,6 +310,26 @@
 #define NVREC_CONFIG                    0x104
 #define NVREC_CONFIG_MODE_PLAY          (1u << 0)   /* 0 = record (Write), 1 = playback (Read) */
 #define NVREC_CONFIG_FUA                (1u << 1)   /* set FUA in every Write */
+/*
+ * DRY (1.2): fabric-only run, no NVMe command is built (the SSDs, the Host
+ * Accelerator and the credits are not touched: CMDS_* and LAT_* stay 0,
+ * SSD_* do not change; the injector keeps working).
+ *   record:   the ring writer runs as usual (bursts into the ring, ingest
+ *             drops when it cannot keep up) and every slot is released as soon
+ *             as it is filled; CHUNKS_RELEASED = CHUNKS_FILLED. STOP /
+ *             LENGTH_CHUNKS / ABORT as usual; DRAIN ends when the writer is done.
+ *   playback: every chunk counts as completed at START; the ring reader streams
+ *             chunks 0 .. LENGTH_CHUNKS-1 from slot c % NUM_CHUNKS into the
+ *             egress FIFO / sink. After a DRY record with LENGTH_CHUNKS =
+ *             NUM_CHUNKS, a DRY playback with the same RING_BASE / CHUNK_SIZE /
+ *             NUM_CHUNKS and LENGTH_CHUNKS = NUM_CHUNKS reads that recording
+ *             back from the ring = ring-resident test.
+ *             LENGTH_CHUNKS > NUM_CHUNKS wraps over the same slots (the
+ *             checker then sees the sequence restart).
+ *   RING_FILL / RING_HWM: record = chunks opened by the writer and not yet
+ *   filled (at most 2); playback = 0.
+ */
+#define NVREC_CONFIG_DRY                (1u << 2)
 #define NVREC_CONFIG_N_MEMBERS_SHIFT    4           /* [5:4] stripe members: 1 or 2 (0 = 1) */
 #define NVREC_CONFIG_N_MEMBERS_MASK     (3u << 4)
 #define NVREC_CONFIG_CREDIT_PER_CQE     (1u << 8)   /* 1 = ignore M_AXIS tuser credit, +1 per CQE */
@@ -310,7 +384,9 @@
 #define NVREC_LENGTH_CHUNKS             0x148   /* 0 = until STOP (record only) */
 #define NVREC_LAST_CHUNK_BYTES          0x14C   /* playback: bytes of the last chunk, 0 = full;
                                                    multiple of the LBA size */
-#define NVREC_MAX_SLOTS                 0x150   /* RO: slot table size (RTL parameter, 1024) */
+#define NVREC_MAX_SLOTS                 0x150   /* RO: slot table size = 2^SLOT_W (RTL
+                                                   parameter; 2048 on the 1.2 reference
+                                                   designs, 1024 before) */
 #define NVREC_CREDIT_INIT               0x154   /* RW: initial credits per SSD, reset 63 */
 
 /* ---- Stripe members m = 0, 1 (RW, latched at START) -------------------- */
@@ -353,20 +429,23 @@
 #define NVREC_CMDS_DONE_HI              0x214
 #define NVREC_CMD_ERRORS                0x218   /* builder CQEs with status != 0 */
 #define NVREC_UNEXPECTED_CQES           0x21C   /* CQEs for a slot not in flight */
-#define NVREC_BYTES_LO                  0x220   /* record: data bytes stored (without padding);
-                                                   playback: bytes streamed to the sink */
+#define NVREC_BYTES_LO                  0x220   /* record: data bytes stored (without padding)
+                                                   = beats taken from the ingest FIFO in this
+                                                   run << BEAT_SHIFT; playback: bytes streamed
+                                                   to the sink (BEAT_BYTES per beat) */
 #define NVREC_BYTES_HI                  0x224
 #define NVREC_RING_FILL                 0x228   /* slots in use now */
 #define NVREC_RING_HWM                  0x22C   /* max RING_FILL; any write clears */
 #define NVREC_ERR_LAST_STATUS           0x230   /* [14:0] CQE status (DW3[31:17]), [20:16] SSD,
                                                    [31] valid */
 #define NVREC_ERR_LAST_CID              0x234   /* [15:0] CID, [31:16] SQID of the last error */
-#define NVREC_CHUNKS_RELEASED_LO        0x238   /* slots completed + released in order */
+#define NVREC_CHUNKS_RELEASED_LO        0x238   /* slots completed + released in order
+                                                   (DRY record: = CHUNKS_FILLED) */
 #define NVREC_CHUNKS_RELEASED_HI        0x23C
 #define NVREC_PAD_BYTES                 0x240   /* zero bytes added to the last chunk at STOP */
 #define NVREC_RING_FULL_CYCLES_LO       0x248   /* dp_clk cycles the writer waited for a slot */
 #define NVREC_RING_FULL_CYCLES_HI       0x24C
-/* RUN_DROP_COUNT (64-bit): ingest drops while the record run was ACCEPTING
+/* RUN_DROP_COUNT (64-bit, beats): ingest drops while the record run was ACCEPTING
  * data (from START until STOP is seen / LENGTH_CHUNKS reached / ABORT).
  * ING_DROP_COUNT keeps counting while the source runs after that; a
  * recording is valid when RUN_DROP_COUNT = 0. (Taken from the ingest
@@ -436,7 +515,9 @@
 #define NVREC_DB_ENTRIES                8
 
 /* ---- Datapath constants ------------------------------------------------- */
-#define NVREC_BEAT_BYTES                16          /* 128-bit AXI-Stream beat */
+/* The beat size is NOT a constant (1.2): read NVREC_BEAT_BYTES_REG. */
+#define NVREC_WORD_BYTES                16          /* one test-pattern word */
+#define NVREC_BEAT_BYTES_DEFAULT        16          /* BEAT_BYTES reads 0 (map < 1.2) */
 #define NVREC_PAGE_SIZE                 4096        /* NVMe MPS = 0 */
 
 /* ===========================================================================

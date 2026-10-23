@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /*
- * nvverify -- verify a recording beat by beat (port of fpga-drive-recorder's
+ * nvverify -- verify a recording word by word (port of fpga-drive-recorder's
  * fdverify).
  *
  * Copyright (C) 2026, Opsero Electronic Design Inc.  All rights reserved.
@@ -8,14 +8,24 @@
  * Reads nvrec recordings (data at the header's header_size offset) and fdrec
  * recordings (data at 4096), or -- with --raw -- a byte range of a block
  * device recorded by "nvrec --raw" (no header). It streams the data with
- * large reads and checks every 16-byte beat of a test-pattern recording:
- *     upper == ~lower           (else: corrupted beat)
+ * large reads and checks every 16-byte pattern WORD of a test-pattern
+ * recording:
+ *     upper == ~lower           (else: corrupted word)
  *     lower == previous + 1     (else: discontinuity = dropped beats)
- * and compares the beat count and the number of missing beats with the
- * header's data_bytes and drop_count.
+ * and compares the size and the number of missing words with the header's
+ * data_bytes and drop_count.
+ *
+ * Units: the pattern is defined on 16-byte words whatever the fabric beat
+ * size, so the check, the discontinuities and the "words missing" count are
+ * per word. The header's beat_bytes is the recorder's fabric beat (16, 32 or
+ * 64 bytes); its drop_count is in those beats, and a dropped beat leaves a
+ * gap of beat_bytes / 16 words at a beat boundary: words missing =
+ * drop_count x beat_bytes / 16. A gap that is not whole beats at a beat
+ * boundary is corruption, not a drop. This is also the relation between the
+ * hardware checker's CHK_GAP_BEATS (beats) and the gaps found here (words).
  *
  * Exit code 0 only on a clean file: complete header, size consistent, no
- * corrupted beats, no discontinuities, drop_count 0. 1 otherwise (2 for usage
+ * corrupted words, no discontinuities, drop_count 0. 1 otherwise (2 for usage
  * or I/O errors).
  */
 
@@ -42,8 +52,15 @@
 
 const char *prog_name = "nvverify";
 
-#define CHUNK           (8u << 20)      /* read size */
-#define BEAT            16u
+#define CHUNK           (8u << 20)      /* read size, a multiple of every beat size */
+#define WORD            16u             /* one 16-byte pattern word */
+#define MAX_BEAT        4096u           /* sanity limit for beat_bytes */
+
+/* beat_bytes of a header (or --beat-bytes): a power of two, 16 .. 4096 */
+static bool beat_ok(uint32_t b)
+{
+	return b >= WORD && b <= MAX_BEAT && !(b & (b - 1));
+}
 
 static void usage(FILE *f)
 {
@@ -52,14 +69,19 @@ static void usage(FILE *f)
 "       nvverify [options] --raw --length <bytes> [--offset <bytes>] <blockdev>\n"
 "\n"
 "Verify an nvrec (or fdrec) recording: parse the header, then check every\n"
-"16-byte beat of the test pattern (upper == ~lower, lower == previous + 1).\n"
+"16-byte word of the test pattern (upper == ~lower, lower == previous + 1).\n"
+"Recordings with 16-, 32- and 64-byte fabric beats (128/256/512-bit designs)\n"
+"are all checked per 16-byte word; gaps are reported in words and compared\n"
+"with the header's drop_count (in beats) x beat_bytes / 16.\n"
 "\n"
 "Options:\n"
 "  --raw              <blockdev> holds a raw recording (nvrec --raw): no header,\n"
-"                     the first beat may have any sequence number\n"
+"                     the first word may have any sequence number\n"
 "  --offset <bytes>   raw: start of the recording on the device (default 0)\n"
 "  --length <bytes>   raw: bytes to check (required)\n"
-"  --max-errors <n>   print at most n discontinuities and n corrupted beats\n"
+"  --beat-bytes <n>   raw: the recorder's fabric beat, 16/32/64 (default: 16 =\n"
+"                     no beat-boundary check of the gaps)\n"
+"  --max-errors <n>   print at most n discontinuities and n corrupted words\n"
 "                     (default 20; all are still counted)\n"
 "  --header-only      only parse and print the header\n"
 "  --pattern          check the test pattern even if the header says the\n"
@@ -67,7 +89,7 @@ static void usage(FILE *f)
 "  -q, --quiet        no progress output\n"
 "  -h, --help         this help\n"
 "\n"
-"Exit code: 0 = clean file (no dropped, missing or corrupted beats),\n"
+"Exit code: 0 = clean file (no dropped beats, no missing or corrupted words),\n"
 "1 = problems found, 2 = usage or I/O error.\n");
 }
 
@@ -84,7 +106,7 @@ static void print_time(const char *label, uint64_t ns)
 
 int main(int argc, char **argv)
 {
-	static const struct option lo[] = {
+	static const struct option longopts[] = {
 		{ "max-errors", required_argument, NULL, 'm' },
 		{ "header-only", no_argument, NULL, 'H' },
 		{ "pattern", no_argument, NULL, 'P' },
@@ -92,6 +114,7 @@ int main(int argc, char **argv)
 		{ "raw", no_argument, NULL, 'R' },
 		{ "offset", required_argument, NULL, 'o' },
 		{ "length", required_argument, NULL, 'l' },
+		{ "beat-bytes", required_argument, NULL, 'B' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -99,9 +122,10 @@ int main(int argc, char **argv)
 	bool raw = false;
 	uint64_t raw_off = 0, raw_len = 0;
 	uint64_t max_err = 20, file_size, data_len, hdr_bytes, hdr_drops;
-	uint64_t beats = 0, first = 0, expected = 0, gaps = 0, missing = 0;
+	uint64_t words = 0, first = 0, expected = 0, gaps = 0, missing = 0;
 	uint64_t backward = 0, corrupt = 0, printed_gaps = 0, printed_bad = 0;
-	uint32_t flags, hsize;
+	uint64_t odd_gaps = 0, hdr_drop_words, raw_beat = WORD;
+	uint32_t flags, hsize, beat, wpb;
 	bool header_only = false, force_pattern = false, quiet = false;
 	bool check, ok = true, have_prev = false;
 	uint8_t *buf;
@@ -110,7 +134,7 @@ int main(int argc, char **argv)
 	int fd, c;
 	uint64_t off;
 
-	while ((c = getopt_long(argc, argv, "qh", lo, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "qh", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'm':
 			if (parse_size(optarg, &max_err))
@@ -135,6 +159,11 @@ int main(int argc, char **argv)
 		case 'l':
 			if (parse_size(optarg, &raw_len) || !raw_len)
 				return die_usage("invalid --length '%s'", optarg), 2;
+			break;
+		case 'B':
+			if (parse_size(optarg, &raw_beat) || raw_beat > MAX_BEAT ||
+			    !beat_ok((uint32_t)raw_beat))
+				return die_usage("--beat-bytes must be a power of two, 16..%u", MAX_BEAT), 2;
 			break;
 		case 'h':
 			usage(stdout);
@@ -161,7 +190,7 @@ int main(int argc, char **argv)
 			err_msg("--raw needs --length");
 			return 2;
 		}
-		if (raw_off % 4096 || raw_len % BEAT) {
+		if (raw_off % 4096 || raw_len % WORD) {
 			err_msg("--offset must be 4 KB aligned and --length a multiple of 16");
 			return 2;
 		}
@@ -171,8 +200,13 @@ int main(int argc, char **argv)
 		hdr_bytes = raw_len;
 		hdr_drops = 0;
 		data_len = raw_len;
-		printf("%s: raw, bytes %" PRIu64 "..%" PRIu64 "\n", argv[optind], raw_off,
-		       raw_off + raw_len);
+		beat = (uint32_t)raw_beat;
+		wpb = beat / WORD;
+		hdr_drop_words = 0;
+		printf("%s: raw, bytes %" PRIu64 "..%" PRIu64 ", %u-byte beats\n", argv[optind], raw_off,
+		       raw_off + raw_len, beat);
+		if (raw_len % beat)
+			printf("note: --length is not a whole number of %u-byte beats\n", beat);
 		goto data;
 	}
 	if (pread(fd, &h, sizeof(h), 0) != (ssize_t)sizeof(h)) {
@@ -189,10 +223,11 @@ int main(int argc, char **argv)
 	flags = le32toh(h.flags);
 	hdr_bytes = le64toh(h.data_bytes);
 	hdr_drops = le64toh(h.drop_count);
+	beat = le32toh(h.beat_bytes);
 
 	printf("%s:\n", argv[optind]);
 	printf("  header          %.5s version %u, data at %u, %u-byte beats\n",
-	       h.magic, le32toh(h.header_version), hsize, le32toh(h.beat_bytes));
+	       h.magic, le32toh(h.header_version), hsize, beat);
 	printf("  flags           0x%x (%s, %s)\n", flags,
 	       flags & NVREC_FILE_FLAG_TPG ? "test pattern" : "user source",
 	       flags & NVREC_FILE_FLAG_COMPLETE ? "complete" : "INCOMPLETE");
@@ -205,7 +240,7 @@ int main(int argc, char **argv)
 	print_time("start", le64toh(h.start_time_ns));
 	print_time("stop", le64toh(h.stop_time_ns));
 	printf("  data_bytes      %" PRIu64 "\n", hdr_bytes);
-	printf("  drop_count      %" PRIu64 "\n", hdr_drops);
+	printf("  drop_count      %" PRIu64 " beats\n", hdr_drops);
 	printf("  first_seq       %" PRIu64 "\n", (uint64_t)le64toh(h.first_seq));
 	if (!memcmp(h.magic, NVREC_FILE_MAGIC, NVREC_FILE_MAGIC_LEN)) {
 		printf("  chunk / members %u bytes / %u, start chunk %" PRIu64 ", qd %u\n",
@@ -219,16 +254,20 @@ int main(int argc, char **argv)
 			ok = false;
 		}
 		if (le32toh(h.header_version) != NVREC_FILE_HEADER_VERSION ||
-		    hsize < NVREC_FILE_HEADER_BYTES || hsize % 4096 ||
-		    le32toh(h.beat_bytes) != BEAT) {
-			err_msg("unsupported header (version/size/beat_bytes)");
+		    hsize < NVREC_FILE_HEADER_BYTES || hsize % 4096 || !beat_ok(beat)) {
+			err_msg("unsupported header (version %u, size %u, beat_bytes %u)",
+				le32toh(h.header_version), hsize, beat);
 			return 1;
 		}
 	} else if (le32toh(h.header_version) != 1 || hsize != FDREC_FILE_HEADER_SIZE ||
-		   le32toh(h.beat_bytes) != BEAT) {
-		err_msg("unsupported fdrec header (version/size/beat_bytes)");
+		   !beat_ok(beat)) {
+		/* fdrec 1.3 (256-bit) files have 32-byte beats */
+		err_msg("unsupported fdrec header (version %u, size %u, beat_bytes %u)",
+			le32toh(h.header_version), hsize, beat);
 		return 1;
 	}
+	wpb = beat / WORD;
+	hdr_drop_words = hdr_drops * wpb;
 	if (!(flags & NVREC_FILE_FLAG_COMPLETE)) {
 		printf("PROBLEM: header not finalized (recording interrupted?)\n");
 		ok = false;
@@ -239,14 +278,15 @@ int main(int argc, char **argv)
 		       data_len, hdr_bytes);
 		ok = false;
 	}
-	if (data_len % BEAT) {
-		printf("PROBLEM: data length %" PRIu64 " is not a multiple of %u\n",
-		       data_len, BEAT);
+	if (data_len % beat) {
+		printf("PROBLEM: data length %" PRIu64 " is not a multiple of the %u-byte beat\n",
+		       data_len, beat);
 		ok = false;
-		data_len -= data_len % BEAT;
+		data_len -= data_len % WORD;	/* still check every whole word */
 	}
 	if (hdr_drops) {
-		printf("PROBLEM: the recorder dropped %" PRIu64 " beats\n", hdr_drops);
+		printf("PROBLEM: the recorder dropped %" PRIu64 " beats (%" PRIu64 " words)\n",
+		       hdr_drops, hdr_drop_words);
 		ok = false;
 	}
 	if (header_only)
@@ -276,12 +316,12 @@ data:
 			perr("read at offset %" PRIu64, hsize + off);
 			return 2;
 		}
-		n -= n % BEAT;
+		n -= n % WORD;
 		if (!n) {
 			err_msg("short read at offset %" PRIu64, hsize + off);
 			return 2;
 		}
-		for (i = 0; i < (size_t)n; i += BEAT) {
+		for (i = 0; i < (size_t)n; i += WORD) {
 			uint64_t lo, hi;
 
 			memcpy(&lo, buf + i, 8);
@@ -291,9 +331,9 @@ data:
 			if (hi != ~lo) {
 				/* do not trust lo: assume the expected value */
 				if (printed_bad < max_err) {
-					printf("CORRUPT beat %" PRIu64 " at file offset %" PRIu64
+					printf("CORRUPT word %" PRIu64 " at file offset %" PRIu64
 					       ": lower 0x%016" PRIx64 " upper 0x%016" PRIx64 "\n",
-					       beats, hsize + off + i, lo, hi);
+					       words, hsize + off + i, lo, hi);
 					printed_bad++;
 				}
 				corrupt++;
@@ -302,7 +342,7 @@ data:
 					first = 0;
 				}
 				expected++;
-				beats++;
+				words++;
 				continue;
 			}
 			if (!have_prev) {
@@ -311,25 +351,31 @@ data:
 			} else if (lo != expected) {
 				if (printed_gaps < max_err) {
 					if (lo > expected)
-						printf("GAP at beat %" PRIu64 " (file offset %" PRIu64
+						printf("GAP at word %" PRIu64 " (file offset %" PRIu64
 						       "): expected %" PRIu64 ", found %" PRIu64
-						       ", %" PRIu64 " beats missing\n",
-						       beats, hsize + off + i, expected, lo,
+						       ", %" PRIu64 " words missing\n",
+						       words, hsize + off + i, expected, lo,
 						       lo - expected);
 					else
-						printf("BACKWARD at beat %" PRIu64 " (file offset %" PRIu64
+						printf("BACKWARD at word %" PRIu64 " (file offset %" PRIu64
 						       "): expected %" PRIu64 ", found %" PRIu64 "\n",
-						       beats, hsize + off + i, expected, lo);
+						       words, hsize + off + i, expected, lo);
 					printed_gaps++;
 				}
 				gaps++;
-				if (lo > expected)
+				if (lo > expected) {
 					missing += lo - expected;
-				else
+					/* a dropped beat removes wpb words, and
+					 * beats start on a word boundary of the
+					 * beat: anything else is not a drop */
+					if ((lo - expected) % wpb || words % wpb)
+						odd_gaps++;
+				} else {
 					backward++;
+				}
 			}
 			expected = lo + 1;
-			beats++;
+			words++;
 		}
 		off += (uint64_t)n;
 		if (!quiet && isatty(2) && now_s() - tlast >= 1.0) {
@@ -343,40 +389,46 @@ data:
 	free(buf);
 	close(fd);
 
-	printf("  beats           %" PRIu64 " (%" PRIu64 " bytes)\n", beats, beats * BEAT);
+	printf("  words           %" PRIu64 " (%" PRIu64 " bytes, %" PRIu64 " beats of %u bytes%s)\n",
+	       words, words * WORD, words / wpb, beat, words % wpb ? " + a partial beat" : "");
 	printf("  first sequence  %" PRIu64 "%s\n", first,
-	       !raw && beats && first != le64toh(h.first_seq) ? " (DIFFERS from header first_seq)" : "");
-	printf("  last sequence   %" PRIu64 "\n", beats ? expected - 1 : 0);
-	printf("  discontinuities %" PRIu64 "%s, beats missing %" PRIu64 "\n", gaps,
-	       gaps > printed_gaps ? " (list capped)" : "", missing);
-	printf("  corrupted beats %" PRIu64 "%s\n", corrupt,
+	       !raw && words && first != le64toh(h.first_seq) ? " (DIFFERS from header first_seq)" : "");
+	printf("  last sequence   %" PRIu64 "\n", words ? expected - 1 : 0);
+	printf("  discontinuities %" PRIu64 "%s, words missing %" PRIu64 " (%" PRIu64 " beats%s)\n",
+	       gaps, gaps > printed_gaps ? " (list capped)" : "", missing, missing / wpb,
+	       missing % wpb ? " + a partial beat" : "");
+	printf("  corrupted words %" PRIu64 "%s\n", corrupt,
 	       corrupt > printed_bad ? " (list capped)" : "");
 
-	if (!beats) {
+	if (!words) {
 		printf("PROBLEM: no data\n");
 		ok = false;
 	}
-	if (!raw && beats && first != le64toh(h.first_seq)) {
-		printf("PROBLEM: first beat %" PRIu64 " != header first_seq %" PRIu64
-		       " (beats missing at the start)\n", first,
+	if (!raw && words && first != le64toh(h.first_seq)) {
+		printf("PROBLEM: first word %" PRIu64 " != header first_seq %" PRIu64
+		       " (words missing at the start)\n", first,
 		       (uint64_t)le64toh(h.first_seq));
 		ok = false;
 	}
 	if (corrupt || gaps)
 		ok = false;
-	/* The header's drop count is read when the last buffer completed, so it
+	if (odd_gaps)
+		printf("PROBLEM: %" PRIu64 " discontinuities are not whole %u-byte beats (a dropped beat removes %u words at a beat boundary): data corrupted, not dropped\n",
+		       odd_gaps, beat, wpb);
+	/* The header's drop count is read when the last chunk completed, so it
 	 * may include drops after the last recorded beat: it must cover what is
-	 * missing, and be 0 when nothing is. */
-	if (missing > hdr_drops) {
-		printf("PROBLEM: %" PRIu64 " beats missing but the header reports only %" PRIu64
-		       " dropped\n", missing, hdr_drops);
+	 * missing, and be 0 when nothing is. Compared in words. */
+	if (missing > hdr_drop_words) {
+		printf("PROBLEM: %" PRIu64 " words missing but the header reports only %" PRIu64
+		       " beats (%" PRIu64 " words) dropped\n", missing, hdr_drops, hdr_drop_words);
 		ok = false;
-	} else if (missing && missing != hdr_drops) {
-		printf("note: header drop_count %" PRIu64 " >= %" PRIu64
-		       " beats missing in the file (drops after the last recorded beat)\n",
-		       hdr_drops, missing);
+	} else if (missing && missing != hdr_drop_words) {
+		printf("note: header drop_count %" PRIu64 " beats (%" PRIu64 " words) >= %" PRIu64
+		       " words missing in the file (drops after the last recorded beat)\n",
+		       hdr_drops, hdr_drop_words, missing);
 	} else if (missing) {
-		printf("note: missing beats match the header drop_count exactly\n");
+		printf("note: missing words match the header drop_count exactly (%" PRIu64 " beats x %u words)\n",
+		       hdr_drops, wpb);
 	}
 	printf("RESULT %s\n", ok ? "PASS" : "FAIL");
 	return ok ? 0 : 1;

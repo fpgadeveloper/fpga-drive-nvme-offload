@@ -64,6 +64,10 @@ proc str_contains {str substr} {
   }
 }
 
+# nvrec datapath parameters of this target (nvrec_data_width, FIFO depths,
+# nvrec_bridge_split, ...)
+source [file join [file dirname [file normalize [info script]]] nvrec_params.tcl]
+
 # Target board checks
 set is_vck190 [str_contains $target "vck190"]
 set is_vmk180 [str_contains $target "vmk180"]
@@ -1266,8 +1270,10 @@ connect_bd_net [get_bd_pins versal_cips_0/pl0_resetn] [get_bd_pins reset_pl0/ext
 connect_bd_net [get_bd_pins versal_cips_0/pl0_ref_clk] [get_bd_pins reset_pl0/slowest_sync_clk]
 
 # Add smartconnect for the M_AXI_BRIDGE of the QDMA
+# (nvrec_bridge_split: qdma_1 gets its own SmartConnect and NoC NMU further
+# below, so this one only carries qdma_0)
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smc_m_axi_bridge
-if {$dual_design} {
+if {$dual_design && !$nvrec_bridge_split} {
   set_property -dict [list CONFIG.NUM_CLKS {3} CONFIG.NUM_MI {1} CONFIG.NUM_SI {2}] [get_bd_cells smc_m_axi_bridge]
   connect_bd_intf_net [get_bd_intf_pins smc_m_axi_bridge/M00_AXI] [get_bd_intf_pins axi_noc_0/S08_AXI]
   connect_bd_intf_net [get_bd_intf_pins qdma_0/M_AXI_BRIDGE] [get_bd_intf_pins smc_m_axi_bridge/S00_AXI]
@@ -1333,8 +1339,8 @@ if {$dual_design} {
 # FPGA Drive NVMe offload recorder (nvrec), Versal
 # ##########################################################
 #
-#  user_data_source (src_clk)        nvrec_core_0 (dp_clk)                    nvmeha_0 (AMD NVMe
-#  [fdrec_tpg] --AXIS 128b--> [ingest -> ring writer] --AXI4--> axi_smc_dma -> axi_noc_0 (PL NMU) -> DDR MC
+#  user_data_source (src_clk 250)    nvrec_core_0 (dp_clk 250)                nvmeha_0 (AMD NVMe
+#  [fdrec_tpg] --AXIS DWb--> [ingest -> ring writer] --AXI4 DWb--> axi_smc_dma -> axi_noc_0 (PL NMU, DWb) -> DDR MC
 #                             [cmd builder] --SQE AXIS 512b--> S_AXIS    Host Accelerator)
 #                             [cq router]   <--CQE AXIS 128b-- M_AXIS
 #                             [dbmon] <--- M_AXI_SSD (doorbells) ; m_axi_db -> smc_m_axi_fpd -> qdma_N/S_AXI_BRIDGE
@@ -1343,6 +1349,10 @@ if {$dual_design} {
 #  SSD DMA:  qdma_N/M_AXI_BRIDGE -> smc_m_axi_bridge -+-> axi_noc_0/S08_AXI -> DDR MC (data, PRP lists,
 #                                                    |                       admin queues)
 #                                                    +-> nvmeha_0/S_AXI_SSD (I/O SQ/CQ memory, 0x9000_0000)
+#            nvrec_bridge_split (512-bit build): one NMU per bridge
+#            qdma_0/M_AXI_BRIDGE -> smc_m_axi_bridge   -+-> axi_noc_0/S08_AXI -> MC_1
+#            qdma_1/M_AXI_BRIDGE -> smc_m_axi_bridge_1 -+-> axi_noc_0/Snn_AXI -> MC_3
+#                                     (both M01) -> smc_q -> nvmeha_0/S_AXI_SSD
 #  PS:       M_AXI_FPD -> smc_m_axi_fpd -> qdma_N/S_AXI_BRIDGE (BAR windows, base design),
 #            nvrec_core_0 regs, nvmeha_guard (AXI-Lite timeout guard) -> nvmeha_0 S_AXI_LITE
 #
@@ -1354,16 +1364,25 @@ if {$dual_design} {
 #     each, the non-prefetchable windows of the base design), which the 32-bit
 #     doorbell master of the Host Accelerator (M_AXI_SSD) can reach.
 #   * both bridges' M_AXI_BRIDGE share one SmartConnect (as in the base design);
-#     its second master port is the Host Accelerator's queue window.
+#     its second master port is the Host Accelerator's queue window. With
+#     nvrec_bridge_split each bridge has its own SmartConnect and NoC NMU, and
+#     a 2-SI SmartConnect (smc_q, as on ZynqMP) merges their queue-window paths.
 #   * the doorbell master (through the nvrec_core doorbell monitor) is a second
 #     slave port of the base design's M_AXI_FPD SmartConnect; its address space
 #     holds only the two BAR0 windows (everything else excluded).
-#   * clocks: CIPS PL1 = 250 MHz dp_clk, PL2 = 200 MHz src_clk, PL3 = 100 MHz
+#   * clocks: CIPS PL1 = 250 MHz dp_clk, PL2 = 250 MHz src_clk, PL3 = 100 MHz
 #     (nvmeha AXI-Lite, <= 100 MHz per PG328). PL0 (250 MHz) stays the base
 #     design's QDMA / PS-interface clock.
+#   * the ring path is one NoC NMU of nvrec_data_width bits at dp_clk (no HP
+#     port width limit as on ZynqMP): 8.0 GB/s per direction at 256 bits,
+#     16.0 GB/s at 512 bits (NoC QoS request capped at 14000 MB/s, see below).
 #   * DDR: PS DDR at 0x0 (2 GB) and 0x8_0000_0000 on the VCK190; all PL
 #     masters use 64-bit addresses, the queue window 0x9000_0000 sits in the
 #     bridges' address spaces where no DDR is mapped.
+#
+# DWb = nvrec_data_width bits (nvrec_params.tcl / config/data.json data_width,
+# 512 on vck190_fmcp1 since dp256: with it nvrec_bridge_split = 1, ie. one NoC
+# NMU per QDMA bridge).
 #
 # The user_data_source / user_data_sink hierarchies are the documented
 # insertion points for a customer's own data source / sink; identical to the
@@ -1394,13 +1413,13 @@ proc nvrec_map {space slave_seg offset range} {
   }
 }
 
-# Enable PL1 (250 MHz), PL2 (200 MHz) and PL3 (100 MHz) reference clocks.
+# Enable PL1 (250 MHz), PL2 (250 MHz) and PL3 (100 MHz) reference clocks.
 # CIPS merges these keys into the per-board PS_PMC_CONFIG above.
 set_property CONFIG.PS_PMC_CONFIG { \
   PS_USE_PMCPL_CLK1 {1} \
   PMC_CRP_PL1_REF_CTRL_FREQMHZ {250} \
   PS_USE_PMCPL_CLK2 {1} \
-  PMC_CRP_PL2_REF_CTRL_FREQMHZ {200} \
+  PMC_CRP_PL2_REF_CTRL_FREQMHZ {250} \
   PS_USE_PMCPL_CLK3 {1} \
   PMC_CRP_PL3_REF_CTRL_FREQMHZ {100} \
 } [get_bd_cells versal_cips_0]
@@ -1409,7 +1428,12 @@ set_property CONFIG.PS_PMC_CONFIG { \
 set dp_clk_hz   [expr {int(round([get_property CONFIG.FREQ_HZ [get_bd_pins versal_cips_0/pl1_ref_clk]]))}]
 set src_clk_hz  [expr {int(round([get_property CONFIG.FREQ_HZ [get_bd_pins versal_cips_0/pl2_ref_clk]]))}]
 set lite_clk_hz [expr {int(round([get_property CONFIG.FREQ_HZ [get_bd_pins versal_cips_0/pl3_ref_clk]]))}]
-puts "INFO: nvrec dp_clk (pl1_ref_clk) = $dp_clk_hz Hz, src_clk (pl2_ref_clk) = $src_clk_hz Hz, lite clk (pl3_ref_clk) = $lite_clk_hz Hz"
+puts "INFO: nvrec dp_clk (pl1_ref_clk) = $dp_clk_hz Hz, src_clk (pl2_ref_clk) = $src_clk_hz Hz, lite clk (pl3_ref_clk) = $lite_clk_hz Hz, DATA_WIDTH = $nvrec_data_width"
+foreach {name hz} [list dp_clk $dp_clk_hz src_clk $src_clk_hz] {
+  if {abs($hz - 250000000) > 250000} {
+    error "nvrec: $name = $hz Hz, expected 250 MHz"
+  }
+}
 if {$lite_clk_hz > 100000000} {
   error "nvrec: nvmeha clk_axi_lite must be <= 100 MHz (PG328), pl3_ref_clk = $lite_clk_hz Hz"
 }
@@ -1435,6 +1459,7 @@ create_bd_pin -dir I user_data_source/tpg_seq_rst
 create_bd_pin -dir I -from 31 -to 0 user_data_source/tpg_rate_inc
 create_bd_pin -dir O -from 63 -to 0 user_data_source/tpg_seq_next
 create_bd_cell -type module -reference fdrec_tpg user_data_source/fdrec_tpg_0
+set_property CONFIG.DATA_WIDTH $nvrec_data_width [get_bd_cells user_data_source/fdrec_tpg_0]
 foreach p {src_clk src_resetn tpg_enable tpg_seq_rst tpg_rate_inc tpg_seq_next} {
   connect_bd_net [get_bd_pins user_data_source/$p] [get_bd_pins user_data_source/fdrec_tpg_0/$p]
 }
@@ -1453,19 +1478,22 @@ foreach p $chk_counters {
   create_bd_pin -dir O -from 63 -to 0 user_data_sink/$p
 }
 create_bd_cell -type module -reference fdrec_check user_data_sink/fdrec_check_0
+set_property CONFIG.DATA_WIDTH $nvrec_data_width [get_bd_cells user_data_sink/fdrec_check_0]
 foreach p [concat {snk_clk snk_resetn chk_enable chk_reset chk_rate_inc} $chk_counters] {
   connect_bd_net [get_bd_pins user_data_sink/$p] [get_bd_pins user_data_sink/fdrec_check_0/$p]
 }
 connect_bd_intf_net [get_bd_intf_pins user_data_sink/S_AXIS] [get_bd_intf_pins user_data_sink/fdrec_check_0/s_axis]
 
 # nvrec_core: ingest/egress FIFOs, ring writer/reader, command builder,
-# completion router, injector, doorbell monitor, AXI-Lite registers
+# completion router, injector, doorbell monitor, AXI-Lite registers.
+# FIFOs by bytes at every width: ingest 256 KB, egress 128 KB (nvrec_params.tcl).
 create_bd_cell -type module -reference nvrec_core nvrec_core_0
-set_property -dict [list CONFIG.SRC_CLK_HZ $src_clk_hz \
+set_property -dict [list CONFIG.DATA_WIDTH $nvrec_data_width \
+  CONFIG.SRC_CLK_HZ $src_clk_hz \
   CONFIG.DP_CLK_HZ $dp_clk_hz \
-  CONFIG.FIFO_DEPTH {4096} \
-  CONFIG.EGR_FIFO_DEPTH {4096} \
-  CONFIG.SLOT_W {10}] [get_bd_cells nvrec_core_0]
+  CONFIG.FIFO_DEPTH $nvrec_ing_fifo_depth \
+  CONFIG.EGR_FIFO_DEPTH $nvrec_egr_fifo_depth \
+  CONFIG.SLOT_W $nvrec_slot_w] [get_bd_cells nvrec_core_0]
 
 connect_bd_intf_net [get_bd_intf_pins user_data_source/M_AXIS] [get_bd_intf_pins nvrec_core_0/s_axis]
 foreach p {tpg_enable tpg_seq_rst tpg_rate_inc tpg_seq_next} {
@@ -1500,29 +1528,81 @@ connect_bd_intf_net [get_bd_intf_pins nvrec_core_0/m_axis_sqe] [get_bd_intf_pins
 connect_bd_intf_net [get_bd_intf_pins nvmeha_0/M_AXIS] [get_bd_intf_pins nvrec_core_0/s_axis_cqe]
 connect_bd_intf_net [get_bd_intf_pins nvmeha_0/M_AXI_SSD] [get_bd_intf_pins nvrec_core_0/s_axi_db]
 
-# Ring writer / reader -> SmartConnect -> new NoC slave port (PL NMU) -> DDR MC
-# (as the recorder's AXI DMA: 128 bit x 250 MHz = 4000 MB/s per direction)
+# Ring writer / reader -> SmartConnect -> new NoC slave port (PL NMU) -> DDR MC.
+# The NMU is nvrec_data_width bits wide at dp_clk: 256 bit x 250 MHz = 8000 MB/s
+# per direction (16000 at 512 bits); the NoC QoS request reserves that in both
+# directions (record = write, playback = read). The NoC compiler adds the
+# packetization overhead (write data x 1.0625, read requests 1/16 of the read
+# rate) and refuses more than 16000 MB/s per NMU and per DDR MC port (Ipconfig
+# 75-885/886): at 512 bits a symmetric request is capped at 14000 MB/s
+# (14000 x 1.125 = 15750). nvrec_dma_qos (MB/s) can be set before the BD script
+# runs to change the request (report_noc_qos shows what the NoC solution meets).
+if {![info exists nvrec_dma_qos]} {
+  set nvrec_dma_qos [expr {min($nvrec_data_width * 250 / 8, 14000)}]
+}
 set noc_si [get_property CONFIG.NUM_SI [get_bd_cells axi_noc_0]]
 set noc_clks [get_property CONFIG.NUM_CLKS [get_bd_cells axi_noc_0]]
 set noc_port [format "S%02d_AXI" $noc_si]
 set noc_aclk "aclk$noc_clks"
 set_property -dict [list CONFIG.NUM_SI [expr {$noc_si + 1}] CONFIG.NUM_CLKS [expr {$noc_clks + 1}]] [get_bd_cells axi_noc_0]
-set_property -dict [list CONFIG.CONNECTIONS {MC_2 {read_bw {4000} write_bw {4000} read_avg_burst {64} write_avg_burst {64}}}] [get_bd_intf_pins /axi_noc_0/$noc_port]
-puts "INFO: nvrec ring writer/reader -> axi_noc_0/$noc_port (clock $noc_aclk) -> MC_2"
+# (CONNECTIONS in the exact literal form the NoC IP writes itself: every value in braces)
+set_property -dict [list CONFIG.DATA_WIDTH $nvrec_data_width \
+  CONFIG.CONNECTIONS [format {MC_2 {read_bw {%d} write_bw {%d} read_avg_burst {64} write_avg_burst {64}}} $nvrec_dma_qos $nvrec_dma_qos]] \
+  [get_bd_intf_pins /axi_noc_0/$noc_port]
+puts "INFO: nvrec ring writer/reader -> axi_noc_0/$noc_port (clock $noc_aclk, $nvrec_data_width bits, QoS $nvrec_dma_qos MB/s) -> MC_2"
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect axi_smc_dma
 set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] [get_bd_cells axi_smc_dma]
 connect_bd_intf_net [get_bd_intf_pins nvrec_core_0/m_axi] [get_bd_intf_pins axi_smc_dma/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins axi_smc_dma/M00_AXI] [get_bd_intf_pins axi_noc_0/$noc_port]
 
-# SSD DMA: the base design's smc_m_axi_bridge (both QDMA M_AXI_BRIDGE -> NoC
-# S08_AXI -> DDR) gets a second master port to the Host Accelerator's queue
-# window (S_AXI_SSD, dp_clk). The NoC QoS request of S08 is raised from the base
-# design's 1720 MB/s to 3200 MB/s (the source's maximum rate; the SSDs read the
-# recording out of DDR at that rate when striping).
-set_property -dict [list CONFIG.NUM_MI {2} CONFIG.NUM_CLKS {4}] [get_bd_cells smc_m_axi_bridge]
-connect_bd_intf_net [get_bd_intf_pins smc_m_axi_bridge/M01_AXI] [get_bd_intf_pins nvmeha_0/S_AXI_SSD]
-connect_bd_net [get_bd_pins versal_cips_0/pl1_ref_clk] [get_bd_pins smc_m_axi_bridge/aclk3]
-set_property -dict [list CONFIG.CONNECTIONS {MC_1 {read_bw {3200} write_bw {3200} read_avg_burst {4} write_avg_burst {4} }}] [get_bd_intf_pins /axi_noc_0/S08_AXI]
+# SSD DMA. The NoC QoS request of S08 is raised from the base design's 1720 MB/s
+# to 7000 MB/s per direction (a Gen4 x4 link moves up to ~7 GB/s; a bandwidth
+# request to the NoC compiler, not a cap; as fpga-drive-recorder).
+if {!$nvrec_bridge_split} {
+  # Shared NMU (base design): smc_m_axi_bridge (both QDMA M_AXI_BRIDGE -> NoC
+  # S08_AXI -> DDR) gets a second master port to the Host Accelerator's queue
+  # window (S_AXI_SSD, dp_clk).
+  set_property -dict [list CONFIG.NUM_MI {2} CONFIG.NUM_CLKS {4}] [get_bd_cells smc_m_axi_bridge]
+  connect_bd_intf_net [get_bd_intf_pins smc_m_axi_bridge/M01_AXI] [get_bd_intf_pins nvmeha_0/S_AXI_SSD]
+  connect_bd_net [get_bd_pins versal_cips_0/pl1_ref_clk] [get_bd_pins smc_m_axi_bridge/aclk3]
+  set_property -dict [list CONFIG.CONNECTIONS {MC_1 {read_bw {7000} write_bw {7000} read_avg_burst {4} write_avg_burst {4} }}] [get_bd_intf_pins /axi_noc_0/S08_AXI]
+} else {
+  # One NMU per QDMA bridge: qdma_0 keeps smc_m_axi_bridge -> S08 (MC_1),
+  # qdma_1 gets smc_m_axi_bridge_1 -> a new NoC slave port (MC_3), each 7000/7000
+  # MB/s. Both SmartConnects' second master port reaches the Host Accelerator's
+  # queue window through smc_q (2 SI, dp_clk), as smc_ssd_N / smc_q on ZynqMP.
+  set_property -dict [list CONFIG.CONNECTIONS {MC_1 {read_bw {7000} write_bw {7000} read_avg_burst {4} write_avg_burst {4} }}] [get_bd_intf_pins /axi_noc_0/S08_AXI]
+  set noc_si [get_property CONFIG.NUM_SI [get_bd_cells axi_noc_0]]
+  set noc_clks [get_property CONFIG.NUM_CLKS [get_bd_cells axi_noc_0]]
+  set noc_port1 [format "S%02d_AXI" $noc_si]
+  set noc_aclk1 "aclk$noc_clks"
+  set_property -dict [list CONFIG.NUM_SI [expr {$noc_si + 1}] CONFIG.NUM_CLKS [expr {$noc_clks + 1}]] [get_bd_cells axi_noc_0]
+  set_property -dict [list CONFIG.DATA_WIDTH {256} \
+    CONFIG.CONNECTIONS {MC_3 {read_bw {7000} write_bw {7000} read_avg_burst {4} write_avg_burst {4} }}] \
+    [get_bd_intf_pins /axi_noc_0/$noc_port1]
+  connect_bd_net [get_bd_pins versal_cips_0/pl0_ref_clk] [get_bd_pins axi_noc_0/$noc_aclk1]
+  puts "INFO: nvrec qdma_1/M_AXI_BRIDGE -> smc_m_axi_bridge_1 -> axi_noc_0/$noc_port1 (clock $noc_aclk1 = pl0_ref_clk) -> MC_3"
+
+  create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect smc_q
+  set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {1}] [get_bd_cells smc_q]
+  connect_bd_intf_net [get_bd_intf_pins smc_q/M00_AXI] [get_bd_intf_pins nvmeha_0/S_AXI_SSD]
+
+  # qdma_0: smc_m_axi_bridge (1 SI from the base block above) + M01 -> smc_q
+  set_property -dict [list CONFIG.NUM_MI {2} CONFIG.NUM_CLKS {3}] [get_bd_cells smc_m_axi_bridge]
+  connect_bd_intf_net [get_bd_intf_pins smc_m_axi_bridge/M01_AXI] [get_bd_intf_pins smc_q/S00_AXI]
+  connect_bd_net [get_bd_pins versal_cips_0/pl1_ref_clk] [get_bd_pins smc_m_axi_bridge/aclk2]
+
+  # qdma_1: smc_m_axi_bridge_1
+  create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smc_m_axi_bridge_1
+  set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2} CONFIG.NUM_CLKS {3}] [get_bd_cells smc_m_axi_bridge_1]
+  connect_bd_intf_net [get_bd_intf_pins qdma_1/M_AXI_BRIDGE] [get_bd_intf_pins smc_m_axi_bridge_1/S00_AXI]
+  connect_bd_intf_net [get_bd_intf_pins smc_m_axi_bridge_1/M00_AXI] [get_bd_intf_pins axi_noc_0/$noc_port1]
+  connect_bd_intf_net [get_bd_intf_pins smc_m_axi_bridge_1/M01_AXI] [get_bd_intf_pins smc_q/S01_AXI]
+  connect_bd_net [get_bd_pins versal_cips_0/pl0_ref_clk] [get_bd_pins smc_m_axi_bridge_1/aclk]
+  connect_bd_net [get_bd_pins qdma_1/axi_aclk] [get_bd_pins smc_m_axi_bridge_1/aclk1]
+  connect_bd_net [get_bd_pins versal_cips_0/pl1_ref_clk] [get_bd_pins smc_m_axi_bridge_1/aclk2]
+  connect_bd_net [get_bd_pins reset_pl0/peripheral_aresetn] [get_bd_pins smc_m_axi_bridge_1/aresetn]
+}
 
 # Doorbells: nvmeha M_AXI_SSD -> nvrec_core_0 (dbmon) -> smc_m_axi_fpd (second
 # slave port) -> qdma_N/S_AXI_BRIDGE BAR0 window. The same SmartConnect gets
@@ -1563,6 +1643,10 @@ connect_bd_net [get_bd_pins rst_dp_clk/peripheral_aresetn] \
   [get_bd_pins nvrec_core_0/dp_resetn] \
   [get_bd_pins nvmeha_0/rst_n_core]
 connect_bd_net [get_bd_pins rst_dp_clk/interconnect_aresetn] [get_bd_pins axi_smc_dma/aresetn]
+if {$nvrec_bridge_split} {
+  connect_bd_net [get_bd_pins versal_cips_0/pl1_ref_clk] [get_bd_pins smc_q/aclk]
+  connect_bd_net [get_bd_pins rst_dp_clk/interconnect_aresetn] [get_bd_pins smc_q/aresetn]
+}
 
 # nvmeha AXI-Lite clock (<= 100 MHz, PG328): pl3_ref_clk
 connect_bd_net [get_bd_pins versal_cips_0/pl3_ref_clk] \
@@ -1676,4 +1760,16 @@ foreach intr $intr_list {
 }
 
 validate_bd_design
+
+# The nvrec NoC ports after parameter propagation: widths, clocks and QoS
+set nvrec_noc_ports [list S08_AXI $noc_port]
+if {$nvrec_bridge_split} { lappend nvrec_noc_ports $noc_port1 }
+foreach p $nvrec_noc_ports {
+  set ipin [get_bd_intf_pins axi_noc_0/$p]
+  puts "INFO: nvrec axi_noc_0/$p DATA_WIDTH [get_property CONFIG.DATA_WIDTH $ipin] FREQ_HZ [get_property CONFIG.FREQ_HZ $ipin] CONNECTIONS [get_property CONFIG.CONNECTIONS $ipin]"
+}
+foreach ip {nvrec_core_0/m_axi axi_smc_dma/M00_AXI} {
+  set ipin [get_bd_intf_pins $ip]
+  puts "INFO: nvrec $ip DATA_WIDTH [get_property CONFIG.DATA_WIDTH $ipin] FREQ_HZ [get_property CONFIG.FREQ_HZ $ipin]"
+}
 save_bd_design

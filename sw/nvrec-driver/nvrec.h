@@ -25,7 +25,7 @@
 
 #include "nvrec_uapi.h"
 
-#define NVREC_DRV_VERSION	"0.1"
+#define NVREC_DRV_VERSION	"1.1"
 
 /* ------------------------------------------------------------------------ */
 /* NVMe definitions (NVM Express Base Specification 2.0; only what we use)  */
@@ -63,6 +63,7 @@
 /* admin opcodes */
 #define NVME_ADM_DELETE_SQ	0x00
 #define NVME_ADM_CREATE_SQ	0x01
+#define NVME_ADM_GET_LOG_PAGE	0x02
 #define NVME_ADM_DELETE_CQ	0x04
 #define NVME_ADM_CREATE_CQ	0x05
 #define NVME_ADM_IDENTIFY	0x06
@@ -75,6 +76,10 @@
 #define NVME_CMD_DSM		0x09
 
 #define NVME_FEAT_NUM_QUEUES	0x07
+#define NVME_FEAT_APST		0x0c	/* Autonomous Power State Transition */
+#define NVME_APST_TABLE_BYTES	256	/* 32 entries x 8 bytes */
+#define NVME_LOG_SMART		0x02	/* SMART / Health Information, 512 bytes */
+#define NVME_NSID_ALL		0xffffffffu
 #define NVME_ID_CNS_NS		0x00
 #define NVME_ID_CNS_CTRL	0x01
 
@@ -170,6 +175,15 @@ struct nvrec_ssd {
 	u64 nlba;
 	bool vwc;
 	bool dsm;
+	bool apsta;			/* APST supported (Identify APSTA) */
+	u16 wctemp_k, cctemp_k;		/* warning / critical composite temperature, K */
+
+	/* SMART log + feature data (DMA-coherent, 4 KB), under log_lock */
+	struct mutex log_lock;
+	void *logbuf;
+	dma_addr_t logbuf_dma;
+	int temp_c;			/* last composite temperature read */
+	unsigned long temp_jiffies;	/* when (0 = never) */
 
 	/* I/O queues */
 	u32 nr_io_queues;		/* granted by Set Features */
@@ -203,7 +217,9 @@ struct nvrec_dev {
 	struct work_struct ha_dead_work;	/* disable the SSDs once the IP is dead */
 	u32 src_clk_hz;
 	u32 dp_clk_hz;
-	u32 fifo_depth;
+	u32 beat_bytes;			/* bytes per fabric beat: BEAT_BYTES (1.2), 16 before */
+	u32 fifo_depth;			/* ingest FIFO, beats */
+	u32 egr_fifo_depth;		/* egress FIFO, beats */
 	u32 caps;
 
 	struct mutex ssd_lock;		/* ssd[] attach/detach */
@@ -220,6 +236,7 @@ struct nvrec_dev {
 	u32 state;			/* NVREC_STATE_* */
 	wait_queue_head_t wq;
 	u64 start_ns;			/* ktime at start */
+	bool run_dry;			/* the current/last run is fabric-only (CONFIG.DRY) */
 	u64 stop_ns;
 	u64 prefill_ns;			/* playback: start -> sink enabled */
 	struct nvrec_stats final;	/* snapshot at STOP/ABORT/DONE */
@@ -234,6 +251,8 @@ struct nvrec_dev {
 	bool sgt_mapped;
 	dma_addr_t ring_dma;
 	u64 ring_bytes;
+	bool ring_ssd_ok;		/* fabric and SSD views of the ring were checked
+					 * equal (a live SSD at SET_RING); else DRY only */
 	u32 chunk;
 	u32 slots;
 	void *prp_lists;		/* coherent: one list (1 << prp_shift) per slot */
@@ -278,7 +297,7 @@ u64 nvrec_hw_sink_rate_set(struct nvrec_dev *nv, u64 rate_bps);
 void nvrec_hw_tpg_enable(struct nvrec_dev *nv, bool on);
 bool nvrec_hw_tpg_enabled(struct nvrec_dev *nv);
 int nvrec_hw_soft_reset(struct nvrec_dev *nv);
-int nvrec_hw_start(struct nvrec_dev *nv, bool play, u32 flags);
+int nvrec_hw_start(struct nvrec_dev *nv, bool play, u32 flags);	/* NVREC_START_* */
 int nvrec_hw_stop(struct nvrec_dev *nv, bool abort);
 bool nvrec_hw_finished(struct nvrec_dev *nv);	/* DONE / ABORTED / IDLE */
 bool nvrec_hw_aborted(struct nvrec_dev *nv);
@@ -291,6 +310,8 @@ u32 nvrec_hw_max_qd(void);
 int nvrec_nvme_register(void);
 void nvrec_nvme_unregister(void);
 void nvrec_nvme_kill(struct nvrec_ssd *s, const char *why);
+int nvrec_nvme_temperature(struct nvrec_ssd *s, int *temp_c);	/* SMART, cached 1 s */
+int nvrec_nvme_apst_get(struct nvrec_ssd *s, bool *enabled);	/* -EOPNOTSUPP: no APST */
 /* platform side: SSD lookup by PCI device */
 struct nvrec_dev *nvrec_find_for_pci(struct pci_dev *pdev, unsigned int *index);
 void nvrec_ssd_detach_all(struct nvrec_dev *nv);

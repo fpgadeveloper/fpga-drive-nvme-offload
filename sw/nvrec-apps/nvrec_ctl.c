@@ -41,7 +41,7 @@ void ctl_install_signals(void)
 
 bool ctl_ha_dead;
 
-int ctl_open(const char *path, struct nvrec_info *info)
+int ctl_open(const char *path, struct nvrec_info *info, bool fabric_only)
 {
 	int fd = open(path, O_RDWR | O_CLOEXEC);
 
@@ -60,7 +60,15 @@ int ctl_open(const char *path, struct nvrec_info *info)
 		close(fd);
 		return -1;
 	}
-	if (info->status & NVREC_STATUS_HA_DEAD) {
+	if (!info->beat_bytes)
+		info->beat_bytes = 16;
+	if (fabric_only && !(info->caps & NVREC_CAP_DRY)) {
+		err_msg("%s: this design (nvrec_core %u.%u) has no fabric-only mode: it needs register map 1.2",
+			path, info->hw_version >> 16, info->hw_version & 0xffff);
+		close(fd);
+		return -1;
+	}
+	if ((info->status & NVREC_STATUS_HA_DEAD) && !fabric_only) {
 		err_msg("%s", NVREC_HA_DEAD_MSG);
 		ctl_ha_dead = true;
 		close(fd);
@@ -261,16 +269,20 @@ int ctl_run(int fd, const struct nvrec_info *info, const struct ctl_run_opts *o,
 			return -errno;
 		}
 		now = now_s();
-		if (st.cmds_done != last_done) {
-			last_done = st.cmds_done;
+		/* progress: NVMe completions; a DRY run has none, its bytes move */
+		if ((o->dry ? st.bytes : st.cmds_done) != last_done) {
+			last_done = o->dry ? st.bytes : st.cmds_done;
 			tprog = now;
 		} else if (o->timeout > 0 && now - tprog > o->timeout) {
 			if (live)
 				fputc('\n', stderr);
-			err_msg("stalled: no NVMe command completed for %.0f s (in flight: %u + %u), aborting",
-				o->timeout, st.ssd[0].inflight, st.ssd[1].inflight);
+			if (o->dry)
+				err_msg("stalled: no data moved for %.0f s, aborting", o->timeout);
+			else
+				err_msg("stalled: no NVMe command completed for %.0f s (in flight: %u + %u), aborting",
+					o->timeout, st.ssd[0].inflight, st.ssd[1].inflight);
 			ioctl(fd, NVREC_IOC_ABORT, final);
-			if (final->flags & NVREC_STATS_HA_DEAD) {
+			if (!o->dry && (final->flags & NVREC_STATS_HA_DEAD)) {
 				err_msg("%s", NVREC_HA_DEAD_MSG);
 				ctl_ha_dead = true;
 				return -ENOLINK;
@@ -289,7 +301,7 @@ int ctl_run(int fd, const struct nvrec_info *info, const struct ctl_run_opts *o,
 		perr("NVREC_IOC_GET_STATS");
 		return -errno;
 	}
-	if (final->flags & NVREC_STATS_HA_DEAD) {
+	if (!o->dry && (final->flags & NVREC_STATS_HA_DEAD)) {
 		err_msg("%s", NVREC_HA_DEAD_MSG);
 		ctl_ha_dead = true;
 		return -ENOLINK;
@@ -298,11 +310,17 @@ int ctl_run(int fd, const struct nvrec_info *info, const struct ctl_run_opts *o,
 }
 
 void ctl_print_summary(const char *prog, const struct nvrec_info *info,
-		       const struct nvrec_stats *st, double seconds)
+		       const struct nvrec_stats *st, double seconds, bool dry)
 {
 	uint32_t hwm = 0;
 	unsigned i;
 
+	if (dry) {
+		printf("%s: %" PRIu64 " bytes in %.2f s, %.1f MB/s; fabric only (DRY): no NVMe command, %u-byte beats\n",
+		       prog, (uint64_t)st->bytes, seconds, seconds > 0 ? st->bytes / seconds / 1e6 : 0.0,
+		       info->beat_bytes);
+		return;
+	}
 	for (i = 0; i < NVREC_MAX_SSD; i++)
 		if (st->ssd[i].inflight_hwm > hwm)
 			hwm = st->ssd[i].inflight_hwm;

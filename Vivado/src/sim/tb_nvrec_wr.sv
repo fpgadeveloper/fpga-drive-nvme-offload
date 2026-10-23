@@ -4,14 +4,17 @@
 //
 // tb_nvrec_wr -- self-checking testbench for nvrec_wr (ring writer)
 //
-// A FWFT FIFO model (depth 4096, backpressured source: never drops) feeds the
-// writer with beats {~k, k}; an AXI4 write slave model with random
+// Runs for DATA_WIDTH 128, 256 and 512 (sim.tcl, see the sim_runs line below).
+//
+// A FWFT FIFO model (64 KB deep, backpressured source: never drops) feeds the
+// writer with beats of the fdrec test pattern (16-byte words {~n, n}, word n
+// of the stream carries n); an AXI4 write slave model with random
 // AW/W/B delays stores the bursts in a sparse memory. The testbench plays
 // the completion side: it releases filled chunks (rel_cnt) after a random
 // delay, always in order.
 //
 // Checks:
-//   1. every burst: INCR, len <= 256, never crosses 4 KB, inside the slot of
+//   1. every burst: INCR, len <= 4 KB / BEAT_BYTES, never crosses 4 KB, inside the slot of
 //      the chunk being written, address = slot base + offset (ring wrap)
 //   2. every filled chunk c: memory of slot c % N holds beats
 //      c*CB .. c*CB+CB-1 at the moment filled_cnt counts it
@@ -24,14 +27,32 @@
 //   6. abort: issued bursts complete, no more bursts, done
 //
 // Prints PASS / FAIL and calls $finish (sim.tcl contract).
+//
+// sim_runs: DATA_WIDTH=128 DATA_WIDTH=256 DATA_WIDTH=512
 
 `timescale 1ns / 1ps
 
-module tb_nvrec_wr;
+module tb_nvrec_wr #(
+  parameter integer DATA_WIDTH = 256
+);
 
-  localparam integer SLOT_W = 10;
-  localparam integer CNT_W  = 13;
-  localparam integer FDEPTH = 4096;
+  localparam integer BB     = DATA_WIDTH / 8;          // bytes per beat
+  localparam integer WPB    = DATA_WIDTH / 128;        // pattern words per beat
+  localparam integer BURST  = 4096 / BB;               // max burst length
+  localparam integer SLOT_W = 11;
+  localparam integer FDEPTH = 65536 / BB;              // 64 KB
+  localparam integer CNT_W  = $clog2(FDEPTH) + 1;
+
+  // beat k of the stream: words k*WPB .. k*WPB+WPB-1
+  function automatic [DATA_WIDTH-1:0] beat_of(input longint k);
+    longint n;
+    begin
+      for (int w = 0; w < WPB; w++) begin
+        n = k * WPB + w;
+        beat_of[128*w +: 128] = {~n[63:0], n[63:0]};
+      end
+    end
+  endfunction
 
   reg clk = 1'b0;
   always #2.0 clk = ~clk;   // 250 MHz
@@ -51,7 +72,7 @@ module tb_nvrec_wr;
   reg  [63:0] src_k = 0;            // next beat to generate
   reg         src_en = 0;
   integer     src_rate = 100;       // % of cycles a beat is pushed
-  reg  [127:0] fifo_tdata  = 128'd0;
+  reg  [DATA_WIDTH-1:0] fifo_tdata = {DATA_WIDTH{1'b0}};
   reg          fifo_tvalid = 1'b0;
   wire         fifo_tready;
   reg  [CNT_W-1:0] fifo_count = 0;
@@ -59,7 +80,7 @@ module tb_nvrec_wr;
   task automatic q_update();
     begin
       fifo_tvalid = (q.size() > 0);
-      fifo_tdata  = (q.size() > 0) ? {~q[0], q[0]} : 128'd0;
+      fifo_tdata  = (q.size() > 0) ? beat_of(q[0]) : {DATA_WIDTH{1'b0}};
       fifo_count  = (q.size() > FDEPTH) ? FDEPTH : q.size();
     end
   endtask
@@ -69,7 +90,7 @@ module tb_nvrec_wr;
   wire [7:0]   awlen;
   wire         awvalid;
   reg          awready = 0;
-  wire [127:0] wdata;
+  wire [DATA_WIDTH-1:0] wdata;
   wire         wlast, wvalid;
   reg          wready = 0;
   reg  [1:0]   bresp = 0;
@@ -81,7 +102,7 @@ module tb_nvrec_wr;
   wire [22:0] last_bytes;
   wire [63:0] beats_out, run_beats, full_cycles;
 
-  nvrec_wr #(.SLOT_W(SLOT_W), .CNT_W(CNT_W), .ADDR_W(64)) dut (
+  nvrec_wr #(.DATA_WIDTH(DATA_WIDTH), .SLOT_W(SLOT_W), .CNT_W(CNT_W), .ADDR_W(64)) dut (
     .clk(clk), .rst(rst), .start(start), .stop(stop), .abort(abort),
     .ring_base(ring_base), .chunk_shift(chunk_shift), .num_chunks(num_chunks),
     .lba_shift(lba_shift), .length_chunks(length_chunks), .rel_cnt(rel_cnt),
@@ -119,10 +140,10 @@ module tb_nvrec_wr;
   // ---------------------------------------------------------------------------
   // AXI write slave model
   // ---------------------------------------------------------------------------
-  reg [127:0] mem [longint];
+  reg [DATA_WIDTH-1:0] mem [longint];
   typedef struct { longint addr; int len; } aw_t;
   aw_t awq [$];
-  reg [128:0] wbq [$];
+  reg [DATA_WIDTH:0] wbq [$];
   int  bpend = 0;
   longint cur_addr; int cur_beat; int cur_len; bit cur_act = 0;
   int  aw_bursts = 0;
@@ -134,9 +155,10 @@ module tb_nvrec_wr;
     if (awvalid && awready) begin
       aw_t a;
       a.addr = awaddr; a.len = awlen + 1;
-      if ((awaddr[11:0] + (awlen + 1) * 16) > 4096)
+      if ((awaddr[11:0] + (awlen + 1) * BB) > 4096)
         fail($sformatf("burst crosses 4 KB: addr %h len %0d", awaddr, awlen + 1));
-      if (awaddr[3:0] != 0) fail("unaligned burst address");
+      if (awlen + 1 > BURST) fail($sformatf("burst longer than 4 KB: len %0d", awlen + 1));
+      if (awaddr % BB != 0) fail("unaligned burst address");
       awq.push_back(a);
       aw_bursts++;
     end
@@ -149,10 +171,10 @@ module tb_nvrec_wr;
         cur_addr = awq[0].addr; cur_len = awq[0].len; cur_beat = 0; cur_act = 1;
         void'(awq.pop_front());
       end
-      mem[cur_addr + cur_beat * 16] = wbq[0][127:0];
-      if (wbq[0][128] != (cur_beat == cur_len - 1)) fail("WLAST mismatch");
+      mem[cur_addr + cur_beat * BB] = wbq[0][DATA_WIDTH-1:0];
+      if (wbq[0][DATA_WIDTH] != (cur_beat == cur_len - 1)) fail("WLAST mismatch");
       cur_beat++;
-      if (wbq[0][128]) begin
+      if (wbq[0][DATA_WIDTH]) begin
         cur_act = 0;
         bpend++;
       end
@@ -183,16 +205,16 @@ module tb_nvrec_wr;
     begin
       slot = c % num_chunks;
       base = {ring_base[63:12], 12'd0} + slot * chunk_bytes;
-      for (k = 0; k < (nbytes - pad) / 16; k++) begin
-        kk = first_beat + c * (chunk_bytes / 16) + k;
-        if (!mem.exists(base + k * 16) || mem[base + k * 16] !== {~kk[63:0], kk[63:0]}) begin
+      for (k = 0; k < (nbytes - pad) / BB; k++) begin
+        kk = first_beat + c * (chunk_bytes / BB) + k;
+        if (!mem.exists(base + k * BB) || mem[base + k * BB] !== beat_of(kk)) begin
           fail($sformatf("chunk %0d beat %0d: got %h exp %h", c, k,
-                         mem.exists(base + k*16) ? mem[base + k*16] : 128'hx, {~kk[63:0], kk[63:0]}));
+                         mem.exists(base + k*BB) ? mem[base + k*BB] : {DATA_WIDTH{1'bx}}, beat_of(kk)));
           break;
         end
       end
-      for (k = (nbytes - pad) / 16; k < nbytes / 16; k++)
-        if (!mem.exists(base + k * 16) || mem[base + k * 16] !== 128'd0) begin
+      for (k = (nbytes - pad) / BB; k < nbytes / BB; k++)
+        if (!mem.exists(base + k * BB) || mem[base + k * BB] !== {DATA_WIDTH{1'b0}}) begin
           fail($sformatf("chunk %0d pad beat %0d not zero", c, k));
           break;
         end
@@ -280,7 +302,7 @@ module tb_nvrec_wr;
     if (filled_cnt != 10) fail($sformatf("test1 filled %0d", filled_cnt));
     if (final_partial)    fail("test1 final_partial set");
     if (!saw_ring_full)   fail("test1 ring_full never seen (release too fast?)");
-    if (run_beats != 10 * chunk_bytes / 16) fail($sformatf("test1 run_beats %0d", run_beats));
+    if (run_beats != 10 * chunk_bytes / BB) fail($sformatf("test1 run_beats %0d", run_beats));
     if (pad_bytes != 0) fail("test1 pad");
     flush_src();
 
@@ -290,14 +312,14 @@ module tb_nvrec_wr;
     lba_shift = 9;
     do_start();
     // run until ~2.3 chunks written, then stop the source and the writer
-    wait (run_beats > (2 * chunk_bytes / 16) + 300);
+    wait (run_beats > (2 * chunk_bytes / BB) + 300 / WPB);
     src_en = 0;
     repeat (3) @(posedge clk);
     // stop: everything in the FIFO model must be written
     nb = src_k - first_beat;      // total beats generated in this run
     stop <= 1; @(posedge clk); stop <= 0;
     wait_done(100000);
-    exp_bytes = nb * 16 - 2 * chunk_bytes;
+    exp_bytes = nb * BB - 2 * chunk_bytes;
     exp_pad   = ((exp_bytes + 511) / 512) * 512 - exp_bytes;
     if (filled_cnt != 3) fail($sformatf("test2 filled %0d (exp 3)", filled_cnt));
     if (!final_partial) fail("test2 final_partial not set");
@@ -313,13 +335,13 @@ module tb_nvrec_wr;
     chunk_shift = 17; chunk_bytes = 1 << 17; lba_shift = 12; num_chunks = 3; rel_delay = 10;
     src_en = 1; src_rate = 100;
     do_start();
-    wait (run_beats > (chunk_bytes / 16) + 1000);
+    wait (run_beats > (chunk_bytes / BB) + 1000 / WPB);
     src_en = 0;
     repeat (3) @(posedge clk);
     nb = src_k - first_beat;
     stop <= 1; @(posedge clk); stop <= 0;
     wait_done(100000);
-    exp_bytes = nb * 16 - chunk_bytes;
+    exp_bytes = nb * BB - chunk_bytes;
     exp_pad   = ((exp_bytes + 4095) / 4096) * 4096 - exp_bytes;
     if (filled_cnt != 2) fail($sformatf("test3 filled %0d", filled_cnt));
     if (last_bytes != exp_bytes + exp_pad) fail($sformatf("test3 last_bytes %0d", last_bytes));
@@ -334,13 +356,13 @@ module tb_nvrec_wr;
     // push exactly 2 chunks of beats
     begin
       longint target;
-      target = first_beat + 2 * chunk_bytes / 16;
+      target = first_beat + 2 * chunk_bytes / BB;
       while (src_k < target) begin
         @(posedge clk);
         if (q.size() < FDEPTH) begin q.push_back(src_k); src_k++; q_update(); end
       end
     end
-    wait (run_beats == 2 * chunk_bytes / 16);
+    wait (run_beats == 2 * chunk_bytes / BB);
     repeat (20) @(posedge clk);
     stop <= 1; @(posedge clk); stop <= 0;
     wait_done(100000);
@@ -365,7 +387,7 @@ module tb_nvrec_wr;
     flush_src();
 
     if (bresp_errs != 0) fail("bresp errors");
-    if (errors == 0) $display("PASS: tb_nvrec_wr (%0d bursts)", aw_bursts);
+    if (errors == 0) $display("PASS: tb_nvrec_wr DATA_WIDTH %0d (%0d bursts)", DATA_WIDTH, aw_bursts);
     else             $display("FAIL: tb_nvrec_wr, %0d error(s)", errors);
     $finish;
   end

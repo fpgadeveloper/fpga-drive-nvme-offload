@@ -72,8 +72,10 @@ applies as well. Work through these in order:
    `boot.scr`), and the SSDs never link up. On the other boards, check the carrier's VADJ
    setting against the [FMC card's requirements](https://docs.opsero.com/op063/datasheet/overview/).
 4. **Is the right image running?** The boot log should show this design's driver line
-   (`nvrec ... /dev/nvrec: nvrec_core v1.1 ...`). A card that holds another design's image
-   has another bitstream.
+   (`nvrec ... /dev/nvrec: driver 1.1, nvrec_core v1.2, ... beat 32 bytes ...`, `beat 64 bytes`
+   on `vck190_fmcp1`). A card that
+   holds another design's image has another bitstream; `nvrec_core v1.1` is the previous
+   (128-bit) revision of this design.
 5. **Check the link** with `dmesg | grep -i "pcie link"` and
    `sudo lspci -vv | grep -E "LnkCap|LnkSta"` (see [Test the design in Linux](linux_test)).
    A link that trains slower or narrower than the design supports points to a seating or
@@ -143,6 +145,9 @@ dmesg | grep nvrec
 | `ring of ... needs N MB of CMA ... but the kernel's CMA pool is only M MB`, or `cannot allocate the ring: ... CMA free ...` (kernel log: `cannot allocate a N MB ring (CMA too small? cma= kernel argument)`) | The CMA pool is too small or fragmented for the ring. Use fewer `--buffers` (or a smaller chunk), or raise `NVREC_CMA` in `Yocto/bsp/<target>/conf/local.conf.append` and rebuild the image. `grep Cma /proc/meminfo` shows the pool. |
 | `/dev/nvrec: Device or resource busy (another recorder/player is running)` | Only one program can use the recorder at a time: `nvrec` and `nvplay` cannot run together. Check `ps aux \| grep -E "nvrec\|nvplay"`. |
 | `the recording would end at byte ... beyond ... (end of the device or of the md RAID0 stripe zone)` | Not enough room after the file's position. Free space at the end of the volume, or record less. |
+| `--buffers N exceeds the hardware slot table (M)` | The bitstream's slot table is smaller (1024 on a register map 1.1 bitstream, 2048 on 1.2). Use at most M buffers. |
+| `this design (nvrec_core 1.1) has no fabric-only mode: it needs register map 1.2` | `nvrec --no-write` and `nvplay --ring-only` need the 1.2 hardware. Use the image of this revision. |
+| `driver API version N, this app expects M` | The apps and the kernel module come from different revisions. Rebuild the image (both are built together). |
 
 ### Beats are dropped (`nvrec` exits with code 2)
 
@@ -155,13 +160,27 @@ completing the writes fast enough. In order of likelihood:
 2. **The SLC cache ran out.** If the drops start after a fixed amount of data, the SSD's
    write cache filled up; see [supported SSDs](supported_ssds.md#choosing-ssds-for-recording).
    Use a lower rate, a larger or faster SSD, or RAID0.
-3. **The ring is too small for the SSDs' write stalls.** The default ring is 256 MB; more
-   chunks (`--buffers`, up to 1024) absorb longer stalls, within the CMA pool. The `ring high-water` figure in the summary
-   shows how much of the ring was used.
-4. **Other I/O on the same SSDs** during the recording, or a nearly full volume.
+3. **The ring is too small for the SSDs' write stalls.** The default ring is 512 MB (64 ms
+   at 8 GB/s); more chunks (`--buffers`, up to 2048 and at most 1 GB) absorb longer stalls,
+   within the CMA pool. The `ring high-water` figure in the summary shows how much of the
+   ring was used.
+4. **The drives were idle in a deep power state.** A gap shortly after the start of a fast
+   recording on drives that idled is the wake-up from a deep power state. The driver switches
+   APST off at probe by default; check `cat /sys/block/nvrec0n1/nvrec/apst` (`off`) and that
+   the module was not loaded with `apst=1` (see
+   [Kernel driver](driver.md#power-states-apst-and-temperature)).
+5. **The fabric path itself cannot keep up.** `nvrec --no-write --rate <R> --size 64G`
+   records into the ring without any SSD: if it drops at your rate too, the limit is the
+   fabric → DDR path of the board, not the SSDs (see
+   [Applications](apps.md#fabric-only---no-write)).
+6. **Other I/O on the same SSDs** during the recording, or a nearly full volume.
+7. **A hot drive throttles.** Above its warning temperature a drive slows down its writes;
+   watch `/sys/block/nvrecXn1/nvrec/temperature` during long recordings and give the drives
+   airflow.
 
 `nvverify` shows where the gaps are (file offsets), which tells you whether they are at the
-start, after a fixed amount (cache) or spread over the file (rate too high).
+start, after a fixed amount (cache) or spread over the file (rate too high). It counts the
+missing data in 16-byte words; a dropped 32-byte beat is two words, a 64-byte beat four.
 
 ### Recording stops with `stalled: no NVMe command completed for ... s` (exit code 1)
 
@@ -191,7 +210,12 @@ same recording on the other SSD to tell the two apart.
 The sink consumed faster than the SSDs delivered the data.
 
 * **No `--rate`, or a rate above the read rate.** The checker's default rate is one beat
-  per clock (3.2 GB/s); give `nvplay --rate` below the read rate of your SSDs.
+  per clock (8 GB/s on the 256-bit targets, 16 GB/s on `vck190_fmcp1`); give `nvplay --rate`
+  below the read rate of
+  your SSDs.
+* **A rate above what the fabric path delivers.** `nvplay --ring-only --rate <R>` plays the
+  ring without any SSD: if it underflows at your rate too, the limit is the DDR → fabric
+  path, not the SSDs.
 * **Read stalls.** Isolated underflow bursts near the read rate are read stalls longer than
   the ring lasts at that rate; more chunks (`--buffers`) absorb them.
 
@@ -222,7 +246,9 @@ is enabled and consuming (see [custom data sink](custom_sink)).
   ([board specific notes](supported_carriers.md#board-specific-notes)). If the card was
   written with `dd`, write it again with `bmaptool` and let it verify.
 * **The board boots another design.** The card holds an older image or the old `BOOT.BIN`;
-  the boot log's `nvrec_core v1.1` line identifies this design's bitstream.
+  the boot log's `nvrec_core v1.2 ... beat 32 bytes` line (`beat 64 bytes` on `vck190_fmcp1`)
+  identifies this revision's
+  bitstream.
 
 ## Build failures
 
@@ -238,6 +264,8 @@ is enabled and consuming (see [custom data sink](custom_sink)).
    file; Vivado 2025.2 rejects a SystemVerilog top (`[filemgmt 56-195]`).
 5. **Yocto on Windows or WSL** is not supported; build the XSA there and the Yocto image
    on a native Linux machine (see [Build instructions](build_instructions)).
-6. **A change to the driver or the apps does not show up in the image:** the Yocto stage
-   is skipped when the images exist; delete `Yocto/<target>/images/linux/` and build again
-   (see [Yocto](yocto.md#how-to-build)).
+6. **A change to the driver or the apps does not show up in the image:** the build runner
+   rebuilds the image when an input it hashes changed (`sw/`, `include/`, the bsp, the
+   layers, the XSA); `./build.sh status --target <target>` shows a stale image. To force a
+   rebuild: `./build.sh clean --stage yocto --target <target>`, then build again (see
+   [Yocto](yocto.md#how-to-build)).

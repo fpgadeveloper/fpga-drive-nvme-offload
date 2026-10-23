@@ -40,14 +40,16 @@ contiguous run of clusters, unmounts the volume while the hardware writes, and f
 the file afterwards (see [Filesystem and striping](filesystem)). You copy recordings off
 the board with `scp`, or move the SSDs to a PC.
 
-The data source is a block-design hierarchy (`user_data_source`) with a 128-bit
-AXI4-Stream output. In the reference design it holds a test pattern generator, which
+The data source is a block-design hierarchy (`user_data_source`) with an AXI4-Stream
+output at 250 MHz: 256 bits wide (up to 8 GB/s) on the Zynq UltraScale+ targets, 512 bits
+(up to 16 GB/s) on the Versal target; the width is a build parameter (128, 256 or 512 bits). In the reference design it holds a test pattern generator, which
 models an ADC: it produces data at a programmable rate and cannot be stalled. You replace
 it with your own ADC, sensor or processing logic (see [custom data source](custom_source)).
 If the SSDs cannot keep up, the data that does not fit is dropped and counted in the
 fabric, never silently lost: every recording reports its drop count, and a valid
 recording has a drop count of zero. The `nvverify` tool checks a test-pattern recording
-beat by beat.
+word by word. A fabric-only mode runs the recorder and the player without any SSD, to
+measure what the fabric and the DDR path sustain on their own.
 
 Playback runs the same path in reverse: the fabric issues NVMe Read commands into the ring,
 and streams the completed chunks into a second hierarchy, `user_data_sink`. In the
@@ -136,7 +138,7 @@ Linux image contains:
 | `nvsetup-raid0.sh` | Prepare the recording volume: one SSD or an md RAID0 array of two, exFAT ([Applications](apps)) |
 | `nvrec` | Record the fabric stream to a file |
 | `nvplay` | Play a recording back into the fabric |
-| `nvverify` | Verify a test-pattern recording beat by beat |
+| `nvverify` | Verify a test-pattern recording word by word |
 | `nvbench.sh` | Find the sustained recording rate of a board + SSD combination |
 | `nvbench-suite.sh` | Run the whole benchmark matrix of the [Benchmarks](benchmarks) page |
 | `nvregs` | Dump the hardware registers (support and debugging) |

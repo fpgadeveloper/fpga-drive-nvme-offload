@@ -10,14 +10,20 @@
 # and prints rate vs. pass/fail vs. drop count vs. FIFO high-water mark. The
 # highest passing rate is the sustained recording rate of this board + SSD
 # (+ RAID0) combination.
+#
+# Default sweep: 500 MB/s steps from 500 up to the generator maximum,
+# src_clk x beat_bytes from sysfs with the clock taken to the nearest MHz
+# (249.975 MHz x 32 B -> 8000, 199.98 MHz x 16 B -> 3200: the old x16
+# truncation gave 3199 and never swept 3200). A rate a hair above the true
+# maximum runs at the maximum (the driver clamps it).
 
 set -u
 
 DIR=/mnt/rec
 SIZE=32G
-FROM=250
+FROM=500
 TO=""
-STEP=250
+STEP=500
 NVREC_ARGS=""
 RAW=""
 KEEP=0
@@ -37,7 +43,8 @@ Options:
                        array) instead of a file; verified with nvverify --raw
   --size <bytes>       data per step, nvrec suffixes (default $SIZE)
   --from <MB/s>        first rate in MB/s (10^6 bytes/s, default $FROM)
-  --to <MB/s>          last rate (default: generator maximum = src_clk x 16)
+  --to <MB/s>          last rate (default: generator maximum = src_clk x
+                       beat_bytes, e.g. 250 MHz x 32 B = 8000)
   --step <MB/s>        rate step (default $STEP)
   --stop-on-fail       stop at the first failing rate
   --keep               keep the recordings (default: delete after verifying)
@@ -77,10 +84,12 @@ if [ -z "$RAW" ]; then
 fi
 
 SYS=/sys/class/misc/nvrec
+# bytes per fabric beat (driver >= 1.1); 16 = the 128-bit datapath of older drivers
+BEAT=$(cat $SYS/beat_bytes 2>/dev/null || echo 16)
 if [ -z "$TO" ]; then
     clk=$(cat $SYS/src_clk_hz 2>/dev/null || echo 0)
     [ "$clk" -gt 0 ] || die "cannot read $SYS/src_clk_hz; give --to"
-    TO=$(( clk * 16 / 1000000 ))
+    TO=$(( (clk + 500000) / 1000000 * BEAT ))
 fi
 
 if [ -n "$RAW" ]; then
@@ -93,7 +102,7 @@ OUT="$DIR/nvbench.dat"
 LOG=$(mktemp /tmp/nvbench.XXXXXX)
 trap 'rm -f "$LOG"' EXIT
 
-echo "nvbench: $FS_DEV ($FS_TYPE) ${RAW:-at $DIR}, $SIZE per step, $FROM..$TO MB/s step $STEP"
+echo "nvbench: $FS_DEV ($FS_TYPE) ${RAW:-at $DIR}, $SIZE per step, $FROM..$TO MB/s step $STEP ($BEAT-byte beats)"
 for d in /sys/block/nvrec*n1; do
     [ -e "$d" ] && echo "  $(basename "$d"): $(cat "$d/nvrec/model" 2>/dev/null) ($(cat "$d/nvrec/firmware" 2>/dev/null)), block I/O via $(cat "$d/nvrec/io_path" 2>/dev/null)"
 done
@@ -120,7 +129,7 @@ while [ "$rate" -le "$TO" ]; do
     bytes=$(get bytes); secs=$(get seconds)
     avg=$(awk -v b="${bytes:-0}" -v s="${secs:-0}" 'BEGIN { if (s > 0) printf "%.1f", b / s / 1e6; else print "-" }')
     if [ -n "$RAW" ]; then
-        VERIFY="nvverify -q --raw --length $(( ${bytes:-0} / 16 * 16 )) $RAW"
+        VERIFY="nvverify -q --raw --beat-bytes $BEAT --length $(( ${bytes:-0} / BEAT * BEAT )) $RAW"
     else
         VERIFY="nvverify -q $OUT"
     fi

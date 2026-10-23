@@ -23,6 +23,12 @@
  * Raw mode (--raw <dev>): record straight to LBAs of an unmounted nvrec disk
  * or md array (bring-up, benchmarks); check with nvverify --raw.
  *
+ * Fabric-only mode (--no-write, register map 1.2): the hardware runs with
+ * CONFIG.DRY -- the source fills the ring and every slot is released as soon
+ * as it is filled, no NVMe command, no file, no SSD needed. It measures the
+ * source -> ingest FIFO -> ring writer -> DDR path alone; statistics and the
+ * RESULT line are those of a recording (bytes = bytes written into the ring).
+ *
  * Exit codes: 0 = complete, no dropped beats and no NVMe error,
  *             2 = complete but beats were dropped,
  *             1 = error (NVMe error, stall, setup failure),
@@ -65,13 +71,14 @@ struct opts {
 	const char *output;     /* file, or the raw device with --raw */
 	const char *target;
 	bool raw;
+	bool no_write;          /* fabric only (DRY): no file, no NVMe command */
 	uint64_t offset;        /* raw: byte offset on the device */
 	uint64_t size;
 	uint64_t rate;
 	bool rate_set;
 	uint32_t chunk;
 	bool chunk_set;
-	uint32_t slots;         /* 0 = default: 256 MB of slots */
+	uint32_t slots;         /* 0 = default: 512 MB of slots */
 	uint32_t qd;
 	bool no_tpg;
 	bool fua;
@@ -87,6 +94,7 @@ static void usage(FILE *f)
 	fprintf(f,
 "Usage: nvrec [options] --size <bytes> <file>\n"
 "       nvrec [options] --size <bytes> --raw <blockdev> [--offset <bytes>]\n"
+"       nvrec [options] --size <bytes> --no-write\n"
 "\n"
 "Record the FPGA fabric data stream with the hardware NVMe command path.\n"
 "<file> is on a mounted exFAT volume on /dev/nvrecXn1 or on an md RAID0 of\n"
@@ -96,21 +104,29 @@ static void usage(FILE *f)
 "Options:\n"
 "  --size <bytes>        data to record (suffixes K/M/G/T = 1024^n, KB/MB/GB/TB\n"
 "                        = 1000^n); the file is preallocated to this size\n"
-"  --rate <bytes/s>      test pattern generator rate (default: leave as is)\n"
+"  --rate <bytes/s>      test pattern generator rate (default: leave as is; at\n"
+"                        most src_clk x the fabric beat, e.g. 250 MHz x 32 B =\n"
+"                        8000 MB/s on a 256-bit design: higher runs at the max)\n"
 "  --chunk <bytes>       bytes per NVMe command (default: 1M or the drives'\n"
 "                        MDTS, whichever is smaller; must equal the md chunk of\n"
 "                        a RAID0 volume)\n"
-"  --buffers <n>         ring slots of --chunk bytes in DDR, 2..1024 (default:\n"
-"                        256 MB of slots, 256 MB / chunk within 256..1024:\n"
-"                        1024 x 256K, 512 x 512K, 256 x 1M); the ring and its\n"
-"                        PRP lists come from CMA (cma= kernel argument)\n"
+"  --buffers <n>         ring slots of --chunk bytes in DDR, 2..2048, at most the\n"
+"                        hardware slot table (default: 512 MB of slots, 512 MB /\n"
+"                        chunk within 256..2048: 2048 x 256K, 1024 x 512K,\n"
+"                        512 x 1M); the ring and its PRP lists come from CMA\n"
+"                        (cma= kernel argument)\n"
 "  --qd <n>              NVMe commands in flight per SSD, 1..63 (default 32)\n"
 "  --no-tpg              do not touch the generator (user's own data source)\n"
 "  --fua                 Force Unit Access on every write\n"
 "  --force               overwrite an existing file\n"
 "  --raw <dev>           record to raw LBAs of <dev> (not mounted); no file\n"
 "  --offset <bytes>      raw: start offset on <dev>, chunk aligned (default 0)\n"
-"  --timeout <sec>       abort when no command completes for this long (default %.0f)\n"
+"  --no-write            fabric only (register map 1.2): the ring is filled and\n"
+"                        released at once, no NVMe command, no file (give none);\n"
+"                        --size counts the bytes written into the ring. Tests\n"
+"                        the source -> FIFO -> ring -> DDR path alone\n"
+"  --timeout <sec>       abort when no command completes (--no-write: no data\n"
+"                        moves) for this long (default %.0f)\n"
 "  --stats <sec>         live stats interval, 0 = off (default 1)\n"
 "  --device <path>       control device (default %s)\n"
 "  --target <name>       target name stored in the header (default %s)\n"
@@ -121,9 +137,12 @@ static void usage(FILE *f)
 "\n"
 "Ctrl-C stops early: the open chunk is padded and completed, the file is\n"
 "truncated to what was recorded. Check a test-pattern recording with nvverify.\n"
+"Counts are in fabric beats of the design (16, 32 or 64 bytes, RESULT\n"
+"beat_bytes); the test pattern is numbered in 16-byte words.\n"
 "\n"
 "Exit code: 0 = complete with no dropped beats, 2 = beats were dropped,\n"
-"1 = error, 5 = the Host Accelerator stopped responding (evaluation license).\n",
+"1 = error, 5 = the Host Accelerator stopped responding (evaluation license).\n"
+"The same with --no-write (never 5).\n",
 		DEF_TIMEOUT, DEF_DEVICE, NVREC_TARGET);
 }
 
@@ -140,6 +159,7 @@ static int parse_args(int argc, char **argv, struct opts *o)
 		{ "force", no_argument, NULL, 'f' },
 		{ "raw", no_argument, NULL, 'R' },
 		{ "offset", required_argument, NULL, 'o' },
+		{ "no-write", no_argument, NULL, 'W' },
 		{ "timeout", required_argument, NULL, 't' },
 		{ "stats", required_argument, NULL, 'S' },
 		{ "device", required_argument, NULL, 'D' },
@@ -192,6 +212,7 @@ static int parse_args(int argc, char **argv, struct opts *o)
 		case 'F': o->fua = true; break;
 		case 'f': o->force = true; break;
 		case 'R': o->raw = true; break;
+		case 'W': o->no_write = true; break;
 		case 'o':
 			if (parse_size(optarg, &o->offset))
 				return die_usage("invalid --offset '%s'", optarg);
@@ -219,16 +240,24 @@ static int parse_args(int argc, char **argv, struct opts *o)
 			return -1;
 		}
 	}
-	if (optind != argc - 1) {
-		usage(stderr);
-		return -1;
+	if (o->no_write) {
+		if (optind != argc)
+			return die_usage("--no-write creates no file: give no <file>");
+		if (o->raw || o->force || o->fua || o->offset)
+			return die_usage("--no-write takes none of --raw, --offset, --force, --fua");
+		if (!o->size)
+			return die_usage("--size is required (bytes to move into the ring)");
+	} else {
+		if (optind != argc - 1) {
+			usage(stderr);
+			return -1;
+		}
+		o->output = argv[optind];
 	}
-	o->output = argv[optind];
 	if (!o->size)
 		return die_usage("--size is required (the file is preallocated)");
-	if (o->slots && (uint64_t)o->chunk * o->slots > NVREC_RING_MAX_BYTES)
-		return die_usage("ring of %u x %u bytes is larger than %llu MB: use fewer --buffers",
-				 o->slots, o->chunk, NVREC_RING_MAX_BYTES >> 20);
+	/* --buffers x chunk is checked once the chunk is known (md chunk,
+	 * MDTS): pick_slots() */
 	return 0;
 }
 
@@ -243,7 +272,7 @@ static void fill_header(struct nvrec_file_header *h, const struct opts *o,
 	memcpy(h->magic, NVREC_FILE_MAGIC, NVREC_FILE_MAGIC_LEN);
 	h->header_version = htole32(NVREC_FILE_HEADER_VERSION);
 	h->header_size = htole32(data_off);
-	h->beat_bytes = htole32(16);
+	h->beat_bytes = htole32(info->beat_bytes);	/* the design's fabric beat */
 	h->flags = htole32((o->no_tpg ? 0 : NVREC_FILE_FLAG_TPG) | NVREC_FILE_FLAG_COMPLETE);
 	h->design_version = htole32(info->hw_version);
 	h->src_clk_hz = htole64(info->src_clk_hz);
@@ -265,6 +294,128 @@ static void fill_header(struct nvrec_file_header *h, const struct opts *o,
 	h->lat_avg_ns = htole64((uint64_t)(ctl_cycles_to_us(info, st->lat_count ?
 						st->lat_sum / st->lat_count : 0) * 1e3));
 	h->lat_max_ns = htole64((uint64_t)(ctl_cycles_to_us(info, st->lat_max) * 1e3));
+}
+
+/* ring slots: the default (512 MB of slots) or --buffers within the hardware */
+static int pick_slots(struct opts *o, const struct nvrec_info *info)
+{
+	if (!o->slots) {
+		o->slots = ctl_default_slots(o->chunk, info->max_slots);
+	} else if (info->max_slots && o->slots > info->max_slots) {
+		err_msg("--buffers %u exceeds the hardware slot table (%u)", o->slots, info->max_slots);
+		return -1;
+	} else if ((uint64_t)o->chunk * o->slots > NVREC_RING_MAX_BYTES) {
+		err_msg("ring of %u x %u bytes is larger than %llu MB: use fewer --buffers",
+			o->slots, o->chunk, NVREC_RING_MAX_BYTES >> 20);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * --no-write: a fabric-only (DRY) record run. No file, no geometry members:
+ * the hardware fills the ring slot by slot and releases each slot as soon as
+ * it is filled, so the run measures the source -> ingest FIFO -> ring writer
+ * -> DDR path alone. Same statistics and RESULT keys as a recording.
+ */
+static int record_dry(struct opts *o)
+{
+	struct nvrec_info info;
+	struct nvrec_geometry g;
+	struct nvrec_ring ring;
+	struct nvrec_start start;
+	struct nvrec_stats st;
+	char res[CTL_RESULT_MAX];
+	uint64_t nchunks;
+	double seconds;
+	int fd, r, ret = 1;
+
+	fd = ctl_open(o->device, &info, true);
+	if (fd < 0)
+		return ctl_exit_code();
+	if (o->chunk > info.max_chunk) {
+		/* SET_RING still checks the chunk against the live SSDs' MDTS */
+		if (o->chunk_set) {
+			err_msg("--chunk %u exceeds the SSDs' maximum transfer size (%u)", o->chunk,
+				info.max_chunk);
+			goto out;
+		}
+		o->chunk = info.max_chunk;
+	}
+	if (pick_slots(o, &info))
+		goto out;
+	nchunks = (o->size + o->chunk - 1) / o->chunk;
+	if (nchunks > UINT32_MAX) {
+		err_msg("--size too large for one run");
+		goto out;
+	}
+	if (o->rate_set) {
+		struct nvrec_rate rr = { .rate_bps = o->rate };
+
+		if (ioctl(fd, NVREC_IOC_SET_RATE, &rr) < 0) {
+			perr("NVREC_IOC_SET_RATE");
+			goto out;
+		}
+		o->rate = rr.rate_bps;
+	}
+	if (ctl_set_ring(fd, o->chunk, o->slots, &ring))
+		goto out;
+	memset(&g, 0, sizeof(g));
+	g.nr_members = 0;			/* no SSD */
+	g.length_chunks = (uint32_t)nchunks;
+	if (ioctl(fd, NVREC_IOC_SET_GEOMETRY, &g) < 0) {
+		perr("NVREC_IOC_SET_GEOMETRY");
+		goto out;
+	}
+	memset(&start, 0, sizeof(start));
+	start.flags = (o->no_tpg ? 0 : NVREC_START_TPG) | NVREC_START_DRY;
+	if (ioctl(fd, NVREC_IOC_RECORD_START, &start) < 0) {
+		perr("NVREC_IOC_RECORD_START (fabric only)");
+		goto out;
+	}
+	if (!o->quiet)
+		fprintf(stderr, "nvrec: --no-write: %" PRIu64 " x %u-byte chunks into the ring (%u slots, %"
+			PRIu64 " MB), fabric only, %u-byte beats, nothing is written\n",
+			nchunks, o->chunk, ring.slots, (uint64_t)ring.bytes >> 20, info.beat_bytes);
+	{
+		struct ctl_run_opts ro = {
+			.stats = o->stats, .timeout = o->timeout, .quiet = o->quiet,
+			.dry = true, .expect_bytes = nchunks * o->chunk,
+		};
+
+		r = ctl_run(fd, &info, &ro, &st);
+	}
+	if (r && r != -ETIMEDOUT)
+		goto out;
+	seconds = st.elapsed_ns / 1e9;
+	ctl_print_summary(prog_name, &info, &st, seconds, true);
+	printf("nvrec: dropped beats %" PRIu64 ", FIFO high-water during the run %u of %u beats\n",
+	       (uint64_t)st.drop_count, st.fifo_hwm, st.fifo_depth);
+	printf("nvrec: ring %u slots x %u bytes = %" PRIu64 " MB (filled and released at once)\n",
+	       ring.slots, o->chunk, (uint64_t)ring.bytes >> 20);
+	snprintf(res, sizeof(res), "bytes=%" PRIu64 " seconds=%.3f rate_bps=%" PRIu64
+		 " drops=%" PRIu64 " fifo_hwm=%u fifo_depth=%u error=%d nvme_errors=%u"
+		 " chunk=%u qd=0 members=0 ring_hwm=%u lat_avg_us=0 lat_max_us=0"
+		 " data_offset=0 beat_bytes=%u no_write=1",
+		 (uint64_t)st.bytes, seconds, o->rate_set ? o->rate : 0, (uint64_t)st.drop_count,
+		 st.fifo_hwm, st.fifo_depth, r ? r : (st.state == NVREC_RUN_DONE ? 0 : -EIO),
+		 st.cmd_errors, o->chunk, st.ring_hwm, info.beat_bytes);
+	ctl_result_stats(res, sizeof(res), &info, &st, 0);
+	ctl_result_ring(res, sizeof(res), &ring);
+	ctl_print_result(res, o->json);
+	if (r || st.state != NVREC_RUN_DONE) {
+		err_msg("fabric-only run FAILED (%s)", r == -ETIMEDOUT ? "stalled" : "run did not complete");
+		ret = 1;
+	} else if (st.drop_count) {
+		err_msg("WARNING: %" PRIu64 " beats were dropped: the fabric path did not keep up",
+			(uint64_t)st.drop_count);
+		ret = 2;
+	} else {
+		ret = 0;
+	}
+out:
+	close(fd);
+	return ret;
 }
 
 int main(int argc, char **argv)
@@ -290,6 +441,8 @@ int main(int argc, char **argv)
 	if (parse_args(argc, argv, &o))
 		return 1;
 	ctl_install_signals();
+	if (o.no_write)
+		return record_dry(&o);
 
 	/* ---- where does it go ---------------------------------------------- */
 	if (o.raw) {
@@ -327,7 +480,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	fd = ctl_open(o.device, &info);
+	fd = ctl_open(o.device, &info, false);
 	if (fd < 0)
 		return ctl_exit_code();
 	memset(&g, 0, sizeof(g));
@@ -346,16 +499,8 @@ int main(int argc, char **argv)
 			info.max_chunk);
 		goto out;
 	}
-	if (!o.slots) {
-		o.slots = ctl_default_slots(o.chunk, info.max_slots);
-	} else if (info.max_slots && o.slots > info.max_slots) {
-		err_msg("--buffers %u exceeds the hardware slot table (%u)", o.slots, info.max_slots);
+	if (pick_slots(&o, &info))
 		goto out;
-	} else if ((uint64_t)o.chunk * o.slots > NVREC_RING_MAX_BYTES) {
-		err_msg("ring of %u x %u bytes is larger than %llu MB: use fewer --buffers",
-			o.slots, o.chunk, NVREC_RING_MAX_BYTES >> 20);
-		goto out;
-	}
 	nchunks = (o.size + o.chunk - 1) / o.chunk;
 	if (nchunks > UINT32_MAX) {
 		err_msg("--size too large for one run");
@@ -491,10 +636,10 @@ int main(int argc, char **argv)
 	if (r == -ENOLINK) {
 		/* Host Accelerator dead: the SSDs are disabled, the volume
 		 * cannot be updated; report the run and leave */
-		ctl_print_summary(prog_name, &info, &st, seconds);
+		ctl_print_summary(prog_name, &info, &st, seconds, false);
 		snprintf(res, sizeof(res), "bytes=%" PRIu64 " seconds=%.3f drops=%" PRIu64
-			 " error=%d ha_dead=1", (uint64_t)st.bytes, seconds,
-			 (uint64_t)st.drop_count, r);
+			 " error=%d ha_dead=1 beat_bytes=%u no_write=0", (uint64_t)st.bytes, seconds,
+			 (uint64_t)st.drop_count, r, info.beat_bytes);
 		ctl_result_stats(res, sizeof(res), &info, &st, CTL_RES_LAT);
 		ctl_result_ring(res, sizeof(res), &ring);
 		ctl_print_result(res, o.json);
@@ -548,7 +693,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	ctl_print_summary(prog_name, &info, &st, seconds);
+	ctl_print_summary(prog_name, &info, &st, seconds, false);
 	printf("nvrec: dropped beats %" PRIu64 ", FIFO high-water during the run %u of %u beats%s\n",
 	       (uint64_t)st.drop_count, st.fifo_hwm, st.fifo_depth,
 	       o.raw ? "" : "; file header + padding before the data");
@@ -558,12 +703,12 @@ int main(int argc, char **argv)
 	snprintf(res, sizeof(res), "bytes=%" PRIu64 " seconds=%.3f rate_bps=%" PRIu64
 	       " drops=%" PRIu64 " fifo_hwm=%u fifo_depth=%u error=%d nvme_errors=%u"
 	       " chunk=%u qd=%u members=%u ring_hwm=%u lat_avg_us=%.0f lat_max_us=%.0f"
-	       " data_offset=%u",
+	       " data_offset=%u beat_bytes=%u no_write=0",
 	       (uint64_t)st.bytes, seconds, o.rate_set ? o.rate : 0, (uint64_t)st.drop_count, st.fifo_hwm,
 	       st.fifo_depth, r ? r : (st.state == NVREC_RUN_DONE ? 0 : -EIO), st.cmd_errors,
 	       o.chunk, o.qd ? o.qd : 32, g.nr_members, st.ring_hwm,
 	       ctl_cycles_to_us(&info, st.lat_count ? st.lat_sum / st.lat_count : 0),
-	       ctl_cycles_to_us(&info, st.lat_max), data_off);
+	       ctl_cycles_to_us(&info, st.lat_max), data_off, info.beat_bytes);
 	ctl_result_stats(res, sizeof(res), &info, &st, 0);
 	ctl_result_ring(res, sizeof(res), &ring);
 	ctl_print_result(res, o.json);
