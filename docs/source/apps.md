@@ -626,7 +626,8 @@ lowering, MaxReadReq untouched (512 bytes) — and prints the result. It is idem
 a value a device does not support, and refuses to change anything while a recording or
 playback runs or block I/O is in flight (`--force` overrides). `--all` takes every NVMe
 function, not only nvrec's. The change lasts until the next boot. `status` reads the PCIe
-configuration space and needs root: without `sudo` it prints `MaxPayload ?` for every device.
+configuration space and needs root: without `sudo` it prints `MaxPayload ?` for every device,
+says so (`run as root`) and exits 1.
 On `zcu106_hpc0` with two Samsung 980 PRO, after boot:
 
 ```

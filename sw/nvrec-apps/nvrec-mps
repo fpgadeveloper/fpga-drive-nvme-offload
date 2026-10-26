@@ -82,8 +82,13 @@ mrrs_of() { local v; v=$(devctl "$1") && [ -n "$v" ] && echo $(( 128 << ((0x$v >
 mpss_of() { local v; v=$(devcap "$1") && [ -n "$v" ] && echo $(( 128 << (0x$v & 7) )); }
 enc() { case "$1" in 128) echo 0 ;; 256) echo 1 ;; 512) echo 2 ;; *) echo x ;; esac; }
 
+UNREAD=0   # set by show() when a config-space read failed (printed as ?)
 show() { # <bdf> <role>
-    echo "  $1  $2: MaxPayload $(mps_of "$1" || echo ?) (supports $(mpss_of "$1" || echo ?)), MaxReadReq $(mrrs_of "$1" || echo ?)"
+    local mps mpss mrrs
+    mps=$(mps_of "$1") || { mps=?; UNREAD=1; }
+    mpss=$(mpss_of "$1") || { mpss=?; UNREAD=1; }
+    mrrs=$(mrrs_of "$1") || { mrrs=?; UNREAD=1; }
+    echo "  $1  $2: MaxPayload $mps (supports $mpss), MaxReadReq $mrrs"
 }
 
 status() {
@@ -94,6 +99,16 @@ status() {
         show "$(port_of "$s")" "root port"
     done
     [ "$n" -gt 0 ] || { log "no SSD$([ "$ALL" = 0 ] && echo " bound to nvrec-nvme") found"; return 1; }
+    # The PCIe capability lies past the first 64 bytes of config space, which
+    # only root may read: without it every value is '?'.
+    if [ "$UNREAD" = 1 ]; then
+        if [ "$(id -u 2>/dev/null)" != 0 ]; then
+            log "'?' = config space not readable: run as root (sudo nvrec-mps status)"
+        else
+            log "'?' = config space not readable (setpci failed on a function above)"
+        fi
+        return 1
+    fi
 }
 
 # a recording/playback running, or block I/O in flight on an nvrec disk
