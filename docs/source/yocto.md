@@ -76,7 +76,10 @@ freshness stamp (content hashes) of everything the image is built from: the XSA,
 target's bsp, the extra layers, and the repository sources the recipes fetch (`sw/` and
 `include/`). After you change the driver, the apps or the shared headers, the next
 `./build.sh yocto` sees the change and rebuilds the image (incrementally: the workspace is
-kept); `./build.sh status --target <target>` marks a stale image. To force a rebuild anyway:
+kept); `./build.sh status --target <target>` marks a stale image. Only a new XSA regenerates the
+system device tree and the generated machine; a change to the board's `local.conf.append` alone
+refreshes the build configuration, and bitbake then re-runs only what its values affect (a
+comment-only edit rebuilds nothing). To force a rebuild anyway:
 `./build.sh clean --stage yocto --target <target>`, then `./build.sh yocto --target <target>`.
 ```
 

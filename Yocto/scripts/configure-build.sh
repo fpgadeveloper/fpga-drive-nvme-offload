@@ -33,6 +33,14 @@
 #                       machine-name prefix so it is repo-specific)
 #   $7 PORT_CFG_DIR    (optional per-target overlay layer dir, e.g.
 #                       <repo>/Yocto/bsp/port-configs/ports-0123; empty = none)
+#   $8 MODE            (optional) "full" (default): everything below, SDT and
+#                       gen-machineconf included; "conf": only the layer list
+#                       and the local.conf block are refreshed, for a change to
+#                       local.conf.append / bblayers-extra.txt / the sstate path
+#                       while the XSA is unchanged (a regenerated SDT would
+#                       re-run the device-tree, firmware and boot-image tasks
+#                       for nothing). Falls back to "full" when the generated
+#                       MACHINE conf is not there yet.
 
 set -euo pipefail
 
@@ -43,6 +51,10 @@ XSA="$4"
 SSTATE_PATH="${5:-}"
 BD_NAME="${6:-design}"
 PORT_CFG_DIR="${7:-}"
+MODE="${8:-full}"
+case "$MODE" in full|conf) ;; *)
+    echo "ERROR: MODE must be 'full' or 'conf' (got '$MODE')" >&2; exit 1 ;;
+esac
 
 SETUP="$WORKSPACE/edf-init-build-env"
 
@@ -193,6 +205,13 @@ generate_sdt() {
     return 1
 }
 
+MACHINE_NAME="${BD_NAME}-${TARGET}"
+if [ "$MODE" = conf ] && [ ! -f "$CONF_DIR/machine/$MACHINE_NAME.conf" ]; then
+    echo "[configure-build] conf-only refresh requested but conf/machine/$MACHINE_NAME.conf is missing: full configure"
+    MODE=full
+fi
+
+if [ "$MODE" = full ]; then
 # ---- 1. SDT from XSA --------------------------------------------------------
 if ! generate_sdt; then
     echo "ERROR: SDT generation failed; cannot configure the build." >&2
@@ -203,7 +222,6 @@ fi
 # bitbake is available (we sourced edf-init-build-env) so the tool builds its
 # own native helpers (kconfig-frontends-native, esw-conf-native, lopper) and
 # fetches/processes the SDT itself.
-MACHINE_NAME="${BD_NAME}-${TARGET}"
 GMC="$WORKSPACE/sources/meta-xilinx/gen-machine-conf/gen-machineconf"
 if [ ! -x "$GMC" ]; then
     echo "ERROR: gen-machineconf not found at $GMC" >&2
@@ -219,6 +237,9 @@ python3 "$GMC" \
 if [ ! -f "$CONF_DIR/machine/$MACHINE_NAME.conf" ]; then
     echo "ERROR: gen-machineconf did not produce conf/machine/$MACHINE_NAME.conf" >&2
     exit 1
+fi
+else
+    echo "[configure-build] conf-only refresh (MACHINE=$MACHINE_NAME kept; SDT not regenerated)"
 fi
 
 # ---- 3. local.conf: select the generated MACHINE + BSP overrides + sstate ---
@@ -251,4 +272,4 @@ fi
     echo "$MARK_END"
 } >> "$CONF_DIR/local.conf"
 
-echo "[configure-build] build/conf ready in $BUILDDIR (MACHINE=$MACHINE_NAME)"
+echo "[configure-build] build/conf ready in $BUILDDIR (MACHINE=$MACHINE_NAME, $MODE)"
