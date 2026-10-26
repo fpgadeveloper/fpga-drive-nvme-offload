@@ -34,6 +34,18 @@
 // BEAT_BYTES = DATA_WIDTH / 8 bytes (register BEAT_BYTES, 0x0BC). FIFO depths
 // and every beat counter are in beats of that width.
 //
+// Split ring (register map 1.3, N_RING_PORTS = 2): a second ring AXI4 master
+// m_axi1 reaches a second memory (PL DDR4 on zcu106_hpc0, LPDDR4 on
+// vck190_fmcp1). CONFIG.SPLIT stripes the ring over RING_BASE (m_axi) and
+// RING_BASE1 (m_axi1) in stripes of 2^RING_STRIPE_SHIFT bytes; CONFIG.MEM1
+// puts a single ring at RING_BASE1 (diagnostics). Writer, reader and the
+// command builder's PRP1/PRP2 share the address function (nvrec_ring_addr).
+// mem1_ready (memory 1 calibrated, any clock domain) -> STATE bit 13.
+// N_RING_PORTS = 1: m_axi1 is idle, SPLIT / MEM1 are ignored and the engine
+// is the 1.2 engine (RING_PORTS reads 1). With two ports the ring reader has
+// a skid FIFO of RD_SKID_DEPTH beats per port (see nvrec_rd), so a memory
+// switch of the stream (stripe / chunk boundary) costs no read latency.
+//
 // CONFIG.DRY (bit 2, latched at START): fabric-only run, no NVMe command.
 // Record: slots are released as soon as they are filled (rel = filled_cnt),
 // the command builder is held off, DRAIN ends when the writer is done.
@@ -48,7 +60,11 @@ module nvrec_core #(
   parameter integer DP_CLK_HZ      = 250000000,
   parameter integer FIFO_DEPTH     = 8192,       // ingest, beats (256 KB @ 256 b)
   parameter integer EGR_FIFO_DEPTH = 4096,       // egress, beats (128 KB @ 256 b)
-  parameter integer SLOT_W         = 11
+  parameter integer SLOT_W         = 12,
+  parameter integer N_RING_PORTS   = 2,          // ring AXI4 masters: 1 or 2
+  parameter integer RD_SKID_DEPTH  = 512,        // ring reader per-port R skid FIFO, beats
+                                                 // (2 ring ports only; 0 = none; >= 4096 in URAM)
+  parameter integer RD_RQ_DEPTH    = 0           // ring reader bursts in flight (0 = 16, 32 at 512 b)
 ) (
   (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 src_clk CLK" *)
   (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axis:m_axis_snk, ASSOCIATED_RESET src_resetn" *)
@@ -58,7 +74,7 @@ module nvrec_core #(
   input  wire          src_resetn,
 
   (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 dp_clk CLK" *)
-  (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:m_axi:m_axis_sqe:s_axis_cqe:s_axi_db:m_axi_db, ASSOCIATED_RESET dp_resetn" *)
+  (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:m_axi:m_axi1:m_axis_sqe:s_axis_cqe:s_axi_db:m_axi_db, ASSOCIATED_RESET dp_resetn" *)
   input  wire          dp_clk,
   (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 dp_resetn RST" *)
   (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -126,6 +142,40 @@ module nvrec_core #(
   input  wire          m_axi_rlast,
   input  wire          m_axi_rvalid,
   output wire          m_axi_rready,
+
+  // Second ring AXI4 master (register map 1.3): memory 1 of the split ring
+  output wire [63:0]   m_axi1_awaddr,
+  output wire [7:0]    m_axi1_awlen,
+  output wire [2:0]    m_axi1_awsize,
+  output wire [1:0]    m_axi1_awburst,
+  output wire [3:0]    m_axi1_awcache,
+  output wire [2:0]    m_axi1_awprot,
+  output wire          m_axi1_awvalid,
+  input  wire          m_axi1_awready,
+  output wire [DATA_WIDTH-1:0]   m_axi1_wdata,
+  output wire [DATA_WIDTH/8-1:0] m_axi1_wstrb,
+  output wire          m_axi1_wlast,
+  output wire          m_axi1_wvalid,
+  input  wire          m_axi1_wready,
+  input  wire [1:0]    m_axi1_bresp,
+  input  wire          m_axi1_bvalid,
+  output wire          m_axi1_bready,
+  output wire [63:0]   m_axi1_araddr,
+  output wire [7:0]    m_axi1_arlen,
+  output wire [2:0]    m_axi1_arsize,
+  output wire [1:0]    m_axi1_arburst,
+  output wire [3:0]    m_axi1_arcache,
+  output wire [2:0]    m_axi1_arprot,
+  output wire          m_axi1_arvalid,
+  input  wire          m_axi1_arready,
+  input  wire [DATA_WIDTH-1:0]   m_axi1_rdata,
+  input  wire [1:0]    m_axi1_rresp,
+  input  wire          m_axi1_rlast,
+  input  wire          m_axi1_rvalid,
+  output wire          m_axi1_rready,
+
+  // Memory 1 ready (PL DDR4 calibration done; 1 on Versal), any clock domain
+  input  wire          mem1_ready,
 
   // SQEs to the NVMe Host Accelerator S_AXIS
   output wire [511:0]  m_axis_sqe_tdata,
@@ -244,7 +294,7 @@ module nvrec_core #(
   localparam integer CNT_W      = $clog2(FIFO_DEPTH) + 1;
   localparam integer EGR_CNT_W  = $clog2(EGR_FIFO_DEPTH) + 1;
   localparam integer SYNC_FF    = 4;
-  localparam [31:0]  VERSION    = 32'h0001_0002;   // register map 1.2
+  localparam [31:0]  VERSION    = 32'h0001_0003;   // register map 1.3
   localparam [31:0]  ID_VALUE   = 32'h4E56_5243;
   localparam integer MAX_SLOTS  = 1 << SLOT_W;
   localparam integer BEAT_BYTES = DATA_WIDTH / 8;
@@ -257,6 +307,9 @@ module nvrec_core #(
     // the ring writer's committed-beat arithmetic needs CNT_W >= 10
     if (FIFO_DEPTH < 512) begin : g_bad_depth
       FIFO_DEPTH_must_be_at_least_512 u_param_error ();
+    end
+    if (N_RING_PORTS != 1 && N_RING_PORTS != 2) begin : g_bad_ports
+      N_RING_PORTS_must_be_1_or_2 u_param_error ();
     end
   endgenerate
 
@@ -337,6 +390,12 @@ module nvrec_core #(
   wire ha_dead_s;
   xpm_cdc_single #(.DEST_SYNC_FF(SYNC_FF), .INIT_SYNC_FF(1), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0))
   u_cdc_ha_dead (.src_clk(1'b0), .src_in(ha_dead), .dest_clk(dp_clk), .dest_out(ha_dead_s));
+
+  // Memory 1 ready (1.3): calibration status of the second ring memory
+  wire mem1_ready_s;
+  xpm_cdc_single #(.DEST_SYNC_FF(SYNC_FF), .INIT_SYNC_FF(1), .SIM_ASSERT_CHK(0), .SRC_INPUT_REG(0))
+  u_cdc_mem1_ready (.src_clk(1'b0), .src_in(mem1_ready), .dest_clk(dp_clk), .dest_out(mem1_ready_s));
+  wire mem1_rdy = (N_RING_PORTS == 2) ? mem1_ready_s : 1'b0;
 
   // ===========================================================================
   // fdrec-compatible control registers
@@ -593,6 +652,8 @@ module nvrec_core #(
   reg  [7:0]  cfg_reg;            // CONFIG
   reg  [6:0]  irq_en;
   reg  [63:0] ring_base_r, prp_base_r, start_chunk_r;
+  reg  [63:0] ring_base1_r;       // 1.3
+  reg  [31:0] stripe_r;           // 1.3 RING_STRIPE_SHIFT
   reg  [31:0] num_chunks_r, chunk_size_r, prp_shift_r, lba_shift_r;
   reg  [31:0] length_r, last_bytes_r, credit_init_r;
   reg  [31:0] m_nsid_r [0:1];
@@ -605,6 +666,8 @@ module nvrec_core #(
       cfg_reg       <= 8'h10;
       irq_en        <= 7'd0;
       ring_base_r   <= 64'd0;
+      ring_base1_r  <= 64'd0;
+      stripe_r      <= 32'd12;
       prp_base_r    <= 64'd0;
       start_chunk_r <= 64'd0;
       num_chunks_r  <= 32'd256;
@@ -635,6 +698,9 @@ module nvrec_core #(
         12'h148: length_r      <= wr_data;
         12'h14C: last_bytes_r  <= wr_data;
         12'h154: credit_init_r <= wr_data;
+        12'h158: ring_base1_r[31:0]  <= wr_data;
+        12'h15C: ring_base1_r[63:32] <= wr_data;
+        12'h160: stripe_r      <= wr_data;
         12'h180: m_nsid_r[0]   <= wr_data;
         12'h184: m_sel_r[0]    <= {wr_data[13:8], 3'd0, wr_data[4:0]};
         12'h188: m_lba_r[0][31:0]  <= wr_data;
@@ -686,6 +752,10 @@ module nvrec_core #(
   reg  [4:0]  c_chunk_shift, c_prp_shift;
   reg  [SLOT_W:0] c_num_chunks;
   reg  [63:0] c_ring_base, c_prp_base, c_start_chunk;
+  reg         c_split, c_mem1;    // 1.3
+  reg  [4:0]  c_stripe;
+  reg  [63:0] c_ring_base1;
+  wire [4:0]  chunk_shift_w = log2_chunk(chunk_size_r);
   reg  [31:0] c_length;
   reg  [22:0] c_last_bytes;
   reg  [31:0] c_nsid0, c_nsid1;
@@ -735,6 +805,11 @@ module nvrec_core #(
         c_num_chunks  <= (num_chunks_r == 32'd0) ? 1 :
                          ((num_chunks_r > MAX_SLOTS) ? MAX_SLOTS[SLOT_W:0] : num_chunks_r[SLOT_W:0]);
         c_ring_base   <= ring_base_r;
+        c_ring_base1  <= ring_base1_r;
+        c_split       <= (N_RING_PORTS == 2) && cfg_reg[3];
+        c_mem1        <= (N_RING_PORTS == 2) && cfg_reg[6] && !cfg_reg[3];
+        c_stripe      <= (stripe_r < 32'd12) ? 5'd12 :
+                         ((stripe_r > {27'd0, chunk_shift_w}) ? chunk_shift_w : stripe_r[4:0]);
         c_prp_base    <= prp_base_r;
         c_start_chunk <= start_chunk_r;
         c_length      <= length_r;
@@ -826,15 +901,26 @@ module nvrec_core #(
   wire [22:0] last_bytes;
   wire [63:0] wr_beats_out, wr_run_beats, wr_full_cycles;
   wire [63:0] wr_run_bytes = wr_run_beats << BEAT_SHIFT;   // BYTES (record)
-  wire [31:0] wr_pad_bytes, wr_bresp_errs;
+  wire [31:0] wr_pad_bytes, wr_bresp_errs, wr_stall0, wr_stall1;
+  wire [1:0]  wr_awvalid, wr_wvalid, wr_bready;
+  wire [63:0] wr_awaddr;
+  wire [7:0]  wr_awlen;
+  wire [DATA_WIDTH-1:0] wr_wdata;
+  wire        wr_wlast;
 
-  nvrec_wr #(.DATA_WIDTH(DATA_WIDTH), .SLOT_W(SLOT_W), .CNT_W(CNT_W), .ADDR_W(64)) u_wr (
+  nvrec_wr #(.DATA_WIDTH(DATA_WIDTH), .SLOT_W(SLOT_W), .CNT_W(CNT_W), .ADDR_W(64),
+             .N_RING_PORTS(N_RING_PORTS)) u_wr (
     .clk           (dp_clk),
     .rst           (eng_rst),
     .start         (run_start && !c_play),
+    .cnt_clr       (run_start),
     .stop          (run_stop),
     .abort         (run_abort),
     .ring_base     (c_ring_base),
+    .ring_base1    (c_ring_base1),
+    .split         (c_split),
+    .mem1          (c_mem1),
+    .stripe_shift  (c_stripe),
     .chunk_shift   (c_chunk_shift),
     .num_chunks    (c_num_chunks),
     .lba_shift     (c_lba_shift),
@@ -844,17 +930,17 @@ module nvrec_core #(
     .fifo_tvalid   (fifo_tvalid),
     .fifo_tready   (fifo_tready),
     .fifo_count    (fifo_count),
-    .m_axi_awaddr  (m_axi_awaddr),
-    .m_axi_awlen   (m_axi_awlen),
-    .m_axi_awvalid (m_axi_awvalid),
-    .m_axi_awready (m_axi_awready),
-    .m_axi_wdata   (m_axi_wdata),
-    .m_axi_wlast   (m_axi_wlast),
-    .m_axi_wvalid  (m_axi_wvalid),
-    .m_axi_wready  (m_axi_wready),
-    .m_axi_bresp   (m_axi_bresp),
-    .m_axi_bvalid  (m_axi_bvalid),
-    .m_axi_bready  (m_axi_bready),
+    .m_axi_awaddr  (wr_awaddr),
+    .m_axi_awlen   (wr_awlen),
+    .m_axi_awvalid (wr_awvalid),
+    .m_axi_awready ({m_axi1_awready, m_axi_awready}),
+    .m_axi_wdata   (wr_wdata),
+    .m_axi_wlast   (wr_wlast),
+    .m_axi_wvalid  (wr_wvalid),
+    .m_axi_wready  ({m_axi1_wready, m_axi_wready}),
+    .m_axi_bresp   ({m_axi1_bresp, m_axi_bresp}),
+    .m_axi_bvalid  ({m_axi1_bvalid, m_axi_bvalid}),
+    .m_axi_bready  (wr_bready),
     .opened_cnt    (opened_cnt),
     .filled_cnt    (filled_cnt),
     .final_partial (final_partial),
@@ -867,8 +953,26 @@ module nvrec_core #(
     .run_beats     (wr_run_beats),
     .pad_bytes     (wr_pad_bytes),
     .full_cycles   (wr_full_cycles),
-    .bresp_errs    (wr_bresp_errs)
+    .bresp_errs    (wr_bresp_errs),
+    .stall0        (wr_stall0),
+    .stall1        (wr_stall1)
   );
+
+  // ring port 0 (memory 0) and port 1 (memory 1): shared address / data
+  assign m_axi_awaddr   = wr_awaddr;
+  assign m_axi_awlen    = wr_awlen;
+  assign m_axi_awvalid  = wr_awvalid[0];
+  assign m_axi_wdata    = wr_wdata;
+  assign m_axi_wlast    = wr_wlast;
+  assign m_axi_wvalid   = wr_wvalid[0];
+  assign m_axi_bready   = wr_bready[0];
+  assign m_axi1_awaddr  = wr_awaddr;
+  assign m_axi1_awlen   = wr_awlen;
+  assign m_axi1_awvalid = wr_awvalid[1];
+  assign m_axi1_wdata   = wr_wdata;
+  assign m_axi1_wlast   = wr_wlast;
+  assign m_axi1_wvalid  = wr_wvalid[1];
+  assign m_axi1_bready  = wr_bready[1];
 
   assign m_axi_awsize  = BEAT_SHIFT[2:0];   // BEAT_BYTES per beat
   assign m_axi_awburst = 2'b01;       // INCR
@@ -879,6 +983,15 @@ module nvrec_core #(
   assign m_axi_arburst = 2'b01;
   assign m_axi_arcache = 4'b0011;
   assign m_axi_arprot  = 3'b000;
+  assign m_axi1_awsize  = BEAT_SHIFT[2:0];
+  assign m_axi1_awburst = 2'b01;
+  assign m_axi1_awcache = 4'b0011;
+  assign m_axi1_awprot  = 3'b000;
+  assign m_axi1_wstrb   = {(DATA_WIDTH/8){1'b1}};
+  assign m_axi1_arsize  = BEAT_SHIFT[2:0];
+  assign m_axi1_arburst = 2'b01;
+  assign m_axi1_arcache = 4'b0011;
+  assign m_axi1_arprot  = 3'b000;
 
   // Injector
   wire         inj_valid, inj_accept, inj_afull, inj_irq, inj_push;
@@ -920,7 +1033,7 @@ module nvrec_core #(
   wire [7:0]  infl_hwm0, infl_hwm1;
   wire [31:0] ssd_issued0, ssd_issued1;
 
-  nvrec_cmd #(.SLOT_W(SLOT_W), .ADDR_W(64)) u_cmd (
+  nvrec_cmd #(.SLOT_W(SLOT_W), .ADDR_W(64), .N_RING_PORTS(N_RING_PORTS)) u_cmd (
     .clk             (dp_clk),
     .rst             (!dp_resetn),
     .cnt_rst         (srst),
@@ -935,6 +1048,10 @@ module nvrec_core #(
     .chunk_shift     (c_chunk_shift),
     .num_chunks      (c_num_chunks),
     .ring_base       (c_ring_base),
+    .ring_base1      (c_ring_base1),
+    .split           (c_split),
+    .mem1            (c_mem1),
+    .stripe_shift    (c_stripe),
     .prp_base        (c_prp_base),
     .prp_shift       (c_prp_shift),
     .start_chunk     (c_start_chunk),
@@ -1043,29 +1160,38 @@ module nvrec_core #(
   wire                 rd_tlast, rd_tvalid, rd_tready;
   wire [EGR_CNT_W-1:0] egr_level;
   wire [63:0]          rd_bytes, egr_beats_in, egr_discard;
-  wire [31:0]          rd_rresp_errs;
+  wire [31:0]          rd_rresp_errs, rd_wait0, rd_wait1;
+  wire [1:0]           rd_arvalid, rd_rready;
+  wire [63:0]          rd_araddr;
+  wire [7:0]           rd_arlen;
 
   nvrec_rd #(.DATA_WIDTH(DATA_WIDTH), .SLOT_W(SLOT_W), .ADDR_W(64), .EGR_DEPTH(EGR_FIFO_DEPTH),
-             .EGR_CNT_W(EGR_CNT_W)) u_rd (
+             .EGR_CNT_W(EGR_CNT_W), .N_RING_PORTS(N_RING_PORTS), .SKID_DEPTH(RD_SKID_DEPTH),
+             .RQ_DEPTH(RD_RQ_DEPTH)) u_rd (
     .clk              (dp_clk),
     .rst              (eng_rst),
     .start            (run_start && c_play),
+    .cnt_clr          (run_start),
     .abort            (run_abort),
     .ring_base        (c_ring_base),
+    .ring_base1       (c_ring_base1),
+    .split            (c_split),
+    .mem1             (c_mem1),
+    .stripe_shift     (c_stripe),
     .chunk_shift      (c_chunk_shift),
     .num_chunks       (c_num_chunks),
     .length_chunks    (c_length),
     .last_chunk_bytes (c_last_bytes),
     .cmp_cnt          (c_dry ? c_length : cmp_cnt),   // DRY: ring-resident data
-    .m_axi_araddr     (m_axi_araddr),
-    .m_axi_arlen      (m_axi_arlen),
-    .m_axi_arvalid    (m_axi_arvalid),
-    .m_axi_arready    (m_axi_arready),
-    .m_axi_rdata      (m_axi_rdata),
-    .m_axi_rresp      (m_axi_rresp),
-    .m_axi_rlast      (m_axi_rlast),
-    .m_axi_rvalid     (m_axi_rvalid),
-    .m_axi_rready     (m_axi_rready),
+    .m_axi_araddr     (rd_araddr),
+    .m_axi_arlen      (rd_arlen),
+    .m_axi_arvalid    (rd_arvalid),
+    .m_axi_arready    ({m_axi1_arready, m_axi_arready}),
+    .m_axi_rdata      ({m_axi1_rdata, m_axi_rdata}),
+    .m_axi_rresp      ({m_axi1_rresp, m_axi_rresp}),
+    .m_axi_rlast      ({m_axi1_rlast, m_axi_rlast}),
+    .m_axi_rvalid     ({m_axi1_rvalid, m_axi_rvalid}),
+    .m_axi_rready     (rd_rready),
     .m_axis_tdata     (rd_tdata),
     .m_axis_tlast     (rd_tlast),
     .m_axis_tvalid    (rd_tvalid),
@@ -1075,8 +1201,19 @@ module nvrec_core #(
     .done             (rd_done),
     .busy             (rd_busy),
     .bytes            (rd_bytes),
-    .rresp_errs       (rd_rresp_errs)
+    .rresp_errs       (rd_rresp_errs),
+    .wait0            (rd_wait0),
+    .wait1            (rd_wait1)
   );
+
+  assign m_axi_araddr   = rd_araddr;
+  assign m_axi_arlen    = rd_arlen;
+  assign m_axi_arvalid  = rd_arvalid[0];
+  assign m_axi_rready   = rd_rready[0];
+  assign m_axi1_araddr  = rd_araddr;
+  assign m_axi1_arlen   = rd_arlen;
+  assign m_axi1_arvalid = rd_arvalid[1];
+  assign m_axi1_rready  = rd_rready[1];
 
   // egress FIFO reset window (as fdrec_core)
   reg  [4:0] egr_rst_cnt;
@@ -1267,7 +1404,7 @@ module nvrec_core #(
                    rd_data <= hi_latch;
           // NVMe offload
           12'h104: rd_data <= {23'd0, credit_per_cqe_r, cfg_reg};
-          12'h108: rd_data <= {19'd0, ha_dead_s, inj_valid, wr_ring_full, rd_busy, wr_busy, 4'd0, state};
+          12'h108: rd_data <= {18'd0, mem1_rdy, ha_dead_s, inj_valid, wr_ring_full, rd_busy, wr_busy, 4'd0, state};
           12'h10C: rd_data <= {25'd0, irq_st[6:4], inj_irq, irq_st[2:0]};
           12'h110: rd_data <= {25'd0, irq_en};
           12'h118: begin rd_data <= tstamp[31:0]; hi_latch <= tstamp[63:32]; end
@@ -1285,6 +1422,10 @@ module nvrec_core #(
           12'h14C: rd_data <= last_bytes_r;
           12'h150: rd_data <= MAX_SLOTS;
           12'h154: rd_data <= credit_init_r;
+          12'h158: rd_data <= ring_base1_r[31:0];
+          12'h15C: rd_data <= ring_base1_r[63:32];
+          12'h160: rd_data <= stripe_r;
+          12'h164: rd_data <= N_RING_PORTS;
           12'h180: rd_data <= m_nsid_r[0];
           12'h184: rd_data <= {18'd0, m_sel_r[0][13:8], 3'd0, m_sel_r[0][4:0]};
           12'h188: rd_data <= m_lba_r[0][31:0];
@@ -1325,6 +1466,10 @@ module nvrec_core #(
           12'h248: begin rd_data <= wr_full_cycles[31:0]; hi_latch <= wr_full_cycles[63:32]; end
           12'h250: begin rd_data <= run_drops[31:0]; hi_latch <= run_drops[63:32]; end
           12'h258: rd_data <= run_hwm;
+          12'h260: rd_data <= wr_stall0;
+          12'h264: rd_data <= wr_stall1;
+          12'h268: rd_data <= rd_wait0;
+          12'h26C: rd_data <= rd_wait1;
           12'h280: rd_data <= lat_min;
           12'h284: rd_data <= lat_max;
           12'h288: rd_data <= lat_cnt;

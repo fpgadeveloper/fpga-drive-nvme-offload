@@ -38,9 +38,9 @@
 # Design args follow PetaLinux/bsp/uzev CONFIG_SUBSYSTEM_USER_CMDLINE.
 # No "rw": root is mounted ro and systemd-remount-fs remounts it rw (fstab "/" defaults).
 # NVREC_CMA: CMA pool. The nvrec driver allocates the recording ring there
-# (one physically contiguous region; default 256 slots x chunk, chunk =
-# min(1 MB, the drives' MDTS) -> at most 256 MB) next to the PCIe/NVMe DMA
-# needs of the kernel. The UltraZed-EV SOM has 4 GB of PS DDR4, of which 2 GB
+# (one physically contiguous region: a single ring, 512 MB by default, plus
+# 4 KB of PRP list per slot; at most 1 GB) next to the PCIe/NVMe DMA needs of
+# the kernel. The UltraZed-EV SOM has 4 GB of PS DDR4, of which 2 GB
 # are below 4 GB where arm64 puts the CMA pool: 1024M (the base design used
 # 1000M here) leaves room for the kernel and keeps rings up to ~768 MB
 # possible (NUM_SLOTS x chunk must fit in the pool with the kernel's own CMA

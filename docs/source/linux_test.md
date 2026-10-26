@@ -5,8 +5,9 @@ through the steps below: check that the SSDs and the recorder are there, prepare
 recording volume, make a recording, verify it, copy it off the board and play it back.
 
 Most commands need root privileges: prefix them with `sudo` (the `amd-edf` user may use
-it). The outputs below come from a ZCU106 (`zcu106_hpc0`) with two Samsung 980 PRO 1TB;
-the numbers on your board depend on the target, the SSDs and the rate you choose.
+it). The outputs below come from a ZCU106 (`zcu106_hpc0`) with two Samsung 980 PRO 1TB on
+the FPGA Drive FMC Gen4, with the image's defaults; the numbers on your board depend on the
+target, the SSDs and the rate you choose.
 
 ```{note}
 With an **evaluation license** for the NVMe Host Accelerator, the IP stops 183-184 minutes
@@ -24,39 +25,58 @@ SSD it takes over:
 dmesg | grep -E "PCIe Link|nvrec"
 ```
 
-Example output (ZCU106, two 980 PRO; the `nvrec 420010000.nvrec` line is one line, wrapped here):
+Example output (ZCU106, two Samsung 980 PRO; the `nvrec 420010000.nvrec` line is one line,
+wrapped here):
 
 ```none
 xilinx-xdma-pcie 400000000.axi-pcie: PCIe Link is UP
 xilinx-xdma-pcie 500000000.axi-pcie: PCIe Link is UP
-nvrec 420010000.nvrec: /dev/nvrec: driver 1.1, nvrec_core v1.2, src_clk 249975021 Hz, dp_clk 249975021 Hz,
-  beat 32 bytes, FIFO 8192/4096 beats (ingest/egress), 2048 ring slots, DRY; nvmeha: 2 SSDs x 1 queues
+nvrec 420010000.nvrec: /dev/nvrec: driver 1.2, nvrec_core v1.3, src_clk 249975021 Hz, dp_clk 249975021 Hz,
+  beat 32 bytes, FIFO 8192/4096 beats (ingest/egress), 4096 ring slots, DRY, ring ports 2,
+  mem1 0x2000000000 1024 MB, default ring split, stripe chunk; nvmeha: 2 SSDs x 1 queues
   (SQ window 0x90000000, CQ window 0x90008000), hardware queues, CPU I/O via the injector
 nvrec-nvme 0000:01:00.0: SSD0: APST disabled (the drive's setting)
 nvrec-nvme 0000:01:00.0: SSD0: Samsung SSD 980 PRO 1TB (<serial>, fw 5B2QGXA7): 1953525168 x 512-byte LBAs (1000 GB), MDTS 512 KB, DSTRD 0, 1 I/O queues granted, 0 SW + 1 HW queues in the IP, block I/O via the CPU command injector -> /dev/nvrec0n1
-nvrec-nvme 0000:01:00.0: SSD0: composite temperature 27 C (warning 82 C, critical 85 C; 0 = not reported)
+nvrec-nvme 0000:01:00.0: SSD0: composite temperature 32 C (warning 82 C, critical 85 C; 0 = not reported)
 nvrec-nvme 0001:01:00.0: SSD1: APST disabled (the drive's setting)
 nvrec-nvme 0001:01:00.0: SSD1: Samsung SSD 980 PRO 1TB (<serial>, fw 5B2QGXA7): 1953525168 x 512-byte LBAs (1000 GB), MDTS 512 KB, DSTRD 0, 1 I/O queues granted, 0 SW + 1 HW queues in the IP, block I/O via the CPU command injector -> /dev/nvrec1n1
-nvrec-nvme 0001:01:00.0: SSD1: composite temperature 28 C (warning 82 C, critical 85 C; 0 = not reported)
+nvrec-nvme 0001:01:00.0: SSD1: composite temperature 35 C (warning 82 C, critical 85 C; 0 = not reported)
+nvrec-mps: NVREC_MPS 256 (/etc/default/nvrec-mps): setting it on the nvrec SSDs and their root ports
+nvrec-mps: root port 0000:00:00.0: MaxPayload 128 -> 256 (MaxReadReq 512 unchanged)
+nvrec-mps: SSD       0000:01:00.0: MaxPayload 128 -> 256 (MaxReadReq 512 unchanged)
+nvrec-mps: root port 0001:00:00.0: MaxPayload 128 -> 256 (MaxReadReq 512 unchanged)
+nvrec-mps: SSD       0001:01:00.0: MaxPayload 128 -> 256 (MaxReadReq 512 unchanged)
 ```
 
 What the lines tell you:
 
-* `driver 1.1` is the kernel driver version and `nvrec_core v1.2` the register map version
-  of the hardware (1.2: the configurable datapath width and the fabric-only mode; 1.1 added
-  the Host Accelerator timeout guard); `src_clk` and `dp_clk` are the measured source and
+* `driver 1.2` is the kernel driver version and `nvrec_core v1.3` the register map version
+  of the hardware (1.3: the split ring over two memories; 1.2: the configurable datapath
+  width and the fabric-only mode; 1.1 added the Host Accelerator timeout guard); `src_clk`
+  and `dp_clk` are the measured source and
   datapath clocks; `beat 32 bytes` is the 256-bit fabric datapath of the Zynq UltraScale+
   targets (`vck190_fmcp1`, 512 bits, shows `beat 64 bytes, FIFO 4096/4096 beats`; see
   [Kernel driver](driver.md#beats-and-words)), with an ingest FIFO of 8192 beats (256 KB)
-  and an egress FIFO of 4096 beats (128 KB); `2048 ring slots` is the hardware slot table;
-  `DRY` says the fabric-only mode is there. `2 SSDs x 1 queues` is the Host Accelerator's
+  and an egress FIFO of 4096 beats (128 KB); `4096 ring slots` is the hardware slot table;
+  `DRY` says the fabric-only mode is there. `ring ports 2, mem1 0x2000000000 1024 MB` is the
+  split ring: a second ring port and the 1 GB of the second memory (here the PL DDR4) the
+  device tree reserves for it; the default ring of a RAID0 or fabric-only run is split over
+  both memories in whole-chunk stripes (`stripe chunk`, on `vck190_fmcp1` too; see
+  [Kernel driver](driver.md#split-ring-one-ring-in-two-memories); `NOT READY` after the
+  address would mean the PL DDR4 controller did not calibrate; `uzev` shows `ring ports 1,
+  single ring`). `2 SSDs x 1 queues` is the Host Accelerator's
   configuration: one hardware queue per SSD, whose memory (`SQ window`, `CQ window`) the
   SSDs reach at 0x9000_0000.
 * Per drive: the APST state the drive came up with and what the driver did with it (see
   [Kernel driver](driver.md#power-states-apst-and-temperature)); model, serial, firmware,
   capacity and LBA size, the **MDTS** (which sets the recording chunk, see
   [supported SSDs](supported_ssds)), the doorbell stride (`DSTRD 0` is required), and the
-  block device the drive is reachable at; its temperature and thresholds.
+  block device the drive is reachable at; its temperature and thresholds. A drive may grant
+  more I/O queues than the one the design uses (a Sabrent Rocket 2230 grants 8).
+* The `nvrec-mps` lines: `nvrec-pcie-mps.service` raises the PCIe MaxPayload from the kernel's
+  128 bytes to 256 bytes on both Root Ports and both SSDs, the image's setting on
+  `zcu106_hpc0` and `vck190_fmcp1` (`uzev` keeps 128 bytes and shows no such lines; see
+  [Apps](apps.md#nvrec-mps)).
 
 The SSDs are **not** `/dev/nvme0n1` / `/dev/nvme1n1` in this design: they belong to the
 `nvrec-nvme` driver, which creates their I/O queues inside the Host Accelerator (see
@@ -77,19 +97,33 @@ If a link does not come up or an SSD is missing, see [Troubleshooting](troublesh
 ## 2. Check the recorder driver
 
 ```
-cat /sys/module/nvrec/version              # 1.1: the driver
-cat /sys/class/misc/nvrec/version          # 1.2: the register map of the hardware
+cat /sys/module/nvrec/version              # 1.2: the driver
+cat /sys/class/misc/nvrec/version          # 1.3: the register map of the hardware
 cat /sys/class/misc/nvrec/beat_bytes       # 32: a 256-bit datapath (64 on vck190_fmcp1)
 cat /sys/class/misc/nvrec/ha_dead          # 0 = the Host Accelerator is working
 cat /sys/block/nvrec0n1/nvrec/temperature  # composite temperature of SSD0, degrees C
 cat /sys/block/nvrec0n1/nvrec/apst         # off (the driver's default)
 grep Cma /proc/meminfo                     # CmaTotal: the pool for the recording ring
+sudo nvrec-mps status                      # PCIe MaxPayload of the SSDs and their Root Ports
 ```
 
-The recording ring (512 MB by default: 512 × 1 MB, 1024 × the 980 PRO's 512 KB chunks or
-2048 × 256 KB) and its PRP lists are allocated from the CMA pool
-when a run starts; the image reserves 1 GB (`uzev`) or 1.5 GB (`zcu106_hpc0`,
-`vck190_fmcp1`).
+`sudo nvrec-mps status` on `zcu106_hpc0` (256 bytes on all four; `uzev` shows 128):
+
+```none
+  0000:01:00.0  SSD      : MaxPayload 256 (supports 256), MaxReadReq 512
+  0000:00:00.0  root port: MaxPayload 256 (supports 1024), MaxReadReq 512
+  0001:01:00.0  SSD      : MaxPayload 256 (supports 256), MaxReadReq 512
+  0001:00:00.0  root port: MaxPayload 256 (supports 1024), MaxReadReq 512
+```
+
+The recording ring and its PRP lists are allocated when a run starts. A RAID0 or fabric-only
+run on `zcu106_hpc0` and `vck190_fmcp1` uses a 1 GB ring split over PS DDR and the second
+memory, half in each, in whole-chunk stripes (4096 × the Sabrent's 256 KB chunks, 2048 × the
+980 PRO's 512 KB); a run on one SSD, and every run on `uzev`, a 512 MB ring in PS DDR. The
+PS DDR part comes from the CMA pool, of which the image reserves 1 GB (`uzev`) or 1.5 GB
+(`zcu106_hpc0`, `vck190_fmcp1`); the second memory's part is the 1 GB region the device tree
+reserves there. `cat /sys/class/misc/nvrec/ring_ports /sys/class/misc/nvrec/mem1_ready` shows
+`2` and `1` on the split-ring designs.
 
 ## 3. Prepare the recording volume
 
@@ -122,7 +156,7 @@ nvsetup-raid0: /dev/md0 (exFAT) mounted at /mnt/rec
 ```
 
 The chunk is 1 MB, or the drives' maximum transfer size (MDTS) when that is smaller — 512 KB
-on the 980 PRO. `--trim` deallocates the whole drives first (the reference starting point
+on the 980 PRO, 256 KB on the Sabrent Rocket 2230. `--trim` deallocates the whole drives first (the reference starting point
 for benchmarks), `--mount <dir>` mounts somewhere else. See
 [Applications](apps.md#nvsetup-raid0sh) for all options.
 
@@ -155,41 +189,47 @@ While it runs, `nvrec` prints a live statistics line every second (elapsed time,
 stored, rate, progress, commands in flight, ring fill, dropped beats, NVMe errors), then a
 summary:
 
-Example output (ZCU106, RAID0 of two 980 PRO, freshly trimmed; the `RESULT` line is one line,
-wrapped here):
+Example output (ZCU106, RAID0 of two 980 PRO, freshly trimmed; the design's hardware test,
+which records to `/mnt/rec/hwtest.dat`; the `RESULT` line is one line, wrapped here):
 
 ```none
-nvrec: /mnt/rec/test.dat: 20480 x 524288-byte chunks from array chunk 35 over 2 member(s), ring 1024 slots (512 MB), qd 32
-nvrec: 10737418240 bytes in 10.74 s, 999.9 MB/s; 20480 commands, 0 errors, max 4 in flight per SSD
-nvrec: command latency min 179 / avg 180 / max 3670 us; ring high-water 8 slots, writer waited 0.000 ms for a free slot
+nvrec: /mnt/rec/hwtest.dat: 20480 x 524288-byte chunks from array chunk 35 over 2 member(s), ring 2048 slots (1024 MB, split over 2 memories, whole-chunk stripes (512 KB)), qd 32
+nvrec: 10737418240 bytes in 10.74 s, 1000.0 MB/s; 20480 commands, 0 errors, max 2 in flight per SSD
+nvrec: command latency min 162 / avg 163 / max 1954 us; ring high-water 5 slots, writer waited 0.000 ms for a free slot
+nvrec: ring ports (memory 0 / 1): writer waited 193.537 / 20.974 ms, reader waited 0.000 / 0.000 ms
 nvrec: dropped beats 0, FIFO high-water during the run 129 of 8192 beats; file header + padding before the data
-nvrec: ring 1024 slots x 524288 bytes = 512 MB, high-water 8 slots
+nvrec: ring 2048 slots x 524288 bytes = 1024 MB, split over 2 memories, whole-chunk stripes (512 KB), high-water 5 slots
 RESULT bytes=10737418240 seconds=10.738 rate_bps=999999997 drops=0 fifo_hwm=129 fifo_depth=8192
-  error=0 nvme_errors=0 chunk=524288 qd=32 members=2 ring_hwm=8 lat_avg_us=180 lat_max_us=3670
-  data_offset=524288 beat_bytes=32 no_write=0 lat_min_us=179 lat_count=20480 inflight_hwm=4,1
-  ring_wait_ms=0.000 lat_hist=0,0,0,0,0,0,20468,0,0,6,6,0,0,0,0,0 lat_bin0_log2=10
-  ring_slots=1024 ring_bytes=536870912
+  error=0 nvme_errors=0 chunk=524288 qd=32 members=2 ring_hwm=5 lat_avg_us=163 lat_max_us=1954
+  data_offset=524288 beat_bytes=32 no_write=0 lat_min_us=162 lat_count=20480 inflight_hwm=2,1
+  ring_wait_ms=0.000 lat_hist=0,0,0,0,0,0,20474,0,2,4,0,0,0,0,0,0 lat_bin0_log2=10
+  wr_port_stall_ms=193.537,20.974 rd_port_wait_ms=0.000,0.000 mps=256 ring_slots=2048
+  ring_bytes=1073741824 ring=split stripe_kb=512 ring_mem1_bytes=536870912
 exit code 0
 ```
 
 What the summary tells you:
 
 * **the first line**: 10 GiB is 20480 chunks of 512 KB (the 980 PRO's MDTS), striped over the
-  two drives starting at chunk 35 of the array, through a ring of 1024 slots (512 MB).
+  two drives starting at chunk 35 of the array, through a ring of 2048 slots (1 GB) split over
+  PS DDR and the PL DDR4 in whole-chunk stripes: each drive writes from one of the two memories.
 * **20480 commands, 0 errors**: one NVMe Write command per chunk, all issued and completed in
-  hardware; `max 4 in flight per SSD` is the deepest each SSD's queue got (the limit is
+  hardware; `max 2 in flight per SSD` is the deepest each SSD's queue got (the limit is
   `--qd`, default 32). At 1 GB/s a 980 PRO completes nearly every 512 KB command before the
   next chunk is full; at higher rates or during write stalls more commands queue up.
 * **command latency**: from the moment the command builder hands a command to the Host
   Accelerator to its completion, measured in hardware.
 * **ring high-water**: the most chunks that were waiting for the SSDs at any time, out of
-  the ring's 1024. It shows how much of the ring the SSDs' write stalls used; `writer waited`
+  the ring's 2048. It shows how much of the ring the SSDs' write stalls used; `writer waited`
   is the time the ring was full (it must stay 0 for a clean recording).
+* **ring ports**: how long the ring writer waited for each of the two memories. Some wait is
+  normal in every run; a memory whose wait approaches the duration of the recording is the one
+  that held it up (see [Applications](apps.md#ring-layout---ring-and---stripe)).
 * **dropped beats 0**: no data was lost. `FIFO high-water` is the fill of the 8192-beat
   (256 KB) ingest FIFO during the run; beats are 32 bytes on this design (`beat_bytes=32`).
 * `RESULT` is one machine-readable line for scripts (`nvbench.sh` uses it); its first keys
   follow the `fdrec` tool of fpga-drive-recorder, the others are listed in
-  [Applications](apps.md#nvrec).
+  [Applications](apps.md#nvrec). `mps=256` is the PCIe MaxPayload in force.
 
 | `nvrec` exit code | Meaning |
 |---|---|
@@ -212,19 +252,19 @@ exit code 0 for a clean recording:
 Example output (the recording above):
 
 ```none
-/mnt/rec/test.dat:
+/mnt/rec/hwtest.dat:
   header          NVREC version 1, data at 524288, 32-byte beats
   flags           0x3 (test pattern, complete)
-  design version  1.2
+  design version  1.3
   target / host   zcu106_hpc0 / zcu106-nvrec-2025-2
   src_clk_hz      249975021
-  rate_bps        999999999
+  rate_bps        999999997
   ...
   data_bytes      10737418240
   drop_count      0 beats
   first_seq       0
   chunk / members 524288 bytes / 2, start chunk 35, qd 32
-  NVMe            0 errors, latency avg 179 us, max 243 us
+  NVMe            0 errors, latency avg 163 us, max 1954 us
   words           671088640 (10737418240 bytes, 335544320 beats of 32 bytes)
   first sequence  0
   last sequence   671088639
@@ -268,26 +308,27 @@ sudo nvplay --rate 3000MB /mnt/rec/test.dat; echo "exit code $?"
 
 `nvplay` prints the same summary lines as `nvrec` (see [Applications](apps.md#nvplay) for a
 complete example), then the prefill time, the checker's counts (`nvplay: checker: ... 0
-errors, 0 gaps ..., 0 underflows`) and its `RESULT` line. Example, a 10 GB recording of the
-same kind on the same RAID0 of two 980 PROs, played at 4000 MB/s (the prefill and `RESULT`
+errors, 0 gaps ..., 0 underflows`) and its `RESULT` line. Example, a 40 GiB recording of the
+same kind on the same RAID0 of two 980 PROs, played at 5750 MB/s (the prefill and `RESULT`
 lines; the `RESULT` line is one line, wrapped here):
 
 ```none
-nvplay: ring prefill before the sink was enabled: 0.085 s (not in the time above)
-RESULT bytes=10737418240 seconds=2.684 sink_rate_bps=3999999997 beats=335544320 errors=0 gaps=0
-  gap_beats=0 drop_count=0 underflows=0 nvme_errors=0 complete=1 error=0 prefill_seconds=0.085
-  beat_bytes=32 file_beat_bytes=32 ring_only=0 passes=1 lat_avg_us=424 lat_max_us=10317
-  ring_hwm=1024 lat_min_us=174 lat_count=20480 inflight_hwm=32,32 ring_wait_ms=0.000
-  lat_hist=0,0,0,0,0,0,19331,127,1,13,451,487,70,0,0,0 lat_bin0_log2=10
-  ring_slots=1024 ring_bytes=536870912
+nvplay: ring prefill before the sink was enabled: 0.153 s (not in the time above)
+RESULT bytes=42949672960 seconds=7.470 sink_rate_bps=5749999999 beats=1342177280 errors=0 gaps=0
+  gap_beats=0 drop_count=0 underflows=0 nvme_errors=0 complete=1 error=0 prefill_seconds=0.153
+  beat_bytes=32 file_beat_bytes=32 ring_only=0 passes=1 lat_avg_us=278 lat_max_us=8010
+  ring_hwm=2048 lat_min_us=167 lat_count=81920 inflight_hwm=32,32 ring_wait_ms=0.000
+  lat_hist=0,0,0,0,0,0,79872,2,4,357,593,1092,0,0,0,0 lat_bin0_log2=10
+  wr_port_stall_ms=0.000,0.000 rd_port_wait_ms=1643.923,453.218 mps=256 ring_slots=2048
+  ring_bytes=1073741824 ring=split stripe_kb=512 ring_mem1_bytes=536870912
 exit code 0
 ```
 
 Before the checker is enabled, the ring is filled from the SSDs (`prefill`), so that the
 sink does not starve while the first read commands complete. During playback the ring is
-normally full (`ring_hwm=1024` of 1024 slots) and every SSD has its full `--qd` of reads in
+normally full (`ring_hwm=2048` of 2048 slots) and every SSD has its full `--qd` of reads in
 flight (`inflight_hwm=32,32`): the SSDs read ahead of the sink. `beats` counts the 32-byte
-beats the checker took.
+beats the checker took; `rd_port_wait_ms` is how long the ring reader waited for each memory.
 
 | `nvplay` exit code | Meaning |
 |---|---|

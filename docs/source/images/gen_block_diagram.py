@@ -224,7 +224,9 @@ FAMILIES = {
               "nvmeha_0/S_AXI_SSD (I/O SQ / CQ, 0x9000_0000).\n"
               "Doorbells: nvmeha_0/M_AXI_SSD → doorbell monitor → smc_db → smc_bar_N → xdma_N/S_AXI_B (the SSD's BAR0).  "
               "periph_intercon_N also reaches xdma_N/S_AXI_LITE (ECAM).\n"
-              "The PCIe part (root ports, reference clocks, PERST#, SSD2 power) is the design of fpga-drive-aximm-pcie.",
+              "The PCIe part (root ports, reference clocks, PERST#, SSD2 power) is the design of fpga-drive-aximm-pcie.\n"
+              "Split ring (map 1.3, zcu106_hpc0): ring port 1 nvrec_core_0/m_axi1 and smc_ssd_N (3rd master) → smc_mig → ddr4_0 "
+              "(soldered 2 GB PL DDR4, 0x20_0000_0000, not mapped to the PS); uzev: single ring.",
     ),
     "versal": dict(
         out="nvrec-block-versal.png",
@@ -235,7 +237,7 @@ FAMILIES = {
                   "pl0_ref_clk 250 MHz\npl1_ref_clk 250 MHz\n(dp_clk)\npl2_ref_clk 250 MHz\n(src_clk)\n"
                   "pl3_ref_clk 100 MHz",
         ddr="DDR4 via NoC",
-        ddr_body="axi_noc_0 ring: S09_AXI\n512 bit, 14000 MB/s → MC_2\nSSD1: S08 → MC_1\nSSD2: S10 → MC_3",
+        ddr_body="axi_noc_0 ring A: S09_AXI\n512 bit, 14000 MB/s → MC_2\nSSD1: S08 → MC_1\nSSD2: S10 → MC_3",
         ctl_lbl="M_AXI_FPD →\nsmc_m_axi_fpd  (AXI-Lite)",
         smc="axi_smc_dma\n\nto NoC port\nS09_AXI\n512 bit\n(MC_2),\nnon-\ncoherent",
         data_bits=512,
@@ -267,6 +269,8 @@ FAMILIES = {
               "SmartConnect shared by both root ports.\n"
               "SSD DMA: qdma_0 → smc_m_axi_bridge → NoC S08_AXI (MC_1), qdma_1 → smc_m_axi_bridge_1 → NoC S10_AXI (MC_3), 7000 MB/s each, "
               "or → smc_q → nvmeha_0/S_AXI_SSD (queue window 0x9000_0000).  QDMA control: M_AXI_LPD → smc_m_axi_lpd.\n"
+              "Split ring (map 1.3): ring port 1 nvrec_core_0/m_axi1 → axi_smc_dma1 → noc_lpddr4/S00_AXI (MC_0, 14000 MB/s); S08 / S10 → "
+              "M00 / M01_INI → noc_lpddr4 (MC_1 / MC_2, 4000 MB/s each); LPDDR4 (one controller, 4 GB) at 0x600_0000_0000, not mapped to the PS.\n"
               "Doorbells: nvmeha_0/M_AXI_SSD → doorbell monitor → smc_m_axi_fpd (second slave port) → qdma_N/S_AXI_BRIDGE "
               "(BAR0 only).  The PCIe part is the Versal design of fpga-drive-aximm-pcie.",
     ),

@@ -1355,6 +1355,14 @@ if {$dual_design} {
 #                                     (both M01) -> smc_q -> nvmeha_0/S_AXI_SSD
 #  PS:       M_AXI_FPD -> smc_m_axi_fpd -> qdma_N/S_AXI_BRIDGE (BAR windows, base design),
 #            nvrec_core_0 regs, nvmeha_guard (AXI-Lite timeout guard) -> nvmeha_0 S_AXI_LITE
+#  Split ring (register map 1.3, ring_mem lpddr4 in config/data.json): memory 1 =
+#  the on-board LPDDR4 (second NoC instance noc_lpddr4 with ONE DDRMC, both x32
+#  channels interleaved; see the split-ring block below for why not the BSP's two
+#  interleaved DDRMCs), at DDR_CH2 0x600_0000_0000 (4 GB):
+#            nvrec_core_0/m_axi1 -> axi_smc_dma1 -> noc_lpddr4/S00_AXI (PL NMU, DWb) -> MC_0
+#            axi_noc_0/S08_AXI (qdma_0 bridge) -> M00_INI -> noc_lpddr4/S00_INI -> MC_1
+#            axi_noc_0/Snn_AXI (qdma_1 bridge) -> M01_INI -> noc_lpddr4/S01_INI -> MC_2
+#            (the PS NMUs get no route: the CPUs never see the LPDDR4)
 #
 # Differences from the Zynq UltraScale+ design (bd_zynqmp.tcl), same function:
 #   * the QDMA bridges translate nothing (axibar_notranslate, root-port BAR0 at
@@ -1376,9 +1384,11 @@ if {$dual_design} {
 #   * the ring path is one NoC NMU of nvrec_data_width bits at dp_clk (no HP
 #     port width limit as on ZynqMP): 8.0 GB/s per direction at 256 bits,
 #     16.0 GB/s at 512 bits (NoC QoS request capped at 14000 MB/s, see below).
-#   * DDR: PS DDR at 0x0 (2 GB) and 0x8_0000_0000 on the VCK190; all PL
-#     masters use 64-bit addresses, the queue window 0x9000_0000 sits in the
-#     bridges' address spaces where no DDR is mapped.
+#   * DDR: PS DDR4 at 0x0 (2 GB) and 0x500_0000_0000 (6 GB, DDR_CH1) on the
+#     VCK190; LPDDR4 (split ring memory 1) at 0x600_0000_0000 (DDR_CH2) for
+#     nvrec_core_0/m_axi1 and the QDMA bridges only; all PL masters use 64-bit
+#     addresses, the queue window 0x9000_0000 sits in the bridges' address
+#     spaces where no DDR is mapped.
 #
 # DWb = nvrec_data_width bits (nvrec_params.tcl / config/data.json data_width,
 # 512 on vck190_fmcp1 since dp256: with it nvrec_bridge_split = 1, ie. one NoC
@@ -1493,7 +1503,9 @@ set_property -dict [list CONFIG.DATA_WIDTH $nvrec_data_width \
   CONFIG.DP_CLK_HZ $dp_clk_hz \
   CONFIG.FIFO_DEPTH $nvrec_ing_fifo_depth \
   CONFIG.EGR_FIFO_DEPTH $nvrec_egr_fifo_depth \
-  CONFIG.SLOT_W $nvrec_slot_w] [get_bd_cells nvrec_core_0]
+  CONFIG.SLOT_W $nvrec_slot_w \
+  CONFIG.N_RING_PORTS $nvrec_ring_ports \
+  CONFIG.RD_SKID_DEPTH $nvrec_rd_skid_depth] [get_bd_cells nvrec_core_0]
 
 connect_bd_intf_net [get_bd_intf_pins user_data_source/M_AXIS] [get_bd_intf_pins nvrec_core_0/s_axis]
 foreach p {tpg_enable tpg_seq_rst tpg_rate_inc tpg_seq_next} {
@@ -1538,6 +1550,9 @@ connect_bd_intf_net [get_bd_intf_pins nvmeha_0/M_AXI_SSD] [get_bd_intf_pins nvre
 # (14000 x 1.125 = 15750). nvrec_dma_qos (MB/s) can be set before the BD script
 # runs to change the request (report_noc_qos shows what the NoC solution meets).
 if {![info exists nvrec_dma_qos]} {
+  # the same request with or without the split ring: a ring port carries the
+  # whole stream with a single ring, MEM1 or chunk-sized stripes (the 8000 MB/s
+  # of the first split-ring build cost the single ring margin on the bench)
   set nvrec_dma_qos [expr {min($nvrec_data_width * 250 / 8, 14000)}]
 }
 set noc_si [get_property CONFIG.NUM_SI [get_bd_cells axi_noc_0]]
@@ -1568,6 +1583,8 @@ if {!$nvrec_bridge_split} {
   set_property -dict [list CONFIG.CONNECTIONS {MC_1 {read_bw {7000} write_bw {7000} read_avg_burst {4} write_avg_burst {4} }}] [get_bd_intf_pins /axi_noc_0/S08_AXI]
 } else {
   # One NMU per QDMA bridge: qdma_0 keeps smc_m_axi_bridge -> S08 (MC_1),
+  # (with ring_mem lpddr4 each bridge NMU also gets an INI route to the
+  # LPDDR4, see the split-ring block below, and both requests are halved)
   # qdma_1 gets smc_m_axi_bridge_1 -> a new NoC slave port (MC_3), each 7000/7000
   # MB/s. Both SmartConnects' second master port reaches the Host Accelerator's
   # queue window through smc_q (2 SI, dp_clk), as smc_ssd_N / smc_q on ZynqMP.
@@ -1602,6 +1619,116 @@ if {!$nvrec_bridge_split} {
   connect_bd_net [get_bd_pins qdma_1/axi_aclk] [get_bd_pins smc_m_axi_bridge_1/aclk1]
   connect_bd_net [get_bd_pins versal_cips_0/pl1_ref_clk] [get_bd_pins smc_m_axi_bridge_1/aclk2]
   connect_bd_net [get_bd_pins reset_pl0/peripheral_aresetn] [get_bd_pins smc_m_axi_bridge_1/aresetn]
+}
+
+# ----------------------------------------------------------
+# Split ring (register map 1.3): memory 1 = on-board LPDDR4
+# ----------------------------------------------------------
+# ring_mem lpddr4 (config/data.json): a second NoC instance with ONE of the
+# VCK190's two LPDDR4 DDRMCs (LPDDR4_Controller0: board interfaces
+# ch0_lpddr4_c0 + ch1_lpddr4_c0, system clock lpddr4_sma_clk1), its two x32
+# channels interleaved inside the controller (MC_CHANNEL_INTERLEAVING, 256 B),
+# mapped at DDR_CH2 (0x600_0000_0000, 4 GB; the PS DDR4 uses DDR_LOW0 +
+# DDR_CH1).
+# Why one controller and not the BSP's two interleaved ones: the (first
+# generation) AXI NoC orders writes strictly (MC_ORDERING has the single choice
+# "Strict"). An NMU writing to two interleaved DDRMCs chops every burst into
+# interleave-size pieces (128 B) and sends the next piece only after the write
+# response of the previous one, so one NoC master wrote the LPDDR4 at only
+# 1.8-2.0 GB/s (bench 2026-10-23; reads, which the NMU reorders, ran at
+# 12.45 GB/s). Behind one DDRMC every ring/bridge NMU has a single LPDDR4
+# destination; the controller spreads the data over both channels itself, so
+# the peak stays 2 x 15.6 GB/s (2 x32 channels at 3906 MT/s, the same two
+# channels the 1 GB carve-out used before: channel 0 of each controller).
+# Not DDR_LOW1
+# (0x8_0000_0000): an NMU may not reach DDR_LOW regions of two axi_noc
+# instances (BD 41-3567), and the bridges' NMUs reach DDR_LOW0 (DDR4) too; the
+# DDR_CHn regions may sit on another instance (the BSP puts its LPDDR4 at
+# DDR_CH1). Three routes into it, none from the PS:
+#   ring port 1 : nvrec_core_0/m_axi1 -> axi_smc_dma1 -> noc_lpddr4/S00_AXI (its
+#                 own PL NMU, DWb @ dp_clk) -> MC_0, QoS nvrec_dma_qos
+#   SSD bridges : axi_noc_0 S08 (qdma_0) -> M00_INI -> S00_INI -> MC_1 and the
+#                 qdma_1 NMU -> M01_INI -> S01_INI -> MC_2, 4000 MB/s each; the
+#                 bridges keep their 7000 MB/s to the DDR4 (as the single-ring
+#                 build). A bridge NMU still has two destinations (DDR4, LPDDR4):
+#                 strict ordering costs one write round trip at each switch,
+#                 i.e. once per split-ring stripe.
+# QoS values are requests to the NoC compiler, not caps (report_noc_qos).
+set nvrec_noc_lp_ports {}
+if {$nvrec_ring_mem eq "lpddr4"} {
+  if {!$nvrec_bridge_split} {
+    error "nvrec: ring_mem lpddr4 needs one NoC NMU per QDMA bridge (nvrec_bridge_split 1, data_width 512)"
+  }
+  if {!$is_vck190} {
+    error "nvrec: ring_mem lpddr4 is only defined for the VCK190 (target $target)"
+  }
+  if {![info exists nvrec_bridge_lp_qos]} { set nvrec_bridge_lp_qos 4000 }
+  if {![info exists nvrec_bridge_ddr_qos]} { set nvrec_bridge_ddr_qos 7000 }
+  if {![info exists nvrec_lp_ch_intlv]} { set nvrec_lp_ch_intlv 256_Bytes }
+  create_bd_cell -type ip -vlnv xilinx.com:ip:axi_noc noc_lpddr4
+  set_property -dict [list \
+    CONFIG.NUM_SI {1} \
+    CONFIG.NUM_MI {0} \
+    CONFIG.NUM_NSI {2} \
+    CONFIG.NUM_CLKS {1} \
+    CONFIG.NUM_MC {1} \
+    CONFIG.NUM_MCP {4} \
+    CONFIG.CONTROLLERTYPE {LPDDR4_SDRAM} \
+    CONFIG.MC_CHAN_REGION0 {DDR_CH2} \
+    CONFIG.MC_CHAN_REGION1 {NONE} \
+    CONFIG.CH0_LPDDR4_0_BOARD_INTERFACE {ch0_lpddr4_c0} \
+    CONFIG.CH1_LPDDR4_0_BOARD_INTERFACE {ch1_lpddr4_c0} \
+    CONFIG.sys_clk0_BOARD_INTERFACE {lpddr4_sma_clk1} \
+  ] [get_bd_cells noc_lpddr4]
+  # (after the board interfaces: their presets would reset it)
+  set_property -dict [list CONFIG.MC_CHANNEL_INTERLEAVING {true} \
+    CONFIG.MC_CH_INTERLEAVING_SIZE $nvrec_lp_ch_intlv] [get_bd_cells noc_lpddr4]
+  foreach intf {ch0_lpddr4_c0 ch1_lpddr4_c0} pin {CH0_LPDDR4_0 CH1_LPDDR4_0} {
+    create_bd_intf_port -mode Master -vlnv xilinx.com:interface:lpddr4_rtl:1.0 $intf
+    connect_bd_intf_net [get_bd_intf_ports $intf] [get_bd_intf_pins noc_lpddr4/$pin]
+  }
+  foreach clk {lpddr4_sma_clk1} pin {sys_clk0} {
+    create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:diff_clock_rtl:1.0 $clk
+    set_property CONFIG.FREQ_HZ 200000000 [get_bd_intf_ports $clk]
+    connect_bd_intf_net [get_bd_intf_ports $clk] [get_bd_intf_pins noc_lpddr4/$pin]
+  }
+
+  # ring port 1 -> its own NMU on noc_lpddr4
+  set_property -dict [list CONFIG.DATA_WIDTH $nvrec_data_width \
+    CONFIG.CONNECTIONS [format {MC_0 {read_bw {%d} write_bw {%d} read_avg_burst {64} write_avg_burst {64}}} $nvrec_dma_qos $nvrec_dma_qos]] \
+    [get_bd_intf_pins /noc_lpddr4/S00_AXI]
+  create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect axi_smc_dma1
+  set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] [get_bd_cells axi_smc_dma1]
+  connect_bd_intf_net [get_bd_intf_pins nvrec_core_0/m_axi1] [get_bd_intf_pins axi_smc_dma1/S00_AXI]
+  connect_bd_intf_net [get_bd_intf_pins axi_smc_dma1/M00_AXI] [get_bd_intf_pins noc_lpddr4/S00_AXI]
+  connect_bd_net [get_bd_pins versal_cips_0/pl1_ref_clk] \
+    [get_bd_pins noc_lpddr4/aclk0] \
+    [get_bd_pins axi_smc_dma1/aclk]
+  connect_bd_net [get_bd_pins rst_dp_clk/interconnect_aresetn] [get_bd_pins axi_smc_dma1/aresetn]
+  puts "INFO: nvrec ring port 1 nvrec_core_0/m_axi1 -> axi_smc_dma1 -> noc_lpddr4/S00_AXI ($nvrec_data_width bits, QoS $nvrec_dma_qos MB/s) -> MC_0 (LPDDR4)"
+
+  # SSD bridges -> INI -> LPDDR4
+  set_property CONFIG.NUM_NMI {2} [get_bd_cells axi_noc_0]
+  foreach ini {M00_INI M01_INI} {
+    set_property CONFIG.INI_STRATEGY {auto} [get_bd_intf_pins /axi_noc_0/$ini]
+  }
+  foreach ini {S00_INI S01_INI} mc {MC_1 MC_2} {
+    set_property -dict [list CONFIG.INI_STRATEGY {auto} \
+      CONFIG.CONNECTIONS [format {%s {read_bw {%d} write_bw {%d} read_avg_burst {4} write_avg_burst {4}}} $mc $nvrec_bridge_lp_qos $nvrec_bridge_lp_qos]] \
+      [get_bd_intf_pins /noc_lpddr4/$ini]
+  }
+  connect_bd_intf_net [get_bd_intf_pins axi_noc_0/M00_INI] [get_bd_intf_pins noc_lpddr4/S00_INI]
+  connect_bd_intf_net [get_bd_intf_pins axi_noc_0/M01_INI] [get_bd_intf_pins noc_lpddr4/S01_INI]
+  set_property -dict [list CONFIG.CONNECTIONS [format {MC_1 {read_bw {%d} write_bw {%d} read_avg_burst {4} write_avg_burst {4}} M00_INI {read_bw {%d} write_bw {%d}}} \
+    $nvrec_bridge_ddr_qos $nvrec_bridge_ddr_qos $nvrec_bridge_lp_qos $nvrec_bridge_lp_qos]] [get_bd_intf_pins /axi_noc_0/S08_AXI]
+  set_property -dict [list CONFIG.CONNECTIONS [format {MC_3 {read_bw {%d} write_bw {%d} read_avg_burst {4} write_avg_burst {4}} M01_INI {read_bw {%d} write_bw {%d}}} \
+    $nvrec_bridge_ddr_qos $nvrec_bridge_ddr_qos $nvrec_bridge_lp_qos $nvrec_bridge_lp_qos]] [get_bd_intf_pins /axi_noc_0/$noc_port1]
+  puts "INFO: nvrec qdma_0 bridge axi_noc_0/S08_AXI -> MC_1 ($nvrec_bridge_ddr_qos MB/s) + M00_INI -> noc_lpddr4 MC_1, qdma_1 bridge axi_noc_0/$noc_port1 -> MC_3 ($nvrec_bridge_ddr_qos MB/s) + M01_INI -> noc_lpddr4 MC_2 ($nvrec_bridge_lp_qos MB/s each)"
+  set nvrec_noc_lp_ports {S00_AXI S00_INI S01_INI}
+
+  # memory 1 needs no calibration status from the PL (the PLM calibrates the
+  # DDRMCs before the PL runs; a failed calibration stops the boot)
+  connect_bd_net [get_bd_pins const_high/dout] [get_bd_pins nvrec_core_0/mem1_ready]
 }
 
 # Doorbells: nvmeha M_AXI_SSD -> nvrec_core_0 (dbmon) -> smc_m_axi_fpd (second
@@ -1729,8 +1856,32 @@ nvrec_map nvrec_core_0/m_axi_db qdma_0/S_AXI_BRIDGE/BAR0 0xA8000000 64M
 # SSD view (QDMA M_AXI_BRIDGE, no inbound translation): queue window
 nvrec_map qdma_0/M_AXI_BRIDGE nvmeha_0/S_AXI_SSD/Reg 0x90000000 64K
 nvrec_map qdma_1/M_AXI_BRIDGE nvmeha_0/S_AXI_SSD/Reg 0x90000000 64K
+# Split ring memory 1 (LPDDR4, DDR_CH2): ring port 1 and both bridges see it at
+# 0x600_0000_0000 (4 GB), the same address (fabric view = SSD view); the PS has
+# no route to it. Every LPDDR4 segment is checked to sit at 0x600_0000_0000.
+if {$nvrec_ring_mem eq "lpddr4"} {
+  foreach sp {nvrec_core_0/m_axi1 qdma_0/M_AXI_BRIDGE qdma_1/M_AXI_BRIDGE} {
+    set n_lp 0
+    foreach seg [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces $sp]] {
+      set slv [get_bd_addr_segs -of_objects $seg]
+      if {[string match "/noc_lpddr4/*" $slv] || [string match "noc_lpddr4/*" $slv]} {
+        if {[string is true -strict [get_property EXCLUDED $seg]]} { include_bd_addr_seg $seg }
+        if {[expr {[get_property OFFSET $seg]}] != 0x60000000000} {
+          error "nvrec: LPDDR4 segment [get_property NAME $seg] of $sp at [get_property OFFSET $seg], expected 0x600_0000_0000"
+        }
+        incr n_lp
+      }
+    }
+    if {$n_lp == 0} { error "nvrec: $sp has no LPDDR4 segment (no NoC route to noc_lpddr4)" }
+  }
+  foreach seg [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces versal_cips_0/*]] {
+    if {[string match "*noc_lpddr4*" [get_property NAME $seg]]} {
+      error "nvrec: the PS address space maps the LPDDR4 ([get_property NAME $seg]): it must not"
+    }
+  }
+}
 
-foreach sp {versal_cips_0/M_AXI_FPD nvmeha_guard/m_axi nvmeha_0/Data nvrec_core_0/m_axi_db nvrec_core_0/m_axi qdma_0/M_AXI_BRIDGE qdma_1/M_AXI_BRIDGE} {
+foreach sp {versal_cips_0/M_AXI_FPD nvmeha_guard/m_axi nvmeha_0/Data nvrec_core_0/m_axi_db nvrec_core_0/m_axi nvrec_core_0/m_axi1 qdma_0/M_AXI_BRIDGE qdma_1/M_AXI_BRIDGE} {
   if {[llength [get_bd_addr_spaces -quiet $sp]] == 0} { continue }
   foreach seg [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces $sp]] {
     puts "INFO: addr $sp [get_property NAME $seg] offset [get_property OFFSET $seg] range [get_property RANGE $seg] excluded [get_property EXCLUDED $seg]"
@@ -1768,7 +1919,16 @@ foreach p $nvrec_noc_ports {
   set ipin [get_bd_intf_pins axi_noc_0/$p]
   puts "INFO: nvrec axi_noc_0/$p DATA_WIDTH [get_property CONFIG.DATA_WIDTH $ipin] FREQ_HZ [get_property CONFIG.FREQ_HZ $ipin] CONNECTIONS [get_property CONFIG.CONNECTIONS $ipin]"
 }
-foreach ip {nvrec_core_0/m_axi axi_smc_dma/M00_AXI} {
+foreach p $nvrec_noc_lp_ports {
+  set ipin [get_bd_intf_pins noc_lpddr4/$p]
+  puts "INFO: nvrec noc_lpddr4/$p DATA_WIDTH [get_property CONFIG.DATA_WIDTH $ipin] FREQ_HZ [get_property CONFIG.FREQ_HZ $ipin] CONNECTIONS [get_property CONFIG.CONNECTIONS $ipin]"
+}
+if {$nvrec_ring_mem eq "lpddr4"} {
+  foreach k {CONTROLLERTYPE NUM_MC NUM_MCP MC_CHAN_REGION0 MC_INTERLEAVE_SIZE MC_CHANNEL_INTERLEAVING MC_CH_INTERLEAVING_SIZE MC_ADDR_BIT32 MC_ORDERING MC_ECC MC_MEMORY_SPEEDGRADE MC_MEMORY_TIMEPERIOD0 MC_INPUTCLK0_PERIOD MC_NO_CHANNELS MC_MEMORY_DENSITY} {
+    puts "INFO: nvrec noc_lpddr4 $k = [get_property -quiet CONFIG.$k [get_bd_cells noc_lpddr4]]"
+  }
+}
+foreach ip [concat {nvrec_core_0/m_axi axi_smc_dma/M00_AXI} [expr {$nvrec_ring_mem eq "lpddr4" ? {nvrec_core_0/m_axi1 axi_smc_dma1/M00_AXI} : {}}]] {
   set ipin [get_bd_intf_pins $ip]
   puts "INFO: nvrec $ip DATA_WIDTH [get_property CONFIG.DATA_WIDTH $ipin] FREQ_HZ [get_property CONFIG.FREQ_HZ $ipin]"
 }

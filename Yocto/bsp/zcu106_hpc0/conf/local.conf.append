@@ -38,9 +38,12 @@
 # meta-user/recipes-bsp/u-boot/u-boot-edf-scr_%.bbappend.
 # Design args follow PetaLinux/bsp/zcu106 CONFIG_SUBSYSTEM_USER_CMDLINE.
 # No "rw": root is mounted ro and systemd-remount-fs remounts it rw (fstab "/" defaults).
-# NVREC_CMA: CMA pool. The nvrec driver allocates the recording ring there
-# (one physically contiguous region; default 256 x 1 MB = 256 MB, up to 1 GB)
-# next to the PCIe/NVMe DMA needs of the kernel.
+# NVREC_CMA: CMA pool. The nvrec driver allocates the PS DDR part of the
+# recording ring there (one physically contiguous region: a single ring,
+# 512 MB by default, or the PS DDR half of the default 1 GB split ring, plus
+# 4 KB of PRP list per slot; at most 1 GB) next to the PCIe/NVMe DMA needs of
+# the kernel. The split ring's other half is the 1 GB no-map region of the
+# PL DDR4 in the device tree (nvrec-ring1), not CMA.
 # NVREC_HUGEPAGES: 2 MB hugepages reserved at boot, only for apps that bring
 # their own ring (accepted when physically contiguous); 0 by default.
 NVREC_CMA ?= "1536M"

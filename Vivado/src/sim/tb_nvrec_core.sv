@@ -6,12 +6,14 @@
 // command builder (nvrec_cmd), completion router (nvrec_cq), ring reader
 // (nvrec_rd), command injector (nvrec_inj), registers.
 //
-// Runs for DATA_WIDTH 128, 256 and 512 (sim.tcl, see the sim_runs line below).
-// The DDR model keeps 16-byte words (any beat width), the FIFOs are 64 KB deep
-// at every width and the TPG / checker rates are scaled so that the byte
-// rates are the same in every run.
+// Runs for DATA_WIDTH 128, 256 and 512 with two ring ports (N_RING_PORTS 2,
+// register map 1.3) and once at 256 bits with N_RING_PORTS 1 (the 1.2
+// single-ring engine; sim.tcl, see the sim_runs line below). The memory
+// model keeps 16-byte words (any beat width), the FIFOs are 64 KB deep at
+// every width and the TPG / checker rates are scaled so that the byte rates
+// are the same in every run.
 //
-//   fdrec_tpg (src_clk 200 MHz) -> nvrec_core -> AXI4 DDR model (dp_clk 250 MHz)
+//   fdrec_tpg (src_clk 200 MHz) -> nvrec_core -> two AXI4 memory ports (dp_clk 250 MHz)
 //   nvrec_core m_axis_sqe -> NVMe Host Accelerator + SSD behavioural model
 //                            -> s_axis_cqe (completions, random delay, OUT OF ORDER)
 //   nvrec_core m_axis_snk -> fdrec_check (playback)
@@ -23,6 +25,14 @@
 // writer overwrote before its in-order release would be caught) and keeps
 // it as the "disk"; Read commands scatter the disk data into DDR. The DDR
 // model also flags any write into a slot whose command has not completed.
+//
+// Memory model: one sparse memory (the bus address space), two AXI4 slave
+// ports with DIFFERENT latencies (port 0: R 8 / B 4 cycles, port 1: R 64 / B
+// 32 cycles), random ready/valid stalls and random pauses of 50-300 cycles,
+// so the two ports answer out of order relative to each other. Every burst
+// is checked against the reference ring address function (port = memory of
+// the address, inside that memory's part of the ring, never across 4 KB);
+// the SSD model checks PRP1 / PRP2 / PRP lists against the same function.
 //
 // Tests:
 //   0. register identification / reset values
@@ -42,23 +52,50 @@
 //      no SSD command (slots released as filled, BYTES = TPG words x 16),
 //      then a DRY record of exactly NUM_CHUNKS chunks played back from the
 //      ring (ring-resident) into fdrec_check: no Read command, no error/gap
+//   Split ring (1.3, N_RING_PORTS = 2), 128 KB chunks, 7-slot ring (odd: at
+//   S = chunk memory 0 holds one slot more), for RING_STRIPE_SHIFT 12, 16 and
+//   17 (= chunk):
+//   9. split record, 2-member stripe, START_CHUNK 5 (odd), OOO completions,
+//      STOP with a 2-page partial last chunk (PRP2 = ADDR(slot, 4096));
+//      per-port WR_PORT_STALL counters
+//  10. split playback of that recording (LAST_CHUNK_BYTES = 2 pages) into
+//      fdrec_check; RD_PORT_WAIT counters
+//  11. split DRY record of NUM_CHUNKS chunks + ring-resident playback, ring
+//      memory compared word by word with the reference address function
+//  12. CONFIG.MEM1: single ring at RING_BASE1, all bursts on port 1
+//  13. (N_RING_PORTS = 1) RING_PORTS = 1, SPLIT / MEM1 ignored: single ring at
+//      RING_BASE on port 0, STATE.MEM1_READY = 0
 //
 // Prints PASS / FAIL and calls $finish (sim.tcl contract).
 //
-// sim_runs: DATA_WIDTH=128 DATA_WIDTH=256 DATA_WIDTH=512
+//  14. (N_RING_PORTS = 2) chunk-sized stripes with NoC-like ports (read
+//      latency 200 / 250 dp_clk cycles = 0.8 / 1.0 us, a read-response buffer
+//      of 4 bursts per port, 95 % ready / R valid): DRY record at the source
+//      maximum (one beat per src_clk) and ring-resident playback
+//      into a full-rate checker; the reader's waits and the writer's stalls are
+//      booked to chunk boundaries vs the rest, and the sink must never starve
+//      (with the reader's skid FIFOs; RD_SKID_DEPTH=0 reproduces the 1.3
+//      first-build reader for A/B runs, reported but not checked)
+//
+// sim_runs: DATA_WIDTH=128 DATA_WIDTH=256 DATA_WIDTH=512 DATA_WIDTH=256,N_RING_PORTS=1
 
 `timescale 1ns / 1ps
 
 module tb_nvrec_core #(
-  parameter integer DATA_WIDTH = 256
+  parameter integer DATA_WIDTH = 256,
+  parameter integer N_RING_PORTS = 2,
+  parameter integer RD_SKID_DEPTH = 512,  // ring reader skid FIFO per port (0 = none, for A/B runs)
+  parameter integer RD_RQ_DEPTH = 0,      // ring reader bursts in flight (0 = RTL default)
+  parameter integer EGR_KB = 64           // egress FIFO size (the reference designs: 128 / 256)
 );
 
   localparam integer BB         = DATA_WIDTH / 8;      // bytes per beat
   localparam integer WPB        = DATA_WIDTH / 128;    // pattern words per beat
   localparam integer BEAT_SHIFT = (DATA_WIDTH == 512) ? 6 : (DATA_WIDTH == 256) ? 5 : 4;
   localparam integer FDEPTH     = 65536 / BB;          // ingest FIFO, 64 KB
-  localparam integer EDEPTH     = 65536 / BB;          // egress FIFO, 64 KB
-  localparam integer SLOT_W     = 11;
+  localparam integer EDEPTH     = EGR_KB * 1024 / BB;  // egress FIFO, 64 KB by default
+  localparam integer SLOT_W     = 12;
+  localparam integer TWO        = (N_RING_PORTS == 2);
 
   // TPG / checker rate for the same byte rate at every width (r = 128-bit value)
   function automatic [31:0] rate(input [31:0] r);
@@ -109,13 +146,25 @@ module tb_nvrec_core #(
   wire [1:0]  l_bresp, l_rresp;
   wire [31:0] l_rdata;
 
-  // AXI4 DDR
-  wire [63:0] awaddr, araddr; wire [7:0] awlen, arlen; wire [2:0] awsize, arsize, awprot, arprot;
-  wire [1:0] awburst, arburst; wire [3:0] awcache, arcache;
-  wire awvalid, wvalid, wlast, bready, arvalid, rready;
-  reg  awready = 0, wready = 0, bvalid = 0, arready = 0, rvalid = 0, rlast = 0;
-  wire [DATA_WIDTH-1:0] wdata; wire [BB-1:0] wstrb;
-  reg  [DATA_WIDTH-1:0] rdata = 0; reg [1:0] bresp = 0, rresp = 0;
+  // AXI4 ring ports p = 0 (m_axi) and 1 (m_axi1), as arrays for the model
+  wire [63:0] awaddr [0:1], araddr [0:1];
+  wire [7:0]  awlen [0:1], arlen [0:1];
+  wire [2:0]  awsize [0:1], arsize [0:1], awprot [0:1], arprot [0:1];
+  wire [1:0]  awburst [0:1], arburst [0:1];
+  wire [3:0]  awcache [0:1], arcache [0:1];
+  wire        awvalid [0:1], wvalid [0:1], wlast [0:1], bready [0:1], arvalid [0:1], rready [0:1];
+  reg         awready [0:1], wready [0:1], bvalid [0:1], arready [0:1], rvalid [0:1], rlast [0:1];
+  wire [DATA_WIDTH-1:0] wdata [0:1];
+  wire [BB-1:0] wstrb [0:1];
+  reg  [DATA_WIDTH-1:0] rdata [0:1];
+  reg  [1:0]  bresp [0:1], rresp [0:1];
+  reg         mem1_ready_in = 1'b1;
+  initial begin
+    for (int p = 0; p < 2; p++) begin
+      awready[p] = 0; wready[p] = 0; bvalid[p] = 0; arready[p] = 0; rvalid[p] = 0; rlast[p] = 0;
+      rdata[p] = 0; bresp[p] = 0; rresp[p] = 0;
+    end
+  end
 
   // SQ / CQ streams
   wire [511:0] sqe_tdata; wire [63:0] sqe_tkeep; wire [15:0] sqe_tuser; wire sqe_tvalid;
@@ -126,7 +175,8 @@ module tb_nvrec_core #(
   reg          ha_dead_in = 1'b0;
 
   nvrec_core #(.DATA_WIDTH(DATA_WIDTH), .SRC_CLK_HZ(200000000), .DP_CLK_HZ(250000000),
-               .FIFO_DEPTH(FDEPTH), .EGR_FIFO_DEPTH(EDEPTH), .SLOT_W(SLOT_W)) dut (
+               .FIFO_DEPTH(FDEPTH), .EGR_FIFO_DEPTH(EDEPTH), .SLOT_W(SLOT_W),
+               .N_RING_PORTS(N_RING_PORTS), .RD_SKID_DEPTH(RD_SKID_DEPTH), .RD_RQ_DEPTH(RD_RQ_DEPTH)) dut (
     .src_clk(src_clk), .src_resetn(src_resetn), .dp_clk(dp_clk), .dp_resetn(dp_resetn),
     .s_axis_tdata(src_tdata), .s_axis_tvalid(src_tvalid), .s_axis_tready(src_tready),
     .m_axis_snk_tdata(snk_tdata), .m_axis_snk_tlast(snk_tlast), .m_axis_snk_tvalid(snk_tvalid),
@@ -136,14 +186,23 @@ module tb_nvrec_core #(
     .s_axi_bresp(l_bresp), .s_axi_bvalid(l_bvalid), .s_axi_bready(l_bready),
     .s_axi_araddr(l_araddr), .s_axi_arprot(3'd0), .s_axi_arvalid(l_arvalid), .s_axi_arready(l_arready),
     .s_axi_rdata(l_rdata), .s_axi_rresp(l_rresp), .s_axi_rvalid(l_rvalid), .s_axi_rready(l_rready),
-    .m_axi_awaddr(awaddr), .m_axi_awlen(awlen), .m_axi_awsize(awsize), .m_axi_awburst(awburst),
-    .m_axi_awcache(awcache), .m_axi_awprot(awprot), .m_axi_awvalid(awvalid), .m_axi_awready(awready),
-    .m_axi_wdata(wdata), .m_axi_wstrb(wstrb), .m_axi_wlast(wlast), .m_axi_wvalid(wvalid),
-    .m_axi_wready(wready), .m_axi_bresp(bresp), .m_axi_bvalid(bvalid), .m_axi_bready(bready),
-    .m_axi_araddr(araddr), .m_axi_arlen(arlen), .m_axi_arsize(arsize), .m_axi_arburst(arburst),
-    .m_axi_arcache(arcache), .m_axi_arprot(arprot), .m_axi_arvalid(arvalid), .m_axi_arready(arready),
-    .m_axi_rdata(rdata), .m_axi_rresp(rresp), .m_axi_rlast(rlast), .m_axi_rvalid(rvalid),
-    .m_axi_rready(rready),
+    .m_axi_awaddr(awaddr[0]), .m_axi_awlen(awlen[0]), .m_axi_awsize(awsize[0]), .m_axi_awburst(awburst[0]),
+    .m_axi_awcache(awcache[0]), .m_axi_awprot(awprot[0]), .m_axi_awvalid(awvalid[0]), .m_axi_awready(awready[0]),
+    .m_axi_wdata(wdata[0]), .m_axi_wstrb(wstrb[0]), .m_axi_wlast(wlast[0]), .m_axi_wvalid(wvalid[0]),
+    .m_axi_wready(wready[0]), .m_axi_bresp(bresp[0]), .m_axi_bvalid(bvalid[0]), .m_axi_bready(bready[0]),
+    .m_axi_araddr(araddr[0]), .m_axi_arlen(arlen[0]), .m_axi_arsize(arsize[0]), .m_axi_arburst(arburst[0]),
+    .m_axi_arcache(arcache[0]), .m_axi_arprot(arprot[0]), .m_axi_arvalid(arvalid[0]), .m_axi_arready(arready[0]),
+    .m_axi_rdata(rdata[0]), .m_axi_rresp(rresp[0]), .m_axi_rlast(rlast[0]), .m_axi_rvalid(rvalid[0]),
+    .m_axi_rready(rready[0]),
+    .m_axi1_awaddr(awaddr[1]), .m_axi1_awlen(awlen[1]), .m_axi1_awsize(awsize[1]), .m_axi1_awburst(awburst[1]),
+    .m_axi1_awcache(awcache[1]), .m_axi1_awprot(awprot[1]), .m_axi1_awvalid(awvalid[1]), .m_axi1_awready(awready[1]),
+    .m_axi1_wdata(wdata[1]), .m_axi1_wstrb(wstrb[1]), .m_axi1_wlast(wlast[1]), .m_axi1_wvalid(wvalid[1]),
+    .m_axi1_wready(wready[1]), .m_axi1_bresp(bresp[1]), .m_axi1_bvalid(bvalid[1]), .m_axi1_bready(bready[1]),
+    .m_axi1_araddr(araddr[1]), .m_axi1_arlen(arlen[1]), .m_axi1_arsize(arsize[1]), .m_axi1_arburst(arburst[1]),
+    .m_axi1_arcache(arcache[1]), .m_axi1_arprot(arprot[1]), .m_axi1_arvalid(arvalid[1]), .m_axi1_arready(arready[1]),
+    .m_axi1_rdata(rdata[1]), .m_axi1_rresp(rresp[1]), .m_axi1_rlast(rlast[1]), .m_axi1_rvalid(rvalid[1]),
+    .m_axi1_rready(rready[1]),
+    .mem1_ready(mem1_ready_in),
     .m_axis_sqe_tdata(sqe_tdata), .m_axis_sqe_tkeep(sqe_tkeep), .m_axis_sqe_tuser(sqe_tuser),
     .m_axis_sqe_tvalid(sqe_tvalid), .m_axis_sqe_tready(sqe_tready),
     .s_axis_cqe_tdata(cqe_tdata), .s_axis_cqe_tkeep(16'hFFFF), .s_axis_cqe_tuser(cqe_tuser),
@@ -223,8 +282,12 @@ module tb_nvrec_core #(
   // Test configuration shared with the models
   // ---------------------------------------------------------------------------
   longint cfg_ring_base, cfg_prp_base, cfg_start_chunk;
+  longint cfg_ring_base1 = 64'h0000_0020_0001_3000;
   int     cfg_chunk_shift, cfg_lba_shift, cfg_num_chunks, cfg_prp_shift, cfg_two;
   int     cfg_play, cfg_fua, cfg_dry = 0;
+  int     cfg_split = 0, cfg_mem1 = 0, cfg_stripe = 12;   // 1.3
+  int     n_2page = 0;         // builder SQEs of exactly 2 pages seen by the SSD model
+  int     n_aw [2] = '{0, 0}, n_ar [2] = '{0, 0};          // bursts per ring port
   longint cfg_lba [2];
   int     cfg_nsid [2];
   int     cfg_ssd [2];
@@ -237,71 +300,177 @@ module tb_nvrec_core #(
   longint seq_base = 0;        // TPG sequence number of chunk 0's first beat
 
   // ---------------------------------------------------------------------------
-  // DDR model (AXI4 slave)
+  // Reference ring address function (include/nvrec_regs.h "Ring addresses")
+  // ---------------------------------------------------------------------------
+  function automatic bit split_eff();
+    return TWO && (cfg_split != 0);
+  endfunction
+  function automatic int mem1_eff();
+    return (TWO && (cfg_mem1 != 0) && (cfg_split == 0)) ? 1 : 0;
+  endfunction
+  function automatic int stripe_eff();      // as latched: 12 .. chunk_shift
+    return (cfg_stripe < 12) ? 12 : ((cfg_stripe > cfg_chunk_shift) ? cfg_chunk_shift : cfg_stripe);
+  endfunction
+  function automatic longint base_of(int r);
+    longint b;
+    b = r ? cfg_ring_base1 : cfg_ring_base;
+    return {b[63:12], 12'd0};
+  endfunction
+  function automatic longint ring_bytes();
+    return longint'(cfg_num_chunks) << cfg_chunk_shift;
+  endfunction
+  // bytes of the ring in memory r
+  function automatic longint half_bytes(int r);
+    longint st; int S;
+    S = stripe_eff();
+    st = ring_bytes() >> S;
+    return ((st + 1 - r) >> 1) << S;
+  endfunction
+  function automatic longint ring_addr(longint g);
+    longint i; int S;
+    if (split_eff()) begin
+      S = stripe_eff();
+      i = g >> S;
+      return base_of(int'(i & 1)) + ((i >> 1) << S) + (g & ((longint'(1) << S) - 1));
+    end
+    return base_of(mem1_eff()) + g;
+  endfunction
+  // ring byte offset of bus address a on port p; -1 if a burst of nb bytes
+  // there is not inside port p's part of the ring
+  function automatic longint ring_g(int p, longint a, longint nb);
+    longint off; int S;
+    if (a < base_of(p)) return -1;
+    off = a - base_of(p);
+    if (split_eff()) begin
+      S = stripe_eff();
+      if (off + nb > half_bytes(p)) return -1;
+      return ((((off >> S) << 1) | p) << S) | (off & ((longint'(1) << S) - 1));
+    end
+    if (p != mem1_eff()) return -1;
+    if (off + nb > ring_bytes()) return -1;
+    return off;
+  endfunction
+
+  // ---------------------------------------------------------------------------
+  // Memory model: two AXI4 slave ports on one sparse memory
   // ---------------------------------------------------------------------------
   reg [127:0] mem [longint];    // 16-byte words, keyed by byte address
   bit slot_busy [1 << SLOT_W];   // write command in flight on this slot
+  longint cyc = 0;
+  always @(posedge dp_clk) cyc <= cyc + 1;
 
-  typedef struct { longint addr; int len; } burst_t;
-  burst_t awq [$], arq [$];
-  reg [DATA_WIDTH:0] wbq [$];
-  longint wa; int wb, wl; bit wact = 0; int bpend = 0;
-  longint ra; int rb, rl; bit ract = 0;
+  typedef struct { longint addr; int len; longint t; } burst_t;
 
-  function automatic int slot_of(longint a);
-    return int'((a - cfg_ring_base) >> cfg_chunk_shift);
-  endfunction
+  // Memory model mode: 0 = stress model of tests 0-13 (fixed latencies 8 / 64
+  // and 4 / 32 cycles, ready 1/2 .. 5/6, pauses of 50-300 cycles); 1 = NoC-like
+  // model of test 14, shaped like a NoC master port: up to 32 read bursts
+  // accepted (tracker), but a burst is only fetched from memory (read latency
+  // mm_lat_r from then on) while fewer than mm_rrob bursts are fetched and not
+  // yet returned (a read-response buffer that frees only when the data leaves
+  // on R), so a port whose R channel is held fetches at most mm_rrob bursts
+  // ahead; B after mm_lat_b; ready / R-valid probabilities mm_rdy_pct /
+  // mm_rv_pct %; no pauses.
+  int mm_mode = 0;
+  int mm_lat_r [2] = '{200, 250};
+  int mm_lat_b [2] = '{100, 120};
+  int mm_rdy_pct = 95, mm_rv_pct = 95, mm_rrob = 4;
 
-  always @(posedge dp_clk) begin
-    awready <= ($urandom_range(3) != 0);
-    wready  <= ($urandom_range(5) != 0);
-    arready <= ($urandom_range(2) != 0);
-    if (awvalid && awready) begin
-      burst_t b; b.addr = awaddr; b.len = awlen + 1;
-      if (awburst != 2'b01 || awsize != BEAT_SHIFT) fail("AW not INCR / BEAT_BYTES");
-      if ((awaddr[11:0] + b.len * BB) > 4096) fail("AW crosses 4 KB");
-      if (slot_busy[slot_of(awaddr)])
-        fail($sformatf("ring writer overwrote slot %0d before its command completed", slot_of(awaddr)));
-      awq.push_back(b);
+  genvar gp;
+  generate for (gp = 0; gp < 2; gp++) begin : g_mem
+    int LAT_R, LAT_B;                           // cycles from AR to the first R beat / WLAST to B
+    burst_t awq [$], arq [$];
+    reg [DATA_WIDTH:0] wbq [$];
+    longint bq_t [$];
+    longint wa; int wb, wl; bit wact = 0;
+    longint ra; int rb, rl; bit ract = 0;
+    int pause = 0;
+    int nfetch = 0;                             // mm_mode: bursts at the head of arq already fetched
+
+    always @(posedge dp_clk) begin
+      LAT_R = mm_mode ? mm_lat_r[gp] : (gp ? 64 : 8);
+      LAT_B = mm_mode ? mm_lat_b[gp] : (gp ? 32 : 4);
+      if (mm_mode) begin
+        pause = 0;
+        awready[gp] <= ($urandom_range(99) < mm_rdy_pct);
+        wready[gp]  <= ($urandom_range(99) < mm_rdy_pct);
+        arready[gp] <= ($urandom_range(99) < mm_rdy_pct) &&
+                       (arq.size() < 32 - (arvalid[gp] && arready[gp] ? 1 : 0));
+      end else begin
+      if (pause > 0) pause--;
+      else if ($urandom_range(gp ? 400 : 1500) == 0) pause = $urandom_range(300, 50);
+      awready[gp] <= (pause == 0) && ($urandom_range(3) >= gp + 1);   // 3/4, 1/2
+      wready[gp]  <= (pause == 0) && ($urandom_range(5) >= gp + 1);   // 5/6, 2/3
+      arready[gp] <= (pause == 0) && ($urandom_range(2) != 0);
+      end
+      if (awvalid[gp] && awready[gp]) begin
+        burst_t b; longint g;
+        b.addr = awaddr[gp]; b.len = awlen[gp] + 1; b.t = 0;
+        if (awburst[gp] != 2'b01 || awsize[gp] != BEAT_SHIFT) fail("AW not INCR / BEAT_BYTES");
+        if ((awaddr[gp][11:0] + b.len * BB) > 4096) fail("AW crosses 4 KB");
+        g = ring_g(gp, b.addr, b.len * BB);
+        if (g < 0)
+          fail($sformatf("AW port %0d addr %h len %0d outside the port's part of the ring", gp, b.addr, b.len));
+        else if (slot_busy[g >> cfg_chunk_shift])
+          fail($sformatf("ring writer overwrote slot %0d before its command completed", g >> cfg_chunk_shift));
+        awq.push_back(b);
+        n_aw[gp]++;
+      end
+      if (wvalid[gp] && wready[gp]) begin
+        if (wstrb[gp] != {BB{1'b1}}) fail("WSTRB");
+        wbq.push_back({wlast[gp], wdata[gp]});
+      end
+      while (wbq.size() > 0 && (wact || awq.size() > 0)) begin
+        if (!wact) begin wa = awq[0].addr; wl = awq[0].len; wb = 0; wact = 1; void'(awq.pop_front()); end
+        for (int w = 0; w < WPB; w++) mem[wa + wb * BB + w * 16] = wbq[0][128*w +: 128];
+        if (wbq[0][DATA_WIDTH] != (wb == wl - 1)) fail($sformatf("WLAST port %0d", gp));
+        wb++;
+        if (wbq[0][DATA_WIDTH]) begin wact = 0; bq_t.push_back(cyc + LAT_B); end
+        void'(wbq.pop_front());
+      end
+      if (bvalid[gp] && bready[gp]) bvalid[gp] <= 0;
+      else if (!bvalid[gp] && bq_t.size() > 0 && bq_t[0] <= cyc && pause == 0 && $urandom_range(2) == 0) begin
+        bvalid[gp] <= 1; void'(bq_t.pop_front());
+      end
+      // reads
+      if (arvalid[gp] && arready[gp]) begin
+        burst_t b;
+        b.addr = araddr[gp]; b.len = arlen[gp] + 1; b.t = mm_mode ? -1 : cyc + LAT_R;
+        if (arburst[gp] != 2'b01 || arsize[gp] != BEAT_SHIFT) fail("AR not INCR / BEAT_BYTES");
+        if ((araddr[gp][11:0] + b.len * BB) > 4096) fail("AR crosses 4 KB");
+        if (ring_g(gp, b.addr, b.len * BB) < 0)
+          fail($sformatf("AR port %0d addr %h len %0d outside the port's part of the ring", gp, b.addr, b.len));
+        arq.push_back(b);
+        n_ar[gp]++;
+      end
+      if (mm_mode) begin
+        // fetch while the read-response buffer has room
+        while (nfetch < arq.size() && (nfetch + (ract ? 1 : 0)) < mm_rrob) begin
+          arq[nfetch].t = cyc + LAT_R;
+          nfetch++;
+        end
+      end else begin
+        nfetch = 0;
+      end
+      if (rvalid[gp] && rready[gp]) begin
+        rb++;
+        if (rb == rl) ract = 0;
+      end
+      if (!ract && arq.size() > 0 && arq[0].t >= 0 && arq[0].t <= cyc) begin
+        ra = arq[0].addr; rl = arq[0].len; rb = 0; ract = 1; void'(arq.pop_front());
+        if (nfetch > 0) nfetch--;
+      end
+      if (ract && (!rvalid[gp] || rready[gp]) && pause == 0 &&
+          (mm_mode ? ($urandom_range(99) < mm_rv_pct) : ($urandom_range(3) >= gp + 1))) begin
+        rvalid[gp] <= 1;
+        for (int w = 0; w < WPB; w++)
+          rdata[gp][128*w +: 128] <= mem.exists(ra + rb * BB + w * 16) ? mem[ra + rb * BB + w * 16] : 128'hDEAD;
+        rlast[gp]  <= (rb == rl - 1);
+        rresp[gp]  <= 0;
+      end else if (rvalid[gp] && rready[gp]) begin
+        rvalid[gp] <= 0;
+      end
     end
-    if (wvalid && wready) begin
-      if (wstrb != {BB{1'b1}}) fail("WSTRB");
-      wbq.push_back({wlast, wdata});
-    end
-    while (wbq.size() > 0 && (wact || awq.size() > 0)) begin
-      if (!wact) begin wa = awq[0].addr; wl = awq[0].len; wb = 0; wact = 1; void'(awq.pop_front()); end
-      for (int w = 0; w < WPB; w++) mem[wa + wb * BB + w * 16] = wbq[0][128*w +: 128];
-      if (wbq[0][DATA_WIDTH] != (wb == wl - 1)) fail("WLAST");
-      wb++;
-      if (wbq[0][DATA_WIDTH]) begin wact = 0; bpend++; end
-      void'(wbq.pop_front());
-    end
-    if (bvalid && bready) bvalid <= 0;
-    else if (!bvalid && bpend > 0 && $urandom_range(2) == 0) begin bvalid <= 1; bpend--; end
-    // reads
-    if (arvalid && arready) begin
-      burst_t b; b.addr = araddr; b.len = arlen + 1;
-      if (arburst != 2'b01 || arsize != BEAT_SHIFT) fail("AR not INCR / BEAT_BYTES");
-      if ((araddr[11:0] + b.len * BB) > 4096) fail("AR crosses 4 KB");
-      arq.push_back(b);
-    end
-    if (rvalid && rready) begin
-      rb++;
-      if (rb == rl) ract = 0;
-    end
-    if (!ract && arq.size() > 0) begin
-      ra = arq[0].addr; rl = arq[0].len; rb = 0; ract = 1; void'(arq.pop_front());
-    end
-    if (ract && (!rvalid || rready) && $urandom_range(3) != 0) begin
-      rvalid <= 1;
-      for (int w = 0; w < WPB; w++)
-        rdata[128*w +: 128] <= mem.exists(ra + rb * BB + w * 16) ? mem[ra + rb * BB + w * 16] : 128'hDEAD;
-      rlast  <= (rb == rl - 1);
-      rresp  <= 0;
-    end else if (rvalid && rready) begin
-      rvalid <= 0;
-    end
-  end
+  end endgenerate
 
   // ---------------------------------------------------------------------------
   // NVMe Host Accelerator + SSD model
@@ -347,11 +516,12 @@ module tb_nvrec_core #(
       row   = cfg_two ? (a / 2) : a;
       slot  = exp_c % cfg_num_chunks;
       exp_lba  = cfg_lba[m] + (row << (cfg_chunk_shift - cfg_lba_shift));
-      exp_prp1 = {cfg_ring_base[63:12], 12'd0} + (longint'(slot) << cfg_chunk_shift);
+      exp_prp1 = ring_addr(longint'(slot) << cfg_chunk_shift);
       len   = c.nbytes;
       pages = (len + 4095) / 4096;
       exp_prp2 = (pages > 2) ? ({cfg_prp_base[63:12], 12'd0} + (longint'(slot) << cfg_prp_shift)) :
-                 (pages == 2) ? exp_prp1 + 4096 : 0;
+                 (pages == 2) ? ring_addr((longint'(slot) << cfg_chunk_shift) + 4096) : 0;
+      if (pages == 2) n_2page++;
       if (c.opc != (cfg_play ? 2 : 1)) fail($sformatf("chunk %0d opcode %0d", exp_c, c.opc));
       if (c.cid != slot) fail($sformatf("chunk %0d CID %0d expected slot %0d", exp_c, c.cid, slot));
       if (c.nsid != cfg_nsid[m]) fail($sformatf("chunk %0d NSID %0d", exp_c, c.nsid));
@@ -488,7 +658,7 @@ module tb_nvrec_core #(
       for (s = 0; s < cfg_num_chunks; s++)
         for (p = 1; p < P; p++) begin
           la = {cfg_prp_base[63:12], 12'd0} + (longint'(s) << cfg_prp_shift) + (p - 1) * 8;
-          pa = {cfg_ring_base[63:12], 12'd0} + (longint'(s) << cfg_chunk_shift) + p * 4096;
+          pa = ring_addr((longint'(s) << cfg_chunk_shift) + p * 4096);
           w = mem.exists({la[63:4], 4'd0}) ? mem[{la[63:4], 4'd0}] : 128'd0;
           if (la[3]) w[127:64] = pa; else w[63:0] = pa;
           mem[{la[63:4], 4'd0}] = w;
@@ -499,8 +669,11 @@ module tb_nvrec_core #(
   task automatic configure(input int play);
     begin
       cfg_play = play;
-      wr32(12'h104, (play ? 1 : 0) | (cfg_fua ? 2 : 0) | (cfg_dry ? 4 : 0) | ((cfg_two ? 2 : 1) << 4));
+      wr32(12'h104, (play ? 1 : 0) | (cfg_fua ? 2 : 0) | (cfg_dry ? 4 : 0) | ((cfg_two ? 2 : 1) << 4) |
+                    (cfg_split ? 8 : 0) | (cfg_mem1 ? 32'h40 : 0));
       wr32(12'h120, cfg_ring_base[31:0]);   wr32(12'h124, cfg_ring_base[63:32]);
+      wr32(12'h158, cfg_ring_base1[31:0]);  wr32(12'h15C, cfg_ring_base1[63:32]);
+      wr32(12'h160, cfg_stripe);
       wr32(12'h128, cfg_num_chunks);
       wr32(12'h12C, 1 << cfg_chunk_shift);
       wr32(12'h130, cfg_prp_base[31:0]);    wr32(12'h134, cfg_prp_base[63:32]);
@@ -527,9 +700,331 @@ module tb_nvrec_core #(
     end
   endtask
 
+  // ---------------------------------------------------------------------------
+  // Split-ring tests (1.3)
+  // ---------------------------------------------------------------------------
+  // the 16-byte words of the ring, compared with the TPG sequence from seq 0
+  task automatic check_ring_mem(input longint nbytes, input string what);
+    longint g, a; reg [127:0] d; longint n;
+    begin
+      for (g = 0; g < nbytes; g += 16) begin
+        a = ring_addr(g);
+        n = g / 16;
+        d = mem.exists(a) ? mem[a] : 128'hX;
+        if (d !== {~n[63:0], n[63:0]}) begin
+          fail($sformatf("%s: ring byte %0d at %h holds %h, expected word %0d", what, g, a, d, n));
+          break;
+        end
+      end
+    end
+  endtask
+
+  // poll the TPG word counter until >= words, at most maxus us
+  task automatic wait_words(input longint words, input int maxus);
+    reg [63:0] w; int n;
+    begin
+      n = 0; rd64(12'h018, w);
+      while (w < words && n < maxus * 10) begin #100; rd64(12'h018, w); n++; end
+      if (w < words) fail($sformatf("TPG did not reach %0d words (%0d)", words, w));
+    end
+  endtask
+
+  task automatic split_tests(input int S);
+    reg [31:0] v, v2; reg [63:0] v64, words;
+    longint chunk, total, rem, last;
+    int nfull, n2_before, aw0, aw1;
+    begin
+      $display("Test 9 (S = %0d): split record, 2 members, START_CHUNK 5, 7-slot ring, STOP -> 2-page last chunk", S);
+      soft_reset();
+      wr32(12'h10C, 32'h7F);
+      cfg_split = 1; cfg_mem1 = 0; cfg_stripe = S; cfg_dry = 0;
+      cfg_two = 1; cfg_fua = 0; cfg_start_chunk = 5; cfg_num_chunks = 7;
+      cfg_chunk_shift = 17; cfg_lba_shift = 9; cfg_prp_shift = 12;
+      cfg_ring_base  = 64'h0000_0008_0040_0000;
+      cfg_ring_base1 = 64'h0000_0020_0001_3000;
+      cfg_prp_base   = 64'h0000_0000_5000_0000;
+      cfg_lba[0] = 64'h2_0000; cfg_lba[1] = 64'h4_0800; cfg_nsid[0] = 1; cfg_nsid[1] = 2;
+      cfg_ssd[0] = 0; cfg_ssd[1] = 1; cfg_sq[0] = 0; cfg_sq[1] = 0;
+      allow_pad = 1; seq_check = 1; exp_c = 0; seq_base = 0; dmin = 20; dmax = 2500; err_at_chunk = -1;
+      chunk = longint'(1) << cfg_chunk_shift;
+      n2_before = n_2page; aw0 = n_aw[0]; aw1 = n_aw[1];
+      configure(0);
+      rd32(12'h104, v); if (!v[3]) fail("T9 CONFIG.SPLIT readback");
+      wr32(12'h148, 0);                           // until STOP
+      wr32(12'h1C0, 4); wr32(12'h1E0, 4);
+      wr32(12'h014, rate(32'h4000_0000));         // 1.6 GB/s
+      wr32(12'h100, 1);
+      wr32(12'h010, 1);
+      // 10 full chunks + ~6.3 KB: slow down near the end, then stop the source
+      wait_words((10 * chunk + 6144 - 16384) / 16, 3000);
+      wr32(12'h014, rate(32'h0800_0000));         // 0.2 GB/s
+      wait_words((10 * chunk + 6144 + 256) / 16, 3000);
+      wr32(12'h010, 0);
+      #3000;
+      wr32(12'h100, 2);                           // STOP
+      wait_state(3, 6000);
+      rd64(12'h018, words);
+      total = words * 16;
+      nfull = total / chunk; rem = total % chunk;
+      $display("  T9: %0d bytes = %0d chunks + %0d bytes", total, nfull, rem);
+      if (nfull != 10 || rem <= 4096 || rem > 8192) fail($sformatf("T9 last chunk not 2 pages (%0d chunks + %0d)", nfull, rem));
+      rd64(12'h220, v64); if (v64 != total) fail($sformatf("T9 BYTES %0d != TPG %0d", v64, total));
+      rd64(12'h200, v64); if (v64 != nfull + 1) fail($sformatf("T9 CHUNKS_FILLED %0d", v64));
+      rd64(12'h210, v64); if (v64 != nfull + 1) fail($sformatf("T9 CMDS_DONE %0d", v64));
+      if (exp_c != nfull + 1) fail($sformatf("T9 model saw %0d builder SQEs", exp_c));
+      if (n_2page == n2_before) fail("T9 no 2-page SQE (PRP2 path not exercised)");
+      rd64(12'h028, v64); if (v64 != 0) fail($sformatf("T9 drops %0d", v64));
+      expect32(12'h218, 0, "T9 CMD_ERRORS");
+      expect32(12'h21C, 0, "T9 UNEXPECTED");
+      rd32(12'h260, v); rd32(12'h264, v2);
+      $display("  T9: WR_PORT_STALL0 %0d WR_PORT_STALL1 %0d, AW bursts port0 %0d port1 %0d",
+               v, v2, n_aw[0] - aw0, n_aw[1] - aw1);
+      if (v == 0 || v2 == 0) fail("T9 split: both WR_PORT_STALL counters must count");
+      if (n_aw[0] == aw0 || n_aw[1] == aw1) fail("T9 split: both ports must be written");
+      expect32(12'h1C4, 0, "T9 SSD0 INFLIGHT"); expect32(12'h1E4, 0, "T9 SSD1 INFLIGHT");
+      rem = (rem / 512) * 512;                    // whole LBAs of data (no padding)
+      last = rem;
+
+      $display("Test 10 (S = %0d): split playback of the test 9 recording (2-page last chunk)", S);
+      soft_reset();
+      allow_pad = 1; exp_c = 0; dmin = 50; dmax = 2000;
+      n2_before = n_2page;
+      configure(1);
+      wr32(12'h148, nfull + 1);
+      wr32(12'h14C, last);
+      wr32(12'h1C0, 6); wr32(12'h1E0, 6);
+      wr32(12'h064, rate(32'h8000_0000));         // sink at full rate
+      wr32(12'h060, 2);
+      #2000;
+      wr32(12'h100, 1);
+      #20000;
+      wr32(12'h060, 1);
+      wait_state(3, 8000);
+      #50000;
+      total = nfull * chunk + last;
+      rd64(12'h070, v64); if (v64 != total / BB) fail($sformatf("T10 CHK_BEATS %0d exp %0d", v64, total / BB));
+      rd64(12'h078, v64); if (v64 != 0) fail($sformatf("T10 CHK_ERRORS %0d", v64));
+      rd64(12'h080, v64); if (v64 != 0) fail($sformatf("T10 CHK_GAPS %0d", v64));
+      rd64(12'h098, v64); if (v64 != total / 16 - WPB) fail($sformatf("T10 CHK_LAST_SEQ %0d", v64));
+      rd64(12'h220, v64); if (v64 != total) fail($sformatf("T10 BYTES %0d", v64));
+      if (n_2page == n2_before) fail("T10 no 2-page Read SQE");
+      rd32(12'h268, v); rd32(12'h26C, v2);
+      $display("  T10: RD_PORT_WAIT0 %0d RD_PORT_WAIT1 %0d", v, v2);
+      if (v2 == 0) fail("T10 split: RD_PORT_WAIT1 (slow port) must count");
+      wr32(12'h060, 0);
+
+      $display("Test 11 (S = %0d): split DRY record of NUM_CHUNKS chunks + ring-resident playback", S);
+      soft_reset();
+      cfg_dry = 1; cfg_start_chunk = 0;
+      configure(0);
+      wr32(12'h148, cfg_num_chunks);
+      // 1.2 GB/s: the slow port model (port 1: WREADY 2/3, pauses ~30 % of the
+      // time) moves < 1.9 GB/s at 128 bits and the W channel is head-of-line
+      wr32(12'h014, rate(32'h3000_0000));
+      wr32(12'h100, 1);
+      wr32(12'h010, 1);
+      wait_state(3, 4000);
+      wr32(12'h010, 0);
+      rd64(12'h200, v64); if (v64 != cfg_num_chunks) fail($sformatf("T11 CHUNKS_FILLED %0d", v64));
+      rd64(12'h250, v64); if (v64 != 0) fail($sformatf("T11 RUN_DROP_COUNT %0d", v64));
+      check_ring_mem(ring_bytes(), $sformatf("T11 S=%0d", S));
+      configure(1);
+      wr32(12'h148, cfg_num_chunks);
+      wr32(12'h14C, 0);
+      wr32(12'h064, rate(32'h8000_0000));
+      wr32(12'h060, 2);
+      #2000;
+      wr32(12'h100, 1);
+      #5000;
+      wr32(12'h060, 1);
+      wait_state(3, 4000);
+      #20000;
+      total = ring_bytes();
+      rd64(12'h070, v64); if (v64 != total / BB) fail($sformatf("T11 CHK_BEATS %0d", v64));
+      rd64(12'h078, v64); if (v64 != 0) fail($sformatf("T11 CHK_ERRORS %0d", v64));
+      rd64(12'h080, v64); if (v64 != 0) fail($sformatf("T11 CHK_GAPS %0d", v64));
+      rd64(12'h098, v64); if (v64 != total / 16 - WPB) fail($sformatf("T11 CHK_LAST_SEQ %0d", v64));
+      wr32(12'h060, 0);
+      cfg_dry = 0;
+    end
+  endtask
+
+  task automatic test_mem1();
+    reg [31:0] v, v2; reg [63:0] v64; int aw0, ar0, aw1, ar1;
+    begin
+      $display("Test 12: CONFIG.MEM1: single ring at RING_BASE1 (port 1), DRY record + playback");
+      soft_reset();
+      cfg_split = 0; cfg_mem1 = 1; cfg_dry = 1; cfg_two = 0; cfg_start_chunk = 0; cfg_num_chunks = 5;
+      cfg_chunk_shift = 16; cfg_ring_base1 = 64'h0000_0020_0100_0000;
+      aw0 = n_aw[0]; ar0 = n_ar[0]; aw1 = n_aw[1]; ar1 = n_ar[1];
+      configure(0);
+      wr32(12'h148, cfg_num_chunks);
+      wr32(12'h014, rate(32'h3000_0000));         // 1.2 GB/s (slow port model)
+      wr32(12'h100, 1);
+      wr32(12'h010, 1);
+      wait_state(3, 4000);
+      wr32(12'h010, 0);
+      rd64(12'h250, v64); if (v64 != 0) fail($sformatf("T12 RUN_DROP_COUNT %0d", v64));
+      check_ring_mem(ring_bytes(), "T12 MEM1");
+      configure(1);
+      wr32(12'h148, cfg_num_chunks);
+      wr32(12'h14C, 0);
+      wr32(12'h060, 2);
+      #2000;
+      wr32(12'h100, 1);
+      #5000;
+      wr32(12'h060, 1);
+      wait_state(3, 4000);
+      #20000;
+      rd64(12'h070, v64); if (v64 != ring_bytes() / BB) fail($sformatf("T12 CHK_BEATS %0d", v64));
+      rd64(12'h078, v64); if (v64 != 0) fail($sformatf("T12 CHK_ERRORS %0d", v64));
+      if (n_aw[0] != aw0 || n_ar[0] != ar0) fail("T12 MEM1: traffic on ring port 0");
+      if (n_aw[1] == aw1 || n_ar[1] == ar1) fail("T12 MEM1: no traffic on ring port 1");
+      rd32(12'h268, v); rd32(12'h26C, v2);
+      if (v != 0 || v2 == 0) fail($sformatf("T12 RD_PORT_WAIT0/1 %0d/%0d", v, v2));
+      wr32(12'h060, 0);
+      cfg_mem1 = 0; cfg_dry = 0;
+    end
+  endtask
+
+  task automatic test_one_port();
+    reg [31:0] v; reg [63:0] v64;
+    begin
+      $display("Test 13: N_RING_PORTS 1: SPLIT / MEM1 ignored, single ring on port 0");
+      soft_reset();
+      expect32(12'h164, 1, "T13 RING_PORTS");
+      rd32(12'h108, v); if (v[13]) fail("T13 STATE.MEM1_READY with one ring port");
+      // SPLIT set: must be ignored (the model's reference treats it as 0 too)
+      cfg_split = 1; cfg_stripe = 12; cfg_dry = 1; cfg_two = 0; cfg_start_chunk = 0; cfg_num_chunks = 5;
+      cfg_chunk_shift = 16; cfg_ring_base = 64'h0000_0000_6800_0000;
+      configure(0);
+      wr32(12'h148, cfg_num_chunks);
+      wr32(12'h014, rate(32'h6000_0000));
+      wr32(12'h100, 1);
+      wr32(12'h010, 1);
+      wait_state(3, 4000);
+      wr32(12'h010, 0);
+      check_ring_mem(ring_bytes(), "T13 one port");
+      if (n_aw[1] != 0 || n_ar[1] != 0) fail("T13 traffic on ring port 1");
+      expect32(12'h264, 0, "T13 WR_PORT_STALL1");
+      cfg_split = 0; cfg_dry = 0;
+    end
+  endtask
+
+  // ---------------------------------------------------------------------------
+  // Test 14: memory switches at chunk boundaries (chunk-sized stripes)
+  // ---------------------------------------------------------------------------
+  // Monitors (dp_clk): the ring reader WAITS when a burst is outstanding, the
+  // egress FIFO has room and no data is there; the ring writer STALLS when its
+  // head W beat is valid and not accepted. Each cycle is booked to the first
+  // mon_win beats of a chunk ("boundary") or to the rest of the chunk.
+  // Sink monitor (src_clk): cycles the full-rate checker had no data between
+  // the first and the last beat of the playback (= egress starvation).
+  bit     mon_on = 0;
+  longint mon_chunk_beats = 1, mon_win = 1;
+  longint mon_rd_beats, mon_rd_wait_bnd, mon_rd_wait_mid, mon_wr_beats, mon_wr_stall_bnd, mon_wr_stall_mid;
+  always @(posedge dp_clk) begin
+    if (mon_on) begin
+      if (!dut.u_rd.rq_empty && dut.u_rd.m_axis_tready && !dut.u_rd.m_axis_tvalid) begin
+        if ((mon_rd_beats % mon_chunk_beats) < mon_win) mon_rd_wait_bnd++; else mon_rd_wait_mid++;
+      end
+      if (dut.u_rd.m_axis_tvalid && dut.u_rd.m_axis_tready) mon_rd_beats++;
+      if (dut.u_wr.w_valid && !dut.u_wr.w_ready) begin
+        if ((mon_wr_beats % mon_chunk_beats) < mon_win) mon_wr_stall_bnd++; else mon_wr_stall_mid++;
+      end
+      if (dut.u_wr.w_valid && dut.u_wr.w_ready) mon_wr_beats++;
+    end
+  end
+  bit     snk_mon = 0;
+  longint snk_beats, snk_starve, snk_total;
+  always @(posedge src_clk) begin
+    if (snk_mon) begin
+      if (snk_tvalid && snk_tready) snk_beats++;
+      else if (snk_tready && !snk_tvalid && snk_beats > 0 && snk_beats < snk_total) snk_starve++;
+    end
+  end
+
+  task automatic t14_play(input int rrob, input bit strict);
+    reg [31:0] v, v2; reg [63:0] v64; longint total; int nch;
+    begin
+      mm_rrob = rrob;
+      nch = cfg_num_chunks;
+      total = longint'(nch) << cfg_chunk_shift;
+      configure(1);
+      wr32(12'h148, nch);
+      wr32(12'h14C, 0);
+      wr32(12'h064, 32'h8000_0000);                // sink: one beat per src_clk (any width)
+      wr32(12'h060, 2);
+      #2000;
+      mon_rd_beats = 0; mon_rd_wait_bnd = 0; mon_rd_wait_mid = 0;
+      mon_wr_beats = 0; mon_wr_stall_bnd = 0; mon_wr_stall_mid = 0;
+      snk_beats = 0; snk_starve = 0; snk_total = total / BB;
+      wr32(12'h060, 1);                            // checker on before START: it waits for data
+      mon_on = 1; snk_mon = 1;
+      wr32(12'h100, 1);
+      wait_state(3, 4000);
+      #20000;
+      mon_on = 0; snk_mon = 0;
+      rd64(12'h070, v64); if (v64 != total / BB) fail($sformatf("T14 CHK_BEATS %0d", v64));
+      rd64(12'h078, v64); if (v64 != 0) fail($sformatf("T14 CHK_ERRORS %0d", v64));
+      rd64(12'h080, v64); if (v64 != 0) fail($sformatf("T14 CHK_GAPS %0d", v64));
+      rd32(12'h268, v); rd32(12'h26C, v2);
+      $display("  T14 playback (read buffer %0d bursts): reader waited %0d cycles in the first %0d beats of a chunk (%0d boundaries), %0d elsewhere; RD_PORT_WAIT0/1 %0d / %0d; sink starved %0d src_clk cycles of %0d beats",
+               rrob, mon_rd_wait_bnd, mon_win, nch - 1, mon_rd_wait_mid, v, v2, snk_starve, snk_total);
+      if (strict && RD_SKID_DEPTH > 0 && snk_starve != 0)
+        fail($sformatf("T14 the full-rate sink starved %0d cycles at chunk-sized stripes", snk_starve));
+      wr32(12'h060, 0);
+      mm_rrob = 4;
+    end
+  endtask
+
+  task automatic test_chunk_switch();
+    reg [31:0] v, v2; reg [63:0] v64; longint total; int nch;
+    begin
+      $display("Test 14: chunk-sized stripes, NoC-like ports (R latency %0d / %0d cycles, B %0d / %0d, read buffer %0d bursts per port, ready %0d %%, R valid %0d %%), RD_SKID_DEPTH %0d",
+               mm_lat_r[0], mm_lat_r[1], mm_lat_b[0], mm_lat_b[1], mm_rrob, mm_rdy_pct, mm_rv_pct, RD_SKID_DEPTH);
+      soft_reset();
+      wr32(12'h10C, 32'h7F);
+      mm_mode = 1;
+      cfg_split = 1; cfg_mem1 = 0; cfg_dry = 1; cfg_two = 0; cfg_start_chunk = 0;
+      cfg_chunk_shift = 16; cfg_stripe = 16; cfg_num_chunks = 16; cfg_lba_shift = 9; cfg_prp_shift = 12;
+      cfg_ring_base  = 64'h0000_0008_0080_0000;
+      cfg_ring_base1 = 64'h0000_0020_0080_0000;
+      cfg_prp_base   = 64'h0000_0000_5800_0000;
+      nch = cfg_num_chunks;
+      total = longint'(nch) << cfg_chunk_shift;
+      mon_chunk_beats = (longint'(1) << cfg_chunk_shift) / BB;
+      mon_win = 4 * (4096 / BB);                   // the first 4 bursts of a chunk
+      // 14a: DRY record at the source maximum (writer side)
+      mon_rd_beats = 0; mon_rd_wait_bnd = 0; mon_rd_wait_mid = 0;
+      mon_wr_beats = 0; mon_wr_stall_bnd = 0; mon_wr_stall_mid = 0;
+      configure(0);
+      wr32(12'h148, nch);
+      wr32(12'h014, 32'h8000_0000);                // one beat per src_clk (any width)
+      mon_on = 1;
+      wr32(12'h100, 1);
+      wr32(12'h010, 1);
+      wait_state(3, 4000);
+      wr32(12'h010, 0);
+      mon_on = 0;
+      rd64(12'h250, v64); if (v64 != 0) fail($sformatf("T14 record RUN_DROP_COUNT %0d", v64));
+      rd32(12'h260, v); rd32(12'h264, v2);
+      $display("  T14 record : %0d beats, writer W stall %0d cycles in the first %0d beats of a chunk (%0d boundaries), %0d elsewhere; WR_PORT_STALL0/1 %0d / %0d",
+               mon_wr_beats, mon_wr_stall_bnd, mon_win, nch - 1, mon_wr_stall_mid, v, v2);
+      check_ring_mem(total, "T14 record");
+      // 14b: ring-resident playback into the full-rate checker (reader side),
+      // ports able to feed the sink alone; 14c: ports slower than the sink
+      // (read buffer 3 bursts): the reader is the limit, the starvation shows
+      // how much of the two memories' bandwidth it uses
+      t14_play(4, 1);
+      t14_play(3, 0);
+      mm_mode = 0; cfg_split = 0; cfg_dry = 0;
+    end
+  endtask
+
   // watchdog
   initial begin
-    #80ms;
+    #250ms;
     $display("FAIL: watchdog timeout");
     $finish;
   end
@@ -547,7 +1042,13 @@ module tb_nvrec_core #(
 
     // ---- Test 0: identification / reset values
     $display("Test 0: identification and reset values");
-    expect32(12'h000, 32'h0001_0002, "VERSION");
+    expect32(12'h000, 32'h0001_0003, "VERSION");
+    expect32(12'h164, N_RING_PORTS, "RING_PORTS");
+    expect32(12'h160, 12, "RING_STRIPE_SHIFT reset");
+    expect32(12'h158, 0, "RING_BASE1_LO reset");
+    expect32(12'h15C, 0, "RING_BASE1_HI reset");
+    expect32(12'h260, 0, "WR_PORT_STALL0 reset"); expect32(12'h264, 0, "WR_PORT_STALL1 reset");
+    expect32(12'h268, 0, "RD_PORT_WAIT0 reset");  expect32(12'h26C, 0, "RD_PORT_WAIT1 reset");
     expect32(12'h0BC, BB, "BEAT_BYTES");
     expect32(12'h038, FDEPTH, "ING_FIFO_DEPTH");
     expect32(12'h0A4, EDEPTH, "EGR_FIFO_DEPTH");
@@ -560,7 +1061,13 @@ module tb_nvrec_core #(
     expect32(12'h184, 32'h0000_0000, "MEMBER_SEL(0) reset");
     expect32(12'h1A4, 32'h0000_0001, "MEMBER_SEL(1) reset");
     expect32(12'h1C0, 32, "SSD_MAX_INFLIGHT reset");
-    expect32(12'h108, 0, "STATE idle");
+    expect32(12'h108, TWO ? 32'h2000 : 0, "STATE idle (MEM1_READY = 1 if 2 ring ports)");
+    mem1_ready_in = 1'b0;
+    #200;
+    expect32(12'h108, 0, "STATE.MEM1_READY follows mem1_ready (0)");
+    mem1_ready_in = 1'b1;
+    #200;
+    expect32(12'h108, TWO ? 32'h2000 : 0, "STATE.MEM1_READY follows mem1_ready (1)");
 
     soft_reset();
     wr32(12'h100, 32'h10);                      // CREDIT_RST
@@ -604,6 +1111,10 @@ module tb_nvrec_core #(
     expect32(12'h21C, 0, "T1 UNEXPECTED");
     rd32(12'h22C, v); if (v > 8 || v < 2) fail($sformatf("T1 RING_HWM %0d", v));
     rd32(12'h1D8, v); if (v > 4 || v == 0) fail($sformatf("T1 SSD0 INFLIGHT_HWM %0d (max 4)", v));
+    rd32(12'h260, v); rd32(12'h264, v2);
+    $display("  T1: WR_PORT_STALL0 %0d, WR_PORT_STALL1 %0d (single ring)", v, v2);
+    if (v == 0 || v2 != 0) fail("T1 single ring: stall counters (port 0 > 0, port 1 = 0)");
+    if (n_aw[1] != 0 || n_ar[1] != 0) fail("T1 single ring: traffic on ring port 1");
     expect32(12'h288, 24, "T1 LAT_COUNT");
     rd32(12'h10C, v); if (!v[0]) fail("T1 IRQ DONE not set");
     if (!irq) fail("T1 irq output low");
@@ -887,8 +1398,18 @@ module tb_nvrec_core #(
       cfg_dry = 0;
     end
 
-    if (errors == 0) $display("PASS: tb_nvrec_core (%0d builder SQEs, %0d injector SQEs, %0d CQEs)",
-                              n_bld_sqe, n_inj_sqe, n_cqe);
+    // ---- Tests 9-11: split ring for three stripe sizes
+    if (TWO) begin
+      int stripes [3] = '{12, 16, 17};
+      for (int si = 0; si < 3; si++) split_tests(stripes[si]);
+      test_mem1();
+      test_chunk_switch();
+    end else begin
+      test_one_port();
+    end
+
+    if (errors == 0) $display("PASS: tb_nvrec_core N_RING_PORTS %0d (%0d builder SQEs, %0d injector SQEs, %0d CQEs, %0d 2-page SQEs, bursts port0 %0d/%0d port1 %0d/%0d W/R)",
+                              N_RING_PORTS, n_bld_sqe, n_inj_sqe, n_cqe, n_2page, n_aw[0], n_ar[0], n_aw[1], n_ar[1]);
     else             $display("FAIL: tb_nvrec_core, %0d error(s)", errors);
     $finish;
   end

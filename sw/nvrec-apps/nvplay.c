@@ -70,9 +70,18 @@ static void usage(FILE *f)
 "                        most src_clk x the fabric beat, e.g. 8000 MB/s on a\n"
 "                        256-bit design)\n"
 "  --no-check            do not reset/enable the checker (custom sink)\n"
-"  --buffers <n>         ring slots, 2..2048, at most the hardware slot table\n"
-"                        (default: 512 MB of slots, 512 MB / chunk within\n"
-"                        256..2048: 2048 x 256K, 1024 x 512K, 512 x 1M)\n"
+"  --buffers <n>         ring slots, 2..4096, at most the hardware slot table\n"
+"                        (default: 512 MB of slots, 1 GB for a split ring:\n"
+"                        bytes / chunk within 256..4096, e.g. 1024 x 512K\n"
+"                        single, 2048 x 512K split); a split ring with\n"
+"                        whole-chunk stripes uses an even count (an odd one\n"
+"                        is rounded down)\n"
+"  --ring <layout>       auto (default: the driver's choice -- split on a design\n"
+"                        with a second ring memory, single for one SSD), single\n"
+"                        (PS DDR), split (striped over PS DDR and the second\n"
+"                        memory) or mem1 (all in the second memory); map 1.3\n"
+"  --stripe <KB>|chunk   split ring: stripe unit, a power of two from 4 KB to the\n"
+"                        chunk (default: the driver's); 'chunk' = whole slots\n"
 "  --qd <n>              NVMe reads in flight per SSD, 1..63 (default 32)\n"
 "  --chunk <bytes>       raw / ring-only: bytes per chunk (default 1M or the md\n"
 "                        chunk; ring-only: 1M or the drives' MDTS if smaller)\n"
@@ -107,6 +116,7 @@ struct popts {
 	const char *input;
 	uint64_t rate, fill_rate, offset, length;
 	uint32_t slots, qd, chunk, passes;
+	uint32_t ring, stripe_kb;       /* --ring (0 = auto), --stripe (0 = default) */
 	bool rate_set, check, raw, ring_only, json;
 	struct ctl_run_opts ro;
 };
@@ -195,16 +205,18 @@ static int play_ring_only(struct popts *o)
 	struct nvrec_rate rr;
 	struct ctl_run_opts ro = o->ro;
 	struct chk_expect e;
-	char res[CTL_RESULT_MAX];
+	char res[CTL_RESULT_MAX], rdesc[64];
 	uint64_t ring_data, fill_rate = o->fill_rate;
 	double seconds = 0, prefill = 0;
 	bool complete = true, check_ok = true;
-	uint32_t chunk = o->chunk ? o->chunk : (1u << 20), slots = o->slots, p, done = 0;
+	uint32_t chunk = o->chunk ? o->chunk : (1u << 20), slots = o->slots, p, done = 0, layout;
 	int fd, r = 0, ret = 1;
 
 	fd = ctl_open(o->device, &info, true);
 	if (fd < 0)
 		return ctl_exit_code();
+	if (ctl_ring_layout(&info, o->ring, o->stripe_kb, 0, &layout))
+		goto out;
 	if (chunk > info.max_chunk) {
 		if (o->chunk) {
 			err_msg("--chunk %u exceeds the SSDs' maximum transfer size (%u)", chunk,
@@ -218,12 +230,12 @@ static int play_ring_only(struct popts *o)
 		goto out;
 	}
 	if (!slots) {
-		slots = ctl_default_slots(chunk, info.max_slots);
+		slots = ctl_default_slots(chunk, info.max_slots, layout);
 	} else if (info.max_slots && slots > info.max_slots) {
 		err_msg("--buffers %u exceeds the hardware slot table (%u)", slots, info.max_slots);
 		goto out;
 	}
-	if (ctl_set_ring(fd, chunk, slots, &ring))
+	if (ctl_set_ring(fd, &info, chunk, slots, layout, o->stripe_kb, &ring))
 		goto out;
 	ring_data = (uint64_t)ring.slots * chunk;
 	memset(&g, 0, sizeof(g));
@@ -264,9 +276,9 @@ static int play_ring_only(struct popts *o)
 	}
 	if (!o->ro.quiet)
 		fprintf(stderr, "nvplay: --ring-only: ring filled from the test pattern generator: %u x %u bytes (%"
-			PRIu64 " MB) at %.1f MB/s in %.3f s, 0 drops, %u-byte beats\n",
-			ring.slots, chunk, ring_data >> 20, fill_rate / 1e6, fst.elapsed_ns / 1e9,
-			info.beat_bytes);
+			PRIu64 " MB, %s) at %.1f MB/s in %.3f s, 0 drops, %u-byte beats\n",
+			ring.slots, chunk, ring_data >> 20, ctl_ring_describe(&ring, rdesc, sizeof(rdesc)),
+			fill_rate / 1e6, fst.elapsed_ns / 1e9, info.beat_bytes);
 
 	/* 2. playbacks of the ring: fabric only, every slot once, in order */
 	if (o->rate_set) {
@@ -322,15 +334,17 @@ static int play_ring_only(struct popts *o)
 			if (!chk_verdict(&info, &st, &e, pass_complete, what))
 				check_ok = false;
 		}
+		ctl_print_ports("nvplay", &info, &st);
 		if (r)
 			break;
 	}
 	if (done < o->passes)
 		complete = false;
 
-	printf("nvplay: ring only: %u of %u passes, %" PRIu64 " bytes in %.3f s, %.1f MB/s (fabric only: no NVMe command)\n",
+	printf("nvplay: ring only: %u of %u passes, %" PRIu64 " bytes in %.3f s, %.1f MB/s (fabric only: no NVMe command; %s)\n",
 	       done, o->passes, (uint64_t)sum.bytes, seconds,
-	       seconds > 0 ? sum.bytes / seconds / 1e6 : 0.0);
+	       seconds > 0 ? sum.bytes / seconds / 1e6 : 0.0,
+	       ctl_ring_describe(&ring, rdesc, sizeof(rdesc)));
 	snprintf(res, sizeof(res), "bytes=%" PRIu64 " seconds=%.3f sink_rate_bps=%" PRIu64
 		 " beats=%" PRIu64 " errors=%" PRIu64 " gaps=%" PRIu64 " gap_beats=%" PRIu64
 		 " drop_count=0 underflows=%" PRIu64 " nvme_errors=0 complete=%d error=%d"
@@ -361,6 +375,8 @@ int main(int argc, char **argv)
 		{ "rate", required_argument, NULL, 'r' },
 		{ "no-check", no_argument, NULL, 'n' },
 		{ "buffers", required_argument, NULL, 'b' },
+		{ "ring", required_argument, NULL, 'G' },
+		{ "stripe", required_argument, NULL, 'X' },
 		{ "qd", required_argument, NULL, 'Q' },
 		{ "chunk", required_argument, NULL, 'c' },
 		{ "raw", no_argument, NULL, 'R' },
@@ -382,7 +398,7 @@ int main(int argc, char **argv)
 		.ro = { .stats = 1.0, .timeout = 10.0, .play = true },
 	};
 	uint64_t v, data_bytes, drops = 0, array_off, first_seq = 0;
-	uint32_t slots, chunk, data_off = 0, nch, last, file_beat;
+	uint32_t slots, chunk, data_off = 0, nch, last, file_beat, layout;
 	bool tpg = true, fill_set = false, passes_set = false;
 	struct nvrec_info info;
 	struct nvrec_geometry g;
@@ -392,7 +408,7 @@ int main(int argc, char **argv)
 	struct vol_target t;
 	struct vol_mount mnt;
 	struct chk_expect e;
-	char err[512], res[CTL_RESULT_MAX];
+	char err[512], res[CTL_RESULT_MAX], rdesc[64];
 	unsigned lba_shift = 9;
 	double seconds;
 	int c, fd = -1, ret = 1, r;
@@ -409,6 +425,14 @@ int main(int argc, char **argv)
 			if (parse_size(optarg, &v) || v < 2 || v > NVREC_RING_MAX_SLOTS)
 				return die_usage("--buffers must be 2..%d", NVREC_RING_MAX_SLOTS), 1;
 			o.slots = (uint32_t)v;
+			break;
+		case 'G':
+			if (ctl_parse_ring(optarg, &o.ring))
+				return die_usage("--ring must be auto, single, split or mem1"), 1;
+			break;
+		case 'X':
+			if (ctl_parse_stripe(optarg, &o.stripe_kb))
+				return die_usage("--stripe must be a power of two in KB, 4..4096, or 'chunk'"), 1;
 			break;
 		case 'Q':
 			if (parse_size(optarg, &v) || v < 1 || v > 63)
@@ -593,19 +617,22 @@ int main(int argc, char **argv)
 		}
 		o.rate = rr.rate_bps;
 	}
+	if (ctl_ring_layout(&info, o.ring, o.stripe_kb, g.nr_members, &layout))
+		goto out;
 	if (!slots) {
-		slots = ctl_default_slots(chunk, info.max_slots);
+		slots = ctl_default_slots(chunk, info.max_slots, layout);
 	} else if (info.max_slots && slots > info.max_slots) {
 		err_msg("--buffers %u exceeds the hardware slot table (%u)", slots, info.max_slots);
 		goto out;
 	}
-	if (ctl_set_ring(fd, chunk, slots, &ring))
+	if (ctl_set_ring(fd, &info, chunk, slots, layout, o.stripe_kb, &ring))
 		goto out;
 	if (!o.ro.quiet)
 		fprintf(stderr, "nvplay: %s: %u x %u-byte chunks from array chunk %" PRIu64
-			" over %u member(s), ring %u slots (%" PRIu64 " MB), qd %u, %u-byte beats\n",
+			" over %u member(s), ring %u slots (%" PRIu64 " MB, %s), qd %u, %u-byte beats\n",
 			o.input, nch, chunk, (uint64_t)(array_off / chunk), g.nr_members,
-			ring.slots, (uint64_t)ring.bytes >> 20, o.qd ? o.qd : 32, info.beat_bytes);
+			ring.slots, (uint64_t)ring.bytes >> 20, ctl_ring_describe(&ring, rdesc, sizeof(rdesc)),
+			o.qd ? o.qd : 32, info.beat_bytes);
 	g.start_chunk = array_off / chunk;
 	g.length_chunks = nch;
 	g.last_chunk_bytes = last == chunk ? 0 : last;
@@ -632,8 +659,9 @@ int main(int argc, char **argv)
 	 * ring prefill before the sink is enabled is reported separately */
 	seconds = st.elapsed_ns / 1e9;
 	ctl_print_summary(prog_name, &info, &st, seconds, false);
-	printf("nvplay: ring %u slots x %u bytes = %" PRIu64 " MB, high-water %u slots\n",
-	       ring.slots, chunk, (uint64_t)ring.bytes >> 20, st.ring_hwm);
+	printf("nvplay: ring %u slots x %u bytes = %" PRIu64 " MB, %s, high-water %u slots\n",
+	       ring.slots, chunk, (uint64_t)ring.bytes >> 20,
+	       ctl_ring_describe(&ring, rdesc, sizeof(rdesc)), st.ring_hwm);
 	if (st.prefill_ns)
 		printf("nvplay: ring prefill before the sink was enabled: %.3f s (not in the time above)\n",
 		       st.prefill_ns / 1e9);

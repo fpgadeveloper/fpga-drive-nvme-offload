@@ -71,27 +71,33 @@ sustain, otherwise beats are dropped:
 * The fabric datapath: `dp_clk` × the beat, the same 8 or 16 GB/s (250 MHz `dp_clk`).
   `src_clk` and `dp_clk` run at the same frequency, so a source at one beat every cycle
   leaves the ingest FIFO no time to drain after a pause of the ring writer.
-* The path into memory: on Versal a 512-bit NoC port for the ring (QoS 14 000 MB/s per
-  direction; the two PCIe Root Ports each have their own NoC port, S08 and S10, at
-  7000 MB/s); on Zynq UltraScale+ the `S_AXI_HP2_FPD` port, 128 bits wide at 322.19 MHz on
-  the ZCU106 and 327.77 MHz on the UltraZed-EV (5.16 / 5.24 GB/s peak; 333 MHz requested),
-  so on those targets the memory port, not the fabric, sets the ceiling. `nvrec --no-write` measures this path on its own,
-  without an SSD (see [Applications](apps.md#fabric-only---no-write)).
+* The path into memory: on `zcu106_hpc0` and `vck190_fmcp1` the ring of a RAID0 or
+  fabric-only run is split over two memories, each with its own ring port. On Versal a 512-bit
+  NoC port into the DDR4 and one into the LPDDR4 (QoS 14 000 MB/s per direction each; the two
+  PCIe Root Ports each have their own NoC ports). On the ZCU106 the `S_AXI_HP2_FPD` port into
+  PS DDR (128 bits at 322.19 MHz, 5.16 GB/s peak; 333 MHz requested) and a port into the PL
+  DDR4 through a DDR4 controller in the PL; the ring writer streams in order through both, so
+  their mix, not the fabric, sets the ceiling. The UltraZed-EV has the HP port only
+  (327.77 MHz, 5.24 GB/s peak). `nvrec --no-write` measures this path on its own, without an
+  SSD (see [Applications](apps.md#fabric-only---no-write)).
 * The SSDs read the ring from the same DDR, so a recording crosses DDR twice; and the SSD
   (or the RAID0 array) sustained write rate is usually lower still. Use `nvbench.sh` or
   `nvbench-suite.sh` to measure it for your board and SSDs.
 
 Measured without an SSD (`nvrec --no-write`, see
-[Benchmarks](benchmarks.md#fabric-only-no-ssd)), the fabric reaches DDR without a dropped beat
-up to **5000 MB/s on `zcu106_hpc0`** (5250 MB/s drops: the HP port delivers 5155 MB/s) and up to
-**14 500 MB/s on `vck190_fmcp1`**, whose datapath is 512 bits wide (14 750 MB/s drops: its ring
-port delivers 14.7 GB/s). `uzev` was not measured (its HP port peaks at 5.24 GB/s). A source
-whose average stays below these rates loses no beat on its way into DDR; whether the SSDs keep
-up is the next question (see [Benchmarks](benchmarks.md#ceilings-at-a-glance)).
+[Benchmarks](benchmarks.md#fabric-only-no-ssd)), the fabric fills the ring without a dropped
+beat up to **6000 MB/s on `zcu106_hpc0`** with the default whole-chunk stripes (7000 MB/s with
+4 KB stripes; a single ring in PS DDR stops at 5000 MB/s, where the HP port delivers 5155 MB/s)
+and up to **14 750 MB/s on `vck190_fmcp1`**, whose datapath is 512 bits wide (15 750 MB/s with
+4 KB stripes, just below the 16 000 MB/s source maximum). `uzev` was not measured (its HP port
+peaks at 5.24 GB/s). A source whose average stays below these rates loses no beat on its way
+into the ring; whether the SSDs keep up is the next question (see
+[Benchmarks](benchmarks.md#ceilings-at-a-glance)).
 
 The ingest FIFO (256 KB: 8192 beats of 32 bytes on the Zynq UltraScale+ targets, 4096 beats
 of 64 bytes on `vck190_fmcp1`) only absorbs short bursts and the ring writer's 4 KB burst
-cadence (32 µs at 8 GB/s, 16 µs at 16 GB/s); the ring in DDR (512 MB by default) absorbs
+cadence (32 µs at 8 GB/s, 16 µs at 16 GB/s); the ring (1 GB by default when split over two
+memories, 512 MB otherwise) absorbs
 the SSDs' write stalls. If your source is bursty, its average over a few milliseconds is
 what matters. You can make the FIFO deeper with the `FIFO_DEPTH` parameter of
 `nvrec_core_0` (a power of 2, in beats, block RAM); the block-design scripts size it at

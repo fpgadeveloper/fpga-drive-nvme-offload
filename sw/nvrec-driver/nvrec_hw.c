@@ -19,11 +19,22 @@
  * probe (0 on a 1.0/1.1 bitstream = its 128-bit datapath, 16) and used for
  * the source/sink rate conversion; every beat counter is in those beats.
  * CONFIG.DRY (1.2) runs the fabric side only: no NVMe command is built.
+ *
+ * Split ring (register map 1.3): RING_PORTS = 2 means a second ring AXI4
+ * master to a second memory; the device tree's memory-region (a no-map
+ * carve-out) says where ring B may live. CONFIG.SPLIT stripes the ring over
+ * both memories (RING_BASE / RING_BASE1, RING_STRIPE_SHIFT), CONFIG.MEM1
+ * puts a single ring in memory 1. STATE.MEM1_READY (PL DDR4 calibrated)
+ * gates both. WR_PORT_STALL / RD_PORT_WAIT count how long the writer / reader
+ * waited for each memory (non-zero in clean runs too; a port whose count
+ * approaches the run time is the limit; 32-bit, saturating).
  */
 
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
@@ -116,6 +127,21 @@ static bool hw_is_1_2(struct nvrec_dev *nv)
 	return nv->hw_version >= NVREC_VERSION_1_2;
 }
 
+/* register map 1.3: RING_PORTS, RING_BASE1, RING_STRIPE_SHIFT, CONFIG.SPLIT /
+ * MEM1, STATE.MEM1_READY, port stall counters */
+static bool hw_is_1_3(struct nvrec_dev *nv)
+{
+	return nv->hw_version >= NVREC_VERSION_1_3;
+}
+
+/* Memory 1 of the split ring is usable: two ring ports and the PL DDR4
+ * controller calibrated (constant 1 on Versal). Live register read. */
+bool nvrec_hw_mem1_ready(struct nvrec_dev *nv)
+{
+	return hw_is_1_3(nv) && nv->ring_ports > 1 &&
+	       (core_rd(nv, NVREC_STATE) & NVREC_STATE_MEM1_READY);
+}
+
 /* Latch "Host Accelerator dead": log once, stop touching it, disable the
  * SSDs from process context (no NVMe I/O is possible any more), wake the
  * run waiters so a recording fails at once. Any context. */
@@ -162,6 +188,50 @@ static void cfg_u32_array(struct device_node *np, const char *prop, u32 *dst,
 	if (cnt == 1)		/* one value for every SSD */
 		while (--n)
 			dst[n] = dst[0];
+}
+
+/*
+ * Memory 1 of the split ring: "memory-region" = <&carve-out> (a
+ * reserved-memory node with reg and no-map, outside the memory Linux uses),
+ * or, should a kernel refuse such a region, "opsero,ring1" = <base size>
+ * (two 64-bit values). docs/source/driver.md, "Device tree".
+ */
+static void nvrec_hw_read_ring1(struct nvrec_dev *nv)
+{
+	struct device_node *np = nv->dev->of_node, *rn;
+	struct nvrec_ha_cfg *c = &nv->cfg;
+	u64 v[2];
+
+	c->ring1_phys = 0;
+	c->ring1_size = 0;
+	rn = of_parse_phandle(np, "memory-region", 0);
+	if (rn) {
+		struct reserved_mem *rmem = of_reserved_mem_lookup(rn);
+		struct resource res;
+
+		if (rmem) {
+			c->ring1_phys = rmem->base;
+			c->ring1_size = rmem->size;
+		} else if (!of_address_to_resource(rn, 0, &res)) {
+			c->ring1_phys = res.start;
+			c->ring1_size = resource_size(&res);
+		} else {
+			dev_warn(nv->dev, "memory-region %pOF: no address: no split ring\n", rn);
+		}
+		of_node_put(rn);
+	} else if (!of_property_read_u64_array(np, "opsero,ring1", v, 2)) {
+		c->ring1_phys = v[0];
+		c->ring1_size = v[1];
+	}
+	if (c->ring1_size && (c->ring1_phys % NVREC_HUGEPAGE || c->ring1_size < NVREC_HUGEPAGE)) {
+		dev_warn(nv->dev, "memory-1 region %pa + 0x%llx: base must be 2 MB aligned, size >= 2 MB: no split ring\n",
+			 &c->ring1_phys, c->ring1_size);
+		c->ring1_size = 0;
+	}
+	c->ring1_size = round_down(c->ring1_size, NVREC_HUGEPAGE);
+	c->stripe_kb = 0;
+	of_property_read_u32(np, "opsero,ring-stripe-kb", &c->stripe_kb);
+	c->stripe_chunk = of_property_read_bool(np, "opsero,ring-stripe-chunk");
 }
 
 static int nvrec_hw_read_cfg(struct nvrec_dev *nv)
@@ -224,6 +294,7 @@ static int nvrec_hw_read_cfg(struct nvrec_dev *nv)
 				     c->sq_base, c->cq_base);
 	/* injector CQE FIFO shared by all SSDs */
 	c->inj_depth = max_t(u32, 1, NVREC_INJ_CQ_FIFO_DEPTH / c->nr_ssd);
+	nvrec_hw_read_ring1(nv);
 	return 0;
 }
 
@@ -342,6 +413,14 @@ int nvrec_hw_probe(struct nvrec_dev *nv)
 				     nv->beat_bytes);
 	nv->fifo_depth = core_rd(nv, NVREC_ING_FIFO_DEPTH);
 	nv->egr_fifo_depth = core_rd(nv, NVREC_EGR_FIFO_DEPTH);
+	/* ring masters: RING_PORTS of map 1.3 (0x164 reads 0 before: one) */
+	nv->ring_ports = hw_is_1_3(nv) ? core_rd(nv, NVREC_RING_PORTS) : 0;
+	if (!nv->ring_ports)
+		nv->ring_ports = 1;
+	if (nv->ring_ports > 2) {
+		dev_warn(dev, "RING_PORTS %u: this driver uses 2\n", nv->ring_ports);
+		nv->ring_ports = 2;
+	}
 
 	ret = nvrec_hw_read_cfg(nv);
 	if (ret)
@@ -349,11 +428,17 @@ int nvrec_hw_probe(struct nvrec_dev *nv)
 	nv->cfg.max_slots = min_t(u32, core_rd(nv, NVREC_MAX_SLOTS), NVREC_RING_MAX_SLOTS);
 	if (!nv->cfg.max_slots)
 		nv->cfg.max_slots = NVREC_RING_MAX_SLOTS;
+	if (nv->cfg.ring1_size && nv->ring_ports < 2) {
+		dev_info(dev, "memory-1 region ignored: this design has one ring port (single ring only)\n");
+		nv->cfg.ring1_size = 0;
+	}
 
 	nv->caps = NVREC_CAP_TPG | NVREC_CAP_RECORD | NVREC_CAP_PLAY |
 		   NVREC_CAP_CHECK | NVREC_CAP_INJECTOR;
 	if (hw_is_1_2(nv))
 		nv->caps |= NVREC_CAP_DRY;
+	if (nv->ring_ports > 1 && nv->cfg.ring1_size)
+		nv->caps |= NVREC_CAP_SPLIT_RING;
 
 	nv->irq_core = platform_get_irq_byname(pdev, "core");
 	if (nv->irq_core < 0)
@@ -639,6 +724,19 @@ static void nvrec_hw_program(struct nvrec_dev *nv, bool play, bool dry)
 	unsigned int j;
 
 	core_wr64(nv, NVREC_RING_BASE_LO, nv->ring_dma);
+	if (hw_is_1_3(nv)) {
+		/* memory 1 (SPLIT ring B / MEM1 ring) and the stripe; the
+		 * reset values when the ring is in memory 0 only */
+		core_wr64(nv, NVREC_RING_BASE1_LO,
+			  nv->ring_layout == NVREC_RING_SINGLE ? 0 : nv->ring1_dma);
+		core_wr(nv, NVREC_RING_STRIPE_SHIFT,
+			nv->ring_layout == NVREC_RING_SPLIT ? nv->stripe_shift :
+			NVREC_RING_STRIPE_SHIFT_RESET);
+		if (nv->ring_layout == NVREC_RING_SPLIT)
+			cfg |= NVREC_CONFIG_SPLIT;
+		else if (nv->ring_layout == NVREC_RING_MEM1)
+			cfg |= NVREC_CONFIG_MEM1;
+	}
 	core_wr(nv, NVREC_NUM_CHUNKS, nv->slots);
 	core_wr(nv, NVREC_CHUNK_SIZE, nv->chunk);
 	core_wr64(nv, NVREC_PRP_LIST_BASE_LO, nv->prp_lists_dma);
@@ -871,4 +969,11 @@ void nvrec_hw_read_stats(struct nvrec_dev *nv, struct nvrec_stats *st)
 	st->chk_gap_beats = core_rd64(nv, NVREC_CHK_GAP_BEATS_LO);
 	st->chk_underflows = core_rd64(nv, NVREC_CHK_UNDERFLOWS_LO);
 	st->chk_last_seq = core_rd64(nv, NVREC_CHK_LAST_SEQ_LO);
+	if (hw_is_1_3(nv)) {
+		/* per-memory wait cycles (1.3; port 1 reads 0 with one port) */
+		for (k = 0; k < 2; k++) {
+			st->wr_port_stall[k] = core_rd(nv, NVREC_WR_PORT_STALL(k));
+			st->rd_port_wait[k] = core_rd(nv, NVREC_RD_PORT_WAIT(k));
+		}
+	}
 }

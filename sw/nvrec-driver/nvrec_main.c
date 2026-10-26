@@ -35,6 +35,16 @@
  * view) and by the ring writer (fabric view) alike, so SET_RING refuses a
  * system where the two views of DDR differ. A ring set up while no SSD is
  * live cannot be checked: it serves fabric-only (DRY) runs only.
+ *
+ * Split ring (register map 1.3, two ring ports): the ring can also be
+ * striped over memory 0 (the CMA allocation above) and memory 1, a
+ * second DDR behind the second ring port that the CPU never touches (the
+ * device tree reserves it, no-map, "memory-region"): ring B is simply the
+ * start of that region, nothing is allocated or mapped. Stripe i of
+ * 2^stripe_shift bytes lives in memory i & 1 (nvrec_ring.h); the PRP list
+ * entries (one per 4 KB page) follow the same address function, so an SSD
+ * reads and writes both memories within one command when the stripe is
+ * smaller than a chunk. The fabric/SSD-view check covers both memories.
  */
 
 #include <linux/module.h>
@@ -56,10 +66,93 @@
 #define NVREC_PAGE_SZ	4096u
 
 #include "nvrec.h"
+#include "nvrec_regs.h"
+#include "nvrec_ring.h"
 
 static LIST_HEAD(nvrec_list);
 static DEFINE_MUTEX(nvrec_list_lock);
 static DEFINE_IDA(nvrec_ida);
+
+/*
+ * ring_split: the layout of a ring an app sets up without naming one
+ * (nvrec_ring.flags = 0; nvrec_info.ring_default tells the apps):
+ *   auto  split over both memories when the design can (two ring ports, a
+ *         memory-1 region, memory 1 ready), except for single-SSD runs
+ *   0     single ring in memory 0 (as driver 1.1)
+ *   1     split whenever the design can, single-SSD runs too
+ */
+static int ring_split = -1;
+
+static int ring_split_set(const char *val, const struct kernel_param *kp)
+{
+	if (sysfs_streq(val, "auto") || sysfs_streq(val, "-1"))
+		ring_split = -1;
+	else if (sysfs_streq(val, "0") || sysfs_streq(val, "single"))
+		ring_split = 0;
+	else if (sysfs_streq(val, "1") || sysfs_streq(val, "split"))
+		ring_split = 1;
+	else
+		return -EINVAL;
+	return 0;
+}
+
+static int ring_split_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%s\n", ring_split < 0 ? "auto" : ring_split ? "1" : "0");
+}
+
+static const struct kernel_param_ops ring_split_ops = {
+	.set = ring_split_set,
+	.get = ring_split_get,
+};
+module_param_cb(ring_split, &ring_split_ops, NULL, 0644);
+MODULE_PARM_DESC(ring_split, "default ring layout: auto (split over both memories when the design can, not for single-SSD runs), 0 (single ring in PS DDR), 1 (split, single-SSD runs too)");
+
+/*
+ * stripe_kb: the default split-ring stripe: "auto" (or 0) = the board's
+ * (device tree opsero,ring-stripe-chunk / opsero,ring-stripe-kb, else the
+ * whole chunk), "chunk" = the whole chunk, or KB (a power of two, 4 ..
+ * 4096), capped at the chunk at SET_RING.
+ */
+#define STRIPE_KB_AUTO		0u
+#define STRIPE_KB_CHUNK		U32_MAX
+static unsigned int stripe_kb = STRIPE_KB_AUTO;
+
+static int stripe_kb_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int v;
+
+	if (sysfs_streq(val, "auto")) {
+		stripe_kb = STRIPE_KB_AUTO;
+		return 0;
+	}
+	if (sysfs_streq(val, "chunk")) {
+		stripe_kb = STRIPE_KB_CHUNK;
+		return 0;
+	}
+	if (kstrtouint(val, 0, &v))
+		return -EINVAL;
+	if (v && (v < 4 || v > NVREC_MAX_CHUNK / 1024 || !is_power_of_2(v)))
+		return -EINVAL;
+	stripe_kb = v;
+	return 0;
+}
+
+static int stripe_kb_get(char *buf, const struct kernel_param *kp)
+{
+	if (stripe_kb == STRIPE_KB_AUTO)
+		return sysfs_emit(buf, "auto\n");
+	if (stripe_kb == STRIPE_KB_CHUNK)
+		return sysfs_emit(buf, "chunk\n");
+	return sysfs_emit(buf, "%u\n", stripe_kb);
+}
+
+static const struct kernel_param_ops stripe_kb_ops = {
+	.set = stripe_kb_set,
+	.get = stripe_kb_get,
+};
+module_param_cb(stripe_kb, &stripe_kb_ops, NULL, 0644);
+MODULE_PARM_DESC(stripe_kb, "default split-ring stripe: auto (the board's: device tree opsero,ring-stripe-chunk / opsero,ring-stripe-kb, else the whole chunk), chunk, or KB (power of two, 4..4096, capped at the chunk)");
 
 /* ------------------------------------------------------------------------ */
 /* SSD lookup (called by the PCI driver)                                    */
@@ -270,10 +363,71 @@ static void nvrec_ring_free(struct nvrec_dev *nv)
 	nv->prp_lists_bytes = 0;
 	nv->ring_dma = 0;
 	nv->ring_bytes = 0;
+	nv->ring_layout = 0;
+	nv->stripe_shift = 0;
+	nv->ring1_used = 0;
 	nv->ring_ssd_ok = false;
 	nv->slots = 0;
 	nv->chunk = 0;
 	nv->geo_valid = false;
+}
+
+/* The split ring and MEM1 rings are possible now (memory 1 ready) */
+static bool nvrec_split_ok(struct nvrec_dev *nv)
+{
+	return (nv->caps & NVREC_CAP_SPLIT_RING) && nvrec_hw_mem1_ready(nv);
+}
+
+/* The layout of a ring set up without one (module parameter ring_split),
+ * for a run over `members` SSDs (0 = fabric only) */
+static u32 nvrec_ring_default(struct nvrec_dev *nv, unsigned int members)
+{
+	if (!nvrec_split_ok(nv) || !ring_split)
+		return NVREC_RING_SINGLE;
+	if (ring_split < 0 && members == 1)
+		return NVREC_RING_SINGLE;
+	return NVREC_RING_SPLIT;
+}
+
+/* The default stripe, log2 bytes or NVREC_STRIPE_SHIFT_CHUNK (the whole
+ * chunk): module parameter stripe_kb, else the board's device tree
+ * (opsero,ring-stripe-chunk, opsero,ring-stripe-kb), else the whole chunk */
+static u32 nvrec_stripe_default(struct nvrec_dev *nv)
+{
+	u32 kb = stripe_kb;
+
+	if (kb == STRIPE_KB_AUTO) {
+		if (nv->cfg.stripe_chunk || !nv->cfg.stripe_kb)
+			return NVREC_STRIPE_SHIFT_CHUNK;
+		kb = nv->cfg.stripe_kb;
+	}
+	if (kb == STRIPE_KB_CHUNK)
+		return NVREC_STRIPE_SHIFT_CHUNK;
+	if (kb < 4 || !is_power_of_2(kb) || kb > NVREC_MAX_CHUNK / 1024) {
+		dev_warn_once(nv->dev, "opsero,ring-stripe-kb %u invalid (power of two, 4 .. %u): using the whole chunk\n",
+			      kb, NVREC_MAX_CHUNK / 1024);
+		return NVREC_STRIPE_SHIFT_CHUNK;
+	}
+	return ilog2(kb) + 10;
+}
+
+/* "chunk" or "<n> KB" for the probe line and sysfs */
+static const char *nvrec_stripe_name(u32 shift, char *buf, size_t len)
+{
+	if (shift == NVREC_STRIPE_SHIFT_CHUNK)
+		return "chunk";
+	snprintf(buf, len, "%u KB", 1u << (shift - 10));
+	return buf;
+}
+
+static const char *nvrec_layout_name(u32 layout)
+{
+	switch (layout) {
+	case NVREC_RING_SINGLE: return "single";
+	case NVREC_RING_SPLIT: return "split";
+	case NVREC_RING_MEM1: return "mem1";
+	default: return "none";
+	}
 }
 
 /* SSD-side address of a physical address; ~0 when the SSDs disagree */
@@ -337,13 +491,15 @@ static int nvrec_ring_user(struct nvrec_dev *nv, u64 addr, u64 bytes)
 static int nvrec_set_ring(struct nvrec_dev *nv, struct nvrec_ring __user *uarg)
 {
 	struct nvrec_ring a;
+	struct nvrec_ring_map map;
 	phys_addr_t ring_pa;
-	u32 n4k, per_list, i;
+	u32 n4k, per_list, i, layout, shift = 0, slots;
+	u64 total, part0, part1;
 	int ret;
 
 	if (copy_from_user(&a, uarg, sizeof(a)))
 		return -EFAULT;
-	if (a.flags)
+	if ((a.flags & ~NVREC_RING_LAYOUT_MASK) || hweight32(a.flags) > 1 || a.reserved[0])
 		return -EINVAL;
 	if (nvrec_running(nv))
 		return -EBUSY;
@@ -351,14 +507,58 @@ static int nvrec_set_ring(struct nvrec_dev *nv, struct nvrec_ring __user *uarg)
 	if (!a.bytes)
 		return 0;
 
+	/* the layout: as asked, else the default for a 2-member / DRY run;
+	 * an app's own (hugepage) ring is a single ring in memory 0 */
+	layout = a.flags ? a.flags : a.addr ? NVREC_RING_SINGLE : nvrec_ring_default(nv, 2);
+	if (layout != NVREC_RING_SINGLE) {
+		if (a.addr)
+			return -EINVAL;
+		if (!(nv->caps & NVREC_CAP_SPLIT_RING)) {
+			dev_err(nv->dev, "%s ring: %s\n", nvrec_layout_name(layout),
+				nv->ring_ports < 2 ? "this design has one ring port" :
+				"no memory-1 region in the device tree (memory-region)");
+			return -EOPNOTSUPP;
+		}
+		if (!nvrec_hw_mem1_ready(nv)) {
+			dev_err(nv->dev, "%s ring: memory 1 is not ready (STATE.MEM1_READY = 0: the memory controller did not calibrate)\n",
+				nvrec_layout_name(layout));
+			return -EIO;
+		}
+	}
+
 	if (a.addr % NVREC_HUGEPAGE || a.bytes % NVREC_HUGEPAGE ||
-	    a.bytes > NVREC_RING_MAX_BYTES)
+	    a.bytes > (layout == NVREC_RING_SPLIT ? NVREC_RING_MAX_BYTES_SPLIT :
+		       NVREC_RING_MAX_BYTES))
 		return -EINVAL;
 	if (!is_power_of_2(a.chunk) || a.chunk < NVREC_MIN_CHUNK ||
 	    a.chunk > NVREC_MAX_CHUNK || a.chunk % nv->beat_bytes)
 		return -EINVAL;
 	if (a.bytes / a.chunk < 2 || a.bytes / a.chunk > nv->cfg.max_slots)
 		return -EINVAL;
+	if (layout == NVREC_RING_SPLIT) {
+		/* stripe: 4 KB .. one chunk; the default is capped at the chunk */
+		shift = nvrec_ring_stripe(a.stripe_shift, nvrec_stripe_default(nv), ilog2(a.chunk));
+		if (!shift)
+			return -EINVAL;
+	} else if (a.stripe_shift) {
+		return -EINVAL;
+	}
+	/* whole-chunk stripes: an even slot count keeps every SSD on one memory */
+	slots = nvrec_ring_slots(a.bytes / a.chunk, layout, shift, ilog2(a.chunk));
+	if (slots != a.bytes / a.chunk)
+		dev_warn_once(nv->dev, "split ring with whole-chunk stripes: %llu slots rounded down to %u (an even count keeps each SSD on one memory)\n",
+			      a.bytes / a.chunk, slots);
+	/* the parts of the ring in each memory (slots x chunk bytes in all) */
+	total = (u64)slots * a.chunk;
+	part0 = nvrec_ring_part_bytes(layout, total, shift, 0);
+	part1 = nvrec_ring_part_bytes(layout, total, shift, 1);
+	if (part0 > NVREC_RING_MAX_BYTES || part1 > NVREC_RING_MAX_BYTES)
+		return -EINVAL;
+	if (part1 > nv->cfg.ring1_size) {
+		dev_err(nv->dev, "%s ring: %llu MB of it in memory 1, the memory-1 region has %llu MB\n",
+			nvrec_layout_name(layout), part1 >> 20, nv->cfg.ring1_size >> 20);
+		return -ENOSPC;
+	}
 	for (i = 0; i < nv->cfg.nr_ssd; i++) {
 		struct nvrec_ssd *s = nv->ssd[i];
 
@@ -372,37 +572,57 @@ static int nvrec_set_ring(struct nvrec_dev *nv, struct nvrec_ring __user *uarg)
 	 * serves DRY runs only (nvrec_start) */
 	nv->ring_ssd_ok = nvrec_ssd_addr(nv, 0) != ~0ull;
 
-	nv->ring_bytes = a.bytes;
+	/* memory 0: the single ring (as given: 2 MB multiple) or ring A of a
+	 * split ring (CMA); a MEM1 ring has none */
+	nv->ring_bytes = layout == NVREC_RING_SINGLE ? a.bytes : PAGE_ALIGN(part0);
 	if (a.addr) {
 		ret = nvrec_ring_user(nv, a.addr, a.bytes);
-	} else {
-		nv->ring_cookie = dma_alloc_attrs(nv->dev, a.bytes, &nv->ring_dma,
+	} else if (nv->ring_bytes) {
+		nv->ring_cookie = dma_alloc_attrs(nv->dev, nv->ring_bytes, &nv->ring_dma,
 						  GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
 		nv->ring_ours = !!nv->ring_cookie;
 		ret = nv->ring_cookie ? 0 : -ENOMEM;
 		if (ret)
-			dev_err(nv->dev, "cannot allocate a %llu MB ring (CMA too small? cma= kernel argument)\n",
-				a.bytes >> 20);
+			dev_err(nv->dev, "cannot allocate a %llu MB ring%s (CMA too small? cma= kernel argument)\n",
+				nv->ring_bytes >> 20, layout == NVREC_RING_SPLIT ? " A" : "");
+	} else {
+		ret = 0;
 	}
 	if (ret)
 		goto err;
-	ring_pa = dma_to_phys(nv->dev, nv->ring_dma);
-	if (nv->ring_ssd_ok && nvrec_ssd_addr(nv, ring_pa) != nv->ring_dma) {
-		dev_err(nv->dev, "ring: fabric address 0x%llx and SSD address 0x%llx differ: unsupported address map\n",
-			(u64)nv->ring_dma, nvrec_ssd_addr(nv, ring_pa));
+	if (nv->ring_bytes) {
+		ring_pa = dma_to_phys(nv->dev, nv->ring_dma);
+		if (nv->ring_ssd_ok && nvrec_ssd_addr(nv, ring_pa) != nv->ring_dma) {
+			dev_err(nv->dev, "ring: fabric address 0x%llx and SSD address 0x%llx differ: unsupported address map\n",
+				(u64)nv->ring_dma, nvrec_ssd_addr(nv, ring_pa));
+			ret = -EIO;
+			goto err;
+		}
+	}
+	/* memory 1: the start of the reserved region, the same check */
+	if (part1 && nv->ring_ssd_ok &&
+	    nvrec_ssd_addr(nv, nv->cfg.ring1_phys) != nv->ring1_dma) {
+		dev_err(nv->dev, "ring (memory 1): fabric address 0x%llx and SSD address 0x%llx differ: unsupported address map\n",
+			(u64)nv->ring1_dma, nvrec_ssd_addr(nv, nv->cfg.ring1_phys));
 		ret = -EIO;
 		goto err;
 	}
 
 	nv->chunk = a.chunk;
-	nv->slots = a.bytes / a.chunk;
+	nv->slots = slots;
+	nv->ring_layout = layout;
+	nv->stripe_shift = shift;
+	nv->ring1_used = part1;
+	map.base0 = nv->ring_dma;
+	map.base1 = nv->ring1_dma;
+	map.layout = layout;
+	map.shift = shift;
 
-	/* PRP lists: entries for pages 1..P-1 of every slot; a 4 KB list page
-	 * holds 512 entries, longer lists chain through the last entry */
+	/* PRP lists (memory 0): entries for pages 1..P-1 of every slot, each
+	 * page where the address function puts it; a 4 KB list page holds
+	 * 512 entries, longer lists chain through the last entry */
 	n4k = a.chunk / NVREC_PAGE_SZ;
-	nv->prp_shift = 12;
-	if (n4k - 1 > 512)
-		nv->prp_shift = 12 + ilog2(roundup_pow_of_two(DIV_ROUND_UP(n4k - 1, 511)));
+	nv->prp_shift = nvrec_prp_shift(a.chunk);
 	per_list = 1u << nv->prp_shift;
 	nv->prp_lists_bytes = n4k > 2 ? (size_t)nv->slots * per_list : 0;
 	if (nv->prp_lists_bytes) {
@@ -418,32 +638,25 @@ static int nvrec_set_ring(struct nvrec_dev *nv, struct nvrec_ring __user *uarg)
 			ret = -EIO;
 			goto err;
 		}
-		for (i = 0; i < nv->slots; i++) {
-			__le64 *list = nv->prp_lists + (size_t)i * per_list;
-			u64 list_dma = nv->prp_lists_dma + (u64)i * per_list;
-			u64 data = nv->ring_dma + (u64)i * a.chunk;
-			u32 k, e = 0;
-
-			for (k = 1; k < n4k; k++) {
-				/* last slot of a list page, more to come: chain */
-				if (e % 512 == 511 && k < n4k - 1) {
-					list[e] = cpu_to_le64(list_dma + (u64)(e + 1) * 8);
-					e++;
-				}
-				list[e++] = cpu_to_le64(data + (u64)k * NVREC_PAGE_SZ);
-			}
-		}
+		for (i = 0; i < nv->slots; i++)
+			nvrec_prp_fill(nv->prp_lists + (size_t)i * per_list,
+				       nv->prp_lists_dma + (u64)i * per_list, &map, i, a.chunk);
 	}
 	wmb();
 
+	a.flags = layout;
+	a.stripe_shift = shift;
 	a.slots = nv->slots;
 	a.dma_addr = nv->ring_dma;
+	a.dma_addr1 = part1 ? nv->ring1_dma : 0;
 	if (copy_to_user(uarg, &a, sizeof(a))) {
 		ret = -EFAULT;
 		goto err;
 	}
-	dev_dbg(nv->dev, "ring: %u slots x %u bytes at 0x%llx (%s), PRP lists 0x%llx%s\n",
-		nv->slots, nv->chunk, (u64)nv->ring_dma, nv->ring_ours ? "CMA" : "user",
+	dev_dbg(nv->dev, "ring: %u slots x %u bytes, %s (stripe %u KB): memory 0 0x%llx + %llu MB (%s), memory 1 0x%llx + %llu MB, PRP lists 0x%llx%s\n",
+		nv->slots, nv->chunk, nvrec_layout_name(layout), shift ? 1u << (shift - 10) : 0,
+		(u64)nv->ring_dma, part0 >> 20, nv->ring_ours ? "CMA" : "user",
+		(u64)(part1 ? nv->ring1_dma : 0), part1 >> 20,
 		(u64)nv->prp_lists_dma, nv->ring_ssd_ok ? "" : ", no live SSD: DRY runs only");
 	return 0;
 err:
@@ -548,6 +761,12 @@ static int nvrec_start(struct nvrec_dev *nv, struct nvrec_start __user *uarg, bo
 		return -ENXIO;
 	if (play && !nv->geo.length_chunks)
 		return -EINVAL;
+	/* a ring in memory 1: never with CONFIG.SPLIT / MEM1 while it is down */
+	if (nv->ring_layout != NVREC_RING_SINGLE && !nvrec_hw_mem1_ready(nv)) {
+		dev_err(nv->dev, "%s ring: memory 1 is not ready (STATE.MEM1_READY = 0)\n",
+			nvrec_layout_name(nv->ring_layout));
+		return -EIO;
+	}
 	if (!dry) {
 		/* NVMe runs: members, a ring checked against the SSDs' view */
 		if (!nv->geo.nr_members)
@@ -644,6 +863,15 @@ static void nvrec_fill_info(struct nvrec_dev *nv, struct nvrec_info *info)
 	info->max_qd = nvrec_hw_max_qd();
 	info->lat_bin0_log2 = nvrec_hw_lat_bin0_log2();
 	info->status = nvrec_hw_ha_dead(nv) ? NVREC_STATUS_HA_DEAD : 0;
+	info->ring_ports = nv->ring_ports;
+	if (nv->caps & NVREC_CAP_SPLIT_RING) {
+		info->ring1_base = nv->ring1_dma;
+		info->ring1_bytes = nv->cfg.ring1_size;
+		if (!nvrec_hw_mem1_ready(nv))
+			info->status |= NVREC_STATUS_MEM1_DOWN;
+	}
+	info->ring_default = nvrec_ring_default(nv, 2) | (nvrec_ring_default(nv, 1) << 8);
+	info->stripe_shift = nvrec_stripe_default(nv);
 
 	mutex_lock(&nv->ssd_lock);
 	for (i = 0; i < nv->cfg.nr_ssd; i++) {
@@ -855,6 +1083,11 @@ NVREC_STAT_ATTR(overflow, st.overflow);
 NVREC_STAT_ATTR(lat_min_cycles, st.lat_count ? st.lat_min : 0);
 NVREC_STAT_ATTR(lat_max_cycles, st.lat_max);
 NVREC_STAT_ATTR(lat_avg_cycles, st.lat_count ? div64_u64(st.lat_sum, st.lat_count) : 0);
+/* register map 1.3: which memory held the run up (dp_clk cycles, saturating) */
+NVREC_STAT_ATTR(wr_port_stall0, st.wr_port_stall[0]);
+NVREC_STAT_ATTR(wr_port_stall1, st.wr_port_stall[1]);
+NVREC_STAT_ATTR(rd_port_wait0, st.rd_port_wait[0]);
+NVREC_STAT_ATTR(rd_port_wait1, st.rd_port_wait[1]);
 
 /* live, not the last run's snapshot: asks nvrec_core (never the IP) */
 static ssize_t ha_dead_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -880,6 +1113,34 @@ NVREC_RO_ATTR(beat_bytes, "%u", nv->beat_bytes);
 NVREC_RO_ATTR(version, "%u.%u", nv->hw_version >> 16, nv->hw_version & 0xffff);
 NVREC_RO_ATTR(ring_slots, "%u", nv->slots);
 NVREC_RO_ATTR(chunk_bytes, "%u", nv->chunk);
+NVREC_RO_ATTR(max_slots, "%u", nv->cfg.max_slots);
+/* split ring: the design (ring_ports, the memory-1 region) and the ring
+ * set up now (ring_split: single / split / mem1 / none, its stripe) */
+NVREC_RO_ATTR(ring_ports, "%u", nv->ring_ports);
+NVREC_RO_ATTR(ring1_base, "0x%llx", (nv->caps & NVREC_CAP_SPLIT_RING) ? (u64)nv->ring1_dma : 0ull);
+NVREC_RO_ATTR(ring1_bytes, "%llu", (nv->caps & NVREC_CAP_SPLIT_RING) ? nv->cfg.ring1_size : 0ull);
+NVREC_RO_ATTR(ring_split, "%s", nvrec_layout_name(nv->ring_layout));
+NVREC_RO_ATTR(ring_stripe_kb, "%u", nv->stripe_shift ? 1u << (nv->stripe_shift - 10) : 0);
+
+/* the default stripe of a split ring: "chunk" or the KB (module parameter
+ * stripe_kb, device tree), before the cap at the chunk */
+static ssize_t ring_stripe_default_show(struct device *dev, struct device_attribute *attr,
+					char *buf)
+{
+	u32 shift = nvrec_stripe_default(to_nv(dev));
+
+	if (shift == NVREC_STRIPE_SHIFT_CHUNK)
+		return sysfs_emit(buf, "chunk\n");
+	return sysfs_emit(buf, "%u\n", 1u << (shift - 10));
+}
+static DEVICE_ATTR_RO(ring_stripe_default);
+
+/* live: memory 1 usable (STATE.MEM1_READY; 0 without a second ring port) */
+static ssize_t mem1_ready_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", nvrec_hw_mem1_ready(to_nv(dev)));
+}
+static DEVICE_ATTR_RO(mem1_ready);
 
 static ssize_t lat_hist_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
@@ -1007,6 +1268,10 @@ static struct attribute *nvrec_attrs[] = {
 	&dev_attr_lat_min_cycles.attr,
 	&dev_attr_lat_max_cycles.attr,
 	&dev_attr_lat_avg_cycles.attr,
+	&dev_attr_wr_port_stall0.attr,
+	&dev_attr_wr_port_stall1.attr,
+	&dev_attr_rd_port_wait0.attr,
+	&dev_attr_rd_port_wait1.attr,
 	&dev_attr_lat_hist.attr,
 	&dev_attr_lat_bin0_log2.attr,
 	&dev_attr_ssd0_inflight_hwm.attr,
@@ -1019,6 +1284,14 @@ static struct attribute *nvrec_attrs[] = {
 	&dev_attr_version.attr,
 	&dev_attr_ring_slots.attr,
 	&dev_attr_chunk_bytes.attr,
+	&dev_attr_max_slots.attr,
+	&dev_attr_ring_ports.attr,
+	&dev_attr_ring1_base.attr,
+	&dev_attr_ring1_bytes.attr,
+	&dev_attr_ring_split.attr,
+	&dev_attr_ring_stripe_kb.attr,
+	&dev_attr_ring_stripe_default.attr,
+	&dev_attr_mem1_ready.attr,
 	&dev_attr_rate_bps.attr,
 	&dev_attr_tpg_enable.attr,
 	NULL,
@@ -1054,6 +1327,7 @@ static int nvrec_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct nvrec_dev *nv;
 	unsigned int i;
+	char ring[128], sbuf[16];
 	int ret, id;
 
 	nv = devm_kzalloc(dev, sizeof(*nv), GFP_KERNEL);
@@ -1074,6 +1348,9 @@ static int nvrec_probe(struct platform_device *pdev)
 	ret = nvrec_hw_probe(nv);
 	if (ret)
 		return ret;
+	/* memory 1 as the fabric (and, checked at SET_RING, the SSDs) see it */
+	if (nv->caps & NVREC_CAP_SPLIT_RING)
+		nv->ring1_dma = phys_to_dma(dev, nv->cfg.ring1_phys);
 
 	for (i = 0; i < nv->cfg.nr_ssd; i++)
 		nv->port_np[i] = of_parse_phandle(dev->of_node, "opsero,ssd-ports", i);
@@ -1108,11 +1385,20 @@ static int nvrec_probe(struct platform_device *pdev)
 	list_add_tail(&nv->node_list, &nvrec_list);
 	mutex_unlock(&nvrec_list_lock);
 
-	dev_info(dev, "/dev/%s: driver %s, nvrec_core v%u.%u, src_clk %u Hz, dp_clk %u Hz, beat %u bytes, FIFO %u/%u beats (ingest/egress), %u ring slots%s; nvmeha: %u SSDs x %u queues (SQ window 0x%llx, CQ window 0x%llx)%s\n",
+	if (nv->caps & NVREC_CAP_SPLIT_RING)
+		snprintf(ring, sizeof(ring), "ring ports %u, mem1 0x%llx %llu MB%s, default ring %s, stripe %s",
+			 nv->ring_ports, (u64)nv->ring1_dma, nv->cfg.ring1_size >> 20,
+			 nvrec_hw_mem1_ready(nv) ? "" : " NOT READY (STATE.MEM1_READY = 0)",
+			 nvrec_layout_name(nvrec_ring_default(nv, 2)),
+			 nvrec_stripe_name(nvrec_stripe_default(nv), sbuf, sizeof(sbuf)));
+	else
+		snprintf(ring, sizeof(ring), "ring ports %u%s, single ring", nv->ring_ports,
+			 nv->ring_ports > 1 ? " but no memory-1 region (memory-region)" : "");
+	dev_info(dev, "/dev/%s: driver %s, nvrec_core v%u.%u, src_clk %u Hz, dp_clk %u Hz, beat %u bytes, FIFO %u/%u beats (ingest/egress), %u ring slots%s, %s; nvmeha: %u SSDs x %u queues (SQ window 0x%llx, CQ window 0x%llx)%s\n",
 		 nv->name, NVREC_DRV_VERSION, nv->hw_version >> 16, nv->hw_version & 0xffff,
 		 nv->src_clk_hz, nv->dp_clk_hz, nv->beat_bytes, nv->fifo_depth,
 		 nv->egr_fifo_depth, nv->cfg.max_slots,
-		 (nv->caps & NVREC_CAP_DRY) ? ", DRY" : "",
+		 (nv->caps & NVREC_CAP_DRY) ? ", DRY" : "", ring,
 		 nv->cfg.nr_ssd, nv->cfg.max_sq, nv->cfg.sq_base, nv->cfg.cq_base,
 		 ", hardware queues, CPU I/O via the injector");
 	return 0;

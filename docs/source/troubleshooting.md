@@ -72,10 +72,10 @@ applies as well. Work through these in order:
    `boot.scr`), and the SSDs never link up. On the other boards, check the carrier's VADJ
    setting against the [FMC card's requirements](https://docs.opsero.com/op063/datasheet/overview/).
 4. **Is the right image running?** The boot log should show this design's driver line
-   (`nvrec ... /dev/nvrec: driver 1.1, nvrec_core v1.2, ... beat 32 bytes ...`, `beat 64 bytes`
-   on `vck190_fmcp1`). A card that
-   holds another design's image has another bitstream; `nvrec_core v1.1` is the previous
-   (128-bit) revision of this design.
+   (`nvrec ... /dev/nvrec: driver 1.2, nvrec_core v1.3, ... beat 32 bytes ..., ring ports 2`,
+   `beat 64 bytes` on `vck190_fmcp1`, `ring ports 1` on `uzev`). A card that
+   holds another design's image has another bitstream; `nvrec_core v1.2` is the previous
+   revision of this design (single ring), `v1.1` the 128-bit one before it.
 5. **Check the link** with `dmesg | grep -i "pcie link"` and
    `sudo lspci -vv | grep -E "LnkCap|LnkSta"` (see [Test the design in Linux](linux_test)).
    A link that trains slower or narrower than the design supports points to a seating or
@@ -145,7 +145,11 @@ dmesg | grep nvrec
 | `ring of ... needs N MB of CMA ... but the kernel's CMA pool is only M MB`, or `cannot allocate the ring: ... CMA free ...` (kernel log: `cannot allocate a N MB ring (CMA too small? cma= kernel argument)`) | The CMA pool is too small or fragmented for the ring. Use fewer `--buffers` (or a smaller chunk), or raise `NVREC_CMA` in `Yocto/bsp/<target>/conf/local.conf.append` and rebuild the image. `grep Cma /proc/meminfo` shows the pool. |
 | `/dev/nvrec: Device or resource busy (another recorder/player is running)` | Only one program can use the recorder at a time: `nvrec` and `nvplay` cannot run together. Check `ps aux \| grep -E "nvrec\|nvplay"`. |
 | `the recording would end at byte ... beyond ... (end of the device or of the md RAID0 stripe zone)` | Not enough room after the file's position. Free space at the end of the volume, or record less. |
-| `--buffers N exceeds the hardware slot table (M)` | The bitstream's slot table is smaller (1024 on a register map 1.1 bitstream, 2048 on 1.2). Use at most M buffers. |
+| `--buffers N exceeds the hardware slot table (M)` | The bitstream's slot table is smaller (1024 on a register map 1.1 bitstream, 2048 on 1.2, 4096 on 1.3). Use at most M buffers. |
+| `--ring split: this design has one ring port (single ring only)` / `... the driver has no memory-1 region (device tree memory-region)` | The split ring (and `--ring mem1`) needs a register map 1.3 design with two ring ports (`zcu106_hpc0`, `vck190_fmcp1`; not `uzev`) and the second memory's region in the device tree. Use `--ring single` (or leave `--ring` out), or the image of this revision. |
+| `--ring split: memory 1 is not ready (...)` (kernel log: `split ring: memory 1 is not ready (STATE.MEM1_READY = 0 ...)`) | The second memory's controller did not calibrate (`cat /sys/class/misc/nvrec/mem1_ready` reads 0; on `zcu106_hpc0` the PL DDR4). The default ring falls back to a single ring in PS DDR. Power-cycle the board; if it persists, the PL DDR4 (or its clock) has a problem. |
+| `split ring of ... puts N MB in memory 1, its region has M MB` | The second memory's half of the ring is larger than the region the device tree reserves (1 GB). Use fewer `--buffers`. |
+| `--stripe N KB is larger than the chunk (C KB)` / `--stripe needs a split ring` | The stripe is at most one chunk (`--stripe chunk`), and only a split ring has one. |
 | `this design (nvrec_core 1.1) has no fabric-only mode: it needs register map 1.2` | `nvrec --no-write` and `nvplay --ring-only` need the 1.2 hardware. Use the image of this revision. |
 | `driver API version N, this app expects M` | The apps and the kernel module come from different revisions. Rebuild the image (both are built together). |
 
@@ -160,10 +164,18 @@ completing the writes fast enough. In order of likelihood:
 2. **The SLC cache ran out.** If the drops start after a fixed amount of data, the SSD's
    write cache filled up; see [supported SSDs](supported_ssds.md#choosing-ssds-for-recording).
    Use a lower rate, a larger or faster SSD, or RAID0.
-3. **The ring is too small for the SSDs' write stalls.** The default ring is 512 MB (64 ms
-   at 8 GB/s); more chunks (`--buffers`, up to 2048 and at most 1 GB) absorb longer stalls,
-   within the CMA pool. The `ring high-water` figure in the summary shows how much of the
-   ring was used.
+3. **The ring is too small for the SSDs' write stalls.** The default ring is 1 GB when split
+   over two memories (RAID0 on `zcu106_hpc0` and `vck190_fmcp1`) and 512 MB otherwise (64 ms
+   at 8 GB/s); at their top rates three of the four measured RAID0 pairs need at least 512 MB
+   and the Sabrent pair on `vck190_fmcp1` the whole 1 GB (see
+   [Benchmarks](benchmarks.md#ring-size)). More chunks (`--buffers`, up to 4096, at most 1 GB
+   per memory) absorb longer stalls, within the CMA pool. The `ring high-water` figure in the
+   summary shows how much of the ring was used.
+   On the split-ring designs, the `ring ports (memory 0 / 1)` line of the summary shows how
+   long the ring writer waited for each memory. Some wait is normal in every run; a memory
+   whose `writer waited` time comes close to the recording's duration is the one that held
+   it up (the figure saturates at 17 179.886 ms, so use runs shorter than ~17 s for this).
+   `nvrec --ring single` / `--ring mem1` and `--stripe` change the load on each.
 4. **The drives were idle in a deep power state.** A gap shortly after the start of a fast
    recording on drives that idled is the wake-up from a deep power state. The driver switches
    APST off at probe by default; check `cat /sys/block/nvrec0n1/nvrec/apst` (`off`) and that

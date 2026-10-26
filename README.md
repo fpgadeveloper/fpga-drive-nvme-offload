@@ -52,11 +52,15 @@ Important links:
 
 * AXI-Stream datapath at 250 MHz: 256 bits (8 GB/s) on the Zynq UltraScale+ targets, 512 bits
   (16 GB/s) on the Versal target (128, 256 or 512 bits are build options); the fabric writes
-  the stream into a ring of chunks in PS DDR (512 MB by default; a chunk is 1 MB, or the
-  drive's maximum transfer size (MDTS) when that is smaller: one chunk is one NVMe command).
+  the stream into a ring of chunks (a chunk is 1 MB, or the drive's maximum transfer size
+  (MDTS) when that is smaller: one chunk is one NVMe command). On `zcu106_hpc0` and
+  `vck190_fmcp1` the ring of a RAID0 recording is split over PS DDR and a second memory that
+  the CPU does not use (the PL DDR4 on the ZCU106, the LPDDR4 on the VCK190), 1 GB by default
+  in whole-chunk stripes, so each SSD writes and reads one memory; one SSD, and `uzev`, use a
+  512 MB ring in PS DDR.
 * For every filled chunk, fabric logic (`nvrec_core`) builds a 64-byte NVMe Write command and
   hands it to the NVMe Host Accelerator, which queues it and rings the SSD's doorbell. The
-  SSD reads the data from DDR by itself. Up to 63 commands are in flight per SSD.
+  SSD reads the data from the ring by itself. Up to 63 commands are in flight per SSD.
 * Completions come back to the fabric, which releases the ring slots in order. With two SSDs
   the chunks are striped in the Linux md RAID0 layout, so the array also assembles on a PC.
 * The source is never stalled: if the ring is full, beats are dropped and counted.
@@ -123,9 +127,9 @@ Notes:
    otherwise supported by the free Vivado *Standard* Edition; "Enterprise" targets a device
    that the Standard Edition does not support (the XCVC1902 of the VCK190) and also needs a
    Vivado Enterprise license.
-2. Hardware testing: all three targets have been tested on hardware, single drive and RAID0
-   (`zcu106_hpc0` and `vck190_fmcp1` with two Samsung 980 PRO 1TB and with two Sabrent Rocket
-   2230 1TB, `uzev` with two Sabrent Rocket 2230 1TB); see the
+2. Hardware testing: `zcu106_hpc0` and `vck190_fmcp1` have been tested on hardware in this
+   revision, single drive and RAID0, each with two Samsung 980 PRO 1TB and with two Sabrent
+   Rocket 2230 1TB; `uzev` is built but was not tested on hardware in this revision; see the
    [supported SSDs](https://offload.fpgadrive.com/en/latest/supported_ssds.html) and the
    [benchmarks](https://offload.fpgadrive.com/en/latest/benchmarks.html).
 

@@ -79,7 +79,37 @@
  * the opsero,ha-* properties (driver.md) override them without a rebuild.
  * If the block design changes the address map or the interrupt bits, change
  * this node with it.
+ *
+ * Split ring (register map 1.3, driver 1.2): nvrec_core's second ring port
+ * reaches the soldered 2 GB PL DDR4 through a DDR4 controller in the PL, at
+ * 0x20_0000_0000, mapped for the ring port and the XDMA root ports only --
+ * the PS has no path to it and no memory node covers it. memory-region
+ * reserves its first 1 GB for ring B (no-map: the kernel never maps or
+ * allocates it); ring A stays in the CMA pool (cma=, PS DDR4). The driver
+ * refuses a split ring while the controller is not calibrated
+ * (STATE.MEM1_READY). opsero,ring-stripe-chunk makes the board's default
+ * stripe the whole chunk (driver module parameter stripe_kb and the apps'
+ * --stripe override it): measured on this board (Sabrent RAID0, Gen3 x4), whole
+ * chunks play back best (5500 MB/s sustained vs 5250 with 4 KB / 64 KB stripes;
+ * 6000 at MaxPayload 256) and record 6000 MB/s at MaxPayload 256, while 64 KB
+ * was the worst layout in every SSD playback test. The in-order ring
+ * writer/reader alternates between HP2 (~5.15 GB/s) and the PL DDR4 (~7.8
+ * GB/s), so any stripe sits near their harmonic mean (~6.2 GB/s); whole chunks
+ * keep each SSD command in one memory.
  */
+/ {
+   reserved-memory {
+      #address-cells = <2>;
+      #size-cells = <2>;
+      ranges;
+
+      nvrec_ring1: nvrec-ring1@2000000000 {
+         reg = <0x20 0x00000000 0x0 0x40000000>;
+         no-map;
+      };
+   };
+};
+
 &amba_pl {
    nvrec: nvrec@420010000 {
       compatible = "opsero,nvrec";
@@ -91,5 +121,7 @@
       interrupt-names = "core", "ha";
       opsero,ssd-ports = <&xdma_0>, <&xdma_1>;
       opsero,ha-sw-queues = <0>;
+      memory-region = <&nvrec_ring1>;
+      opsero,ring-stripe-chunk;
    };
 };

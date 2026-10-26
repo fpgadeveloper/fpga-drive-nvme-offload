@@ -22,12 +22,18 @@ the register map
 | file | role |
 |---|---|
 | `nvrec_main.c` | platform driver, `/dev/nvrec`, ring, geometry, run control, sysfs |
+| `nvrec_ring.h` | the ring address function and the PRP lists built from it (pure code, unit-tested on the host: `tests/`) |
 | `nvrec_hw.c` | **every** register access (nvrec_core and nvmeha registers) |
 | `nvrec_nvme.c` | PCI driver: controller reset/enable, admin queue, Identify, I/O queue creation |
 | `nvrec_blk.c` | blk-mq block devices |
 
-This page describes driver version 1.1 (`modinfo nvrec`), which goes with register map 1.2.
-It also runs a register map 1.1 bitstream (128-bit datapath, no fabric-only mode).
+This page describes driver version 1.2 (`modinfo nvrec`, ioctl API 4), which goes with
+register map 1.3. It also runs register map 1.2 (single ring, 2048 slots) and 1.1 bitstreams
+(128-bit datapath, no fabric-only mode). The probe message names everything that matters:
+
+```
+nvrec 420010000.nvrec: /dev/nvrec: driver 1.2, nvrec_core v1.3, src_clk 249999756 Hz, dp_clk 249999756 Hz, beat 64 bytes, FIFO 4096/4096 beats (ingest/egress), 4096 ring slots, DRY, ring ports 2, mem1 0x60000000000 1024 MB, default ring split, stripe chunk; nvmeha: 2 SSDs x 1 queues (...)
+```
 
 ## Beats and words
 
@@ -61,6 +67,127 @@ Two units appear in the counters:
 
 `bytes` is in bytes (beats × `beat_bytes`); chunk sizes, LBAs and the ring are unchanged by
 the width: a chunk (64 KB or more) and an LBA (512 bytes or more) are always whole beats.
+
+## Split ring: one ring in two memories
+
+Every byte of a recording or a playback crosses the ring's memory twice: the fabric writes it
+and an SSD reads it (playback: an SSD writes it, the fabric reads it). With the ring in PS DDR
+alone, that DDR controller is the ceiling of the design at the top rates. Register map 1.3
+adds a **second ring port** (`RING_PORTS` = 2) to a **second memory** that the CPU does not use
+— the soldered PL DDR4 on `zcu106_hpc0` (through a DDR4 controller in the PL), the on-board
+LPDDR4 on `vck190_fmcp1` — so the ring can be split over the two memories and each carries
+half of the traffic. `uzev` has one ring port (single ring only).
+
+**Layouts** (`nvrec_ring.flags`, apps `--ring`):
+
+| layout | where the ring is |
+|---|---|
+| `single` | all in memory 0 (PS DDR, the CMA allocation): as driver 1.1 |
+| `split` | striped over memory 0 and memory 1 in stripes of 2^S bytes (`stripe_shift` S, 12 … log2(chunk)) |
+| `mem1` | all in memory 1 (diagnostics: measures the second memory alone) |
+
+**Address function** (register map 1.3, `nvrec_ring.h`): byte *g* of the ring (*g* = slot ×
+chunk + offset) is in stripe *i* = *g* >> S, stripe *i* lives in memory *i* mod 2 at
+((*i* >> 1) << S) + (*g* mod 2^S) from that memory's ring base. With S = 12 the memories
+alternate every 4 KB (every AXI burst), so both carry half the stream at any time and each SSD
+reads and writes both memories within one command. With S = log2(chunk) whole slots alternate
+(slot *s* in memory *s* mod 2). Memory 0 holds ⌈stripes / 2⌉ stripes, memory 1 the rest:
+exactly half each, because with whole-chunk stripes the driver always uses an **even slot
+count** — an odd count from SET_RING is rounded down by one (never below 2; `nvrec_ring.slots`
+returns the count used, and the kernel log says so once:
+`split ring with whole-chunk stripes: N slots rounded down to N-1`). The reason is the
+**SSD ↔ memory pairing**: chunk *c* of a run is in slot *c* mod slots, so with an even count
+its memory is *c* mod 2, while its stripe member is (`start_chunk` + *c*) mod 2 — member *m*
+always writes (and reads) memory *m* XOR (`start_chunk` mod 2). Both are fixed for a run, so
+with whole-chunk stripes **each SSD touches one memory only** (which one depends on the
+parity of the file's first chunk). An odd count would put one more slot in memory 0 and swap
+the pairing at every wrap of the ring. The hardware puts
+ADDR(slot × chunk) in PRP1; the driver writes every other 4 KB page of the slot, at its
+ADDR, into the slot's PRP list (the lists themselves stay in memory 0), so the SSDs follow
+the same function.
+
+**Default stripe: the whole chunk on both boards** (device tree `opsero,ring-stripe-chunk`;
+`opsero,ring-stripe-kb = <KB>` for another board default; the whole chunk without either),
+overridden by the module parameter `stripe_kb` or the app's `--stripe`, and capped at the
+chunk. With whole chunks each SSD reads and writes one memory only (see the pairing above),
+which is what wins once SSDs are in the loop:
+
+* `zcu106_hpc0`: **the whole chunk**. The ring writer and reader stream in order, so they
+  alternate between the two ports — HP2 (~5.15 GB/s) and the PL DDR4 (~7.8 GB/s) — and any
+  large stripe sits near the harmonic mean of the two, 2 / (1/5.15 + 1/7.8) ≈ 6.2 GB/s (4 KB
+  stripes overlap the ports best in the fabric alone: 7000 MB/s record, 6750 playback, against
+  6000-6250 for whole chunks). With the SSDs in the loop whole chunks win: each NVMe command
+  stays in one memory, and a Sabrent RAID0 pair plays back and records 6000 MB/s with them at
+  the default MaxPayload of 256 bytes (5500 MB/s recording with 4 KB stripes) with less of the
+  ring in use (at 128 bytes it plays back 5250 MB/s with whole chunks or 4 KB stripes); 64 KB was the worst layout in every
+  SSD test. **With 512 KB chunks whole-chunk stripes are essential**: with 4 KB stripes each
+  512 KB command of a Samsung 980 PRO switches memory 128 times, and the 980 PRO pair plays
+  back only ~3.8-4.0 GB/s (6.3 ms read latency at MaxPayload 128) instead of 5750 MB/s
+  (5250 MB/s at 128). Whole chunks cap the fabric at about 6.2-6.4 GB/s (the chunk alternation), above what
+  either pair needs.
+* `vck190_fmcp1`: **the whole chunk**. Two Samsung 980 PRO in RAID0 (40 GiB playbacks, 32 GB
+  recordings; see [Benchmarks](benchmarks.md#stripe-whole-chunk-4-kb-or-64-kb)):
+
+  | | whole chunk (default) | 4 KB stripes |
+  |---|---|---|
+  | playback, MaxPayload 256 (the image's default) | **11 000 MB/s** (3 of 3 on the release image; 8 of 9 in the measurement session) | 10 500 MB/s |
+  | playback, MaxPayload 128 | **10 750 MB/s** | 10 250 MB/s |
+  | SSD command latency during the playback, average | 0.20 ms | 1.7-1.85 ms |
+  | recording | 10 000 MB/s (the drives' write rate) | 10 000 MB/s |
+  | fabric only: recording / ring-resident playback | 14 750 / 15 000 MB/s | 15 750 / 16 000 MB/s |
+
+  Two Sabrent Rocket 2230, whose drives read more slowly than either layout takes, play back
+  9250 MB/s with both.
+
+  With 4 KB stripes every SSD command alternates between the DDR4 and the LPDDR4, and the NoC
+  orders each Root Port's writes strictly, so every switch costs a round trip. With whole
+  chunks each SSD writes one memory; the ring reader's skid FIFOs keep fetching from the other
+  memory, so the switch from one memory to the next at a chunk boundary costs the reader
+  little. 4 KB stripes win only without SSDs.
+
+**Memory 1** is a `no-map` reserved-memory region the device tree hands to the nvrec node
+(`memory-region`, see [Device tree](#device-tree)): 1 GB at the start of the second memory on
+both reference designs. The kernel never maps or allocates it; ring B (the memory-1 part of a
+split ring, or a `mem1` ring) simply starts at its base — nothing is allocated, nothing to
+free. Ring A (the memory-0 part) comes from CMA as before, so a split ring takes only half
+its size from CMA: the default split ring of 1 GB is 512 MB of CMA + 512 MB of the region,
+the same CMA as the 512 MB single ring of driver 1.1. The "fabric view = SSD view" check of
+SET_RING covers both memories.
+
+`STATE.MEM1_READY` says memory 1 is usable (the PL DDR4 controller calibrated on
+`zcu106_hpc0`; always 1 on `vck190_fmcp1`). While it is 0 the driver refuses `split` and `mem1`
+rings (SET_RING `-EIO`, START `-EIO`), reports `NVREC_STATUS_MEM1_DOWN` and the default
+layout falls back to `single`; sysfs `mem1_ready` reads it live.
+
+**Default layout** (SET_RING with `flags = 0`, apps `--ring auto`): module parameter
+`ring_split` — `auto` (default): `split` when the design can (two ring ports, a memory-1
+region, memory 1 ready), except for runs over a single SSD, which stay `single`; `0`: always
+`single`; `1`: `split` whenever the design can, single-SSD runs too. `nvrec_info.ring_default`
+tells the apps the result for 2-member/fabric-only runs and for 1-member runs. A single SSD
+stays on the single ring because it gains nothing from the split (its own link is the limit)
+and loses on it: one Sabrent on `zcu106_hpc0` plays back about 13 % slower on the split ring
+(its writes alternate between the memories), records the same; **one 980 PRO on
+`zcu106_hpc0` plays back only ~1.44 GB/s on the split ring** (12 ms read latency) against
+3000 MB/s on the single ring; one 980 PRO on `vck190_fmcp1` 5750 MB/s on a 4 KB-striped split
+ring against 6250 MB/s. Keep `ring_split=auto` (or 0) for single-SSD work: `ring_split=1`
+forces the split on one SSD too.
+
+**Which memory limits a run:** register map 1.3 counts, per ring port, the `dp_clk` cycles the
+ring writer's head beat waited for that port (`WR_PORT_STALL`, record) and the cycles the
+ring reader waited for read data of that port while the egress FIFO had room
+(`RD_PORT_WAIT`, playback), since START. They are in `nvrec_stats.wr_port_stall[]` /
+`rd_port_wait[]`, the sysfs `wr_port_stall0/1` and `rd_port_wait0/1`, and the apps' summaries
+and RESULT lines (in ms). The counters are **not zero in a clean run**: every memory makes
+the head beat wait a little, and the wait grows with the bytes moved through that port (on
+both boards the memory-1 port's writer stall is about 4.2 ms per GiB written to it at any
+rate below its limit; on `zcu106_hpc0` it is a fixed wait of about 4 `dp_clk` cycles per 4 KB
+burst into the PL DDR4 path, 2^26 cycles per 64 GiB, so a non-zero memory-1 count alone does
+not mean that memory 1 limits). Read them by comparison — between the two ports, and against the run
+time (`seconds` of the RESULT line): a port whose stall or wait approaches the duration of the
+run is the one that limits it; a non-zero value alone means nothing. The counters are 32 bits
+wide and saturate at 2^32 − 1 cycles, **17 179.886 ms** at 250 MHz: a run longer than about
+17 s can show that value without meaning anything about the memory (compare shorter runs, or
+the rate of growth in the sysfs counters while the run goes).
 
 ## Why the stock nvme driver is kept off the SSDs
 
@@ -174,6 +301,17 @@ how a script watches the drives during long recordings (`nvbench-suite.sh` stops
 70 °C). `temperature_warn` and `temperature_crit` are the drive's warning and critical
 composite temperature thresholds (Identify Controller WCTEMP / CCTEMP; 0 = not reported).
 
+### PCIe MaxPayload
+
+The driver leaves the PCIe MaxPayload as the kernel set it at enumeration (128 bytes on these
+boards). The board's value is set from user space after boot by `nvrec-pcie-mps.service`
+(`nvrec-mps`, see [Apps](apps.md#nvrec-mps)): 256 bytes on `vck190_fmcp1` and `zcu106_hpc0`,
+128 on `uzev`. A
+board policy belongs there — visible (`nvrec-mps status`), reversible without a reboot, set
+per image — rather than in the driver, and the kernel's own `pci=pcie_bus_perf` would also
+lower MaxReadReq and choose the largest value both ends support rather than the measured one.
+The `mps` key of the apps' `RESULT` lines records the value in force for every run.
+
 ### Queue strategy
 
 The design's IP is built with **hardware-only queues** (register map 1.0 rev b): each SSD has
@@ -221,19 +359,28 @@ context:
 
 One process at a time may open it (`-EBUSY` otherwise). The run model:
 
-1. **`NVREC_IOC_SET_RING`** — the ring of `bytes / chunk` slots in PS DDR, 2 to `max_slots`
-   slots (the hardware slot table: 2048 on the register map 1.2 designs, 1024 on 1.1) and at
-   most 1 GB (the apps default to 512 MB: 512 MB / chunk slots within 256…2048, i.e.
-   2048 × 256 KB, 1024 × 512 KB, 512 × 1 MB). The CMA it takes is the ring plus
-   one PRP list per slot (4 KB each up to a 2 MB chunk); see
-   [ring size and CMA](apps.md#ring-size-and-cma).
+1. **`NVREC_IOC_SET_RING`** — the ring of `bytes / chunk` slots, 2 to `max_slots` slots (the
+   hardware slot table: 4096 on the register map 1.3 designs, 2048 on 1.2, 1024 on 1.1), in
+   the layout of `flags` (`NVREC_RING_SINGLE`, `NVREC_RING_SPLIT` with `stripe_shift`,
+   `NVREC_RING_MEM1`; 0 = the driver's default, see [Split ring](#split-ring-one-ring-in-two-memories)).
+   A single or `mem1` ring is at most 1 GB, a split ring at most 2 GB with at most 1 GB in
+   each memory and its memory-1 part within the memory-1 region. The apps default to 512 MB
+   single (512 MB / chunk slots within 256…4096: 2048 × 256 KB, 1024 × 512 KB, 512 × 1 MB)
+   and 1 GB split (4096 × 256 KB, 2048 × 512 KB, 1024 × 1 MB). The CMA it takes is the
+   memory-0 part plus one PRP list per slot (4 KB each up to a 2 MB chunk, 8 KB for 4 MB); see
+   [ring size and CMA](apps.md#ring-size-and-cma). On return `flags` holds the layout used,
+   `stripe_shift` the stripe (0 unless split), `slots` the slot count used (`bytes / chunk`,
+   rounded down to even for a whole-chunk split ring), `dma_addr` / `dma_addr1` the bus
+   addresses of the two parts. Since `bytes` is a multiple of 2 MB, chunks below 2 MB always
+   give an even count; the rounding only shows with 2 MB and 4 MB chunks.
    The hardware addresses slot *s* at `RING_BASE + s × chunk`, so the ring must be **one
    physically contiguous region**: with `addr = 0` the driver allocates it from CMA
    (`dma_alloc_attrs`, no kernel mapping — the CPU never touches sample data). An app may
    instead pass a 2 MB-hugepage mapping (the fpga-drive-recorder way); it is pinned and
-   accepted only if the pages are physically contiguous. The driver then builds one PRP list
-   per slot (pages 1…P−1 of the slot; lists longer than 512 entries chain) in DMA-coherent
-   memory. The chunk is a power of two, 64 KB–4 MB. **One chunk is one NVMe command**, so the
+   accepted only if the pages are physically contiguous (a single ring only). The driver then
+   builds one PRP list per slot (pages 1…P−1 of the slot, each at the address the layout gives
+   it; lists longer than 512 entries chain) in DMA-coherent memory. The chunk is a power of
+   two, 64 KB–4 MB. **One chunk is one NVMe command**, so the
    chunk must not exceed any member SSD's MDTS (maximum data transfer size, e.g. 512 KB on the
    Samsung 980 PRO): `NVREC_IOC_SET_GEOMETRY` refuses a larger chunk with `-EINVAL` and logs
    `chunk of N bytes exceeds the maximum transfer size (MDTS) of nvrecXn1 (M bytes)`.
@@ -325,13 +472,15 @@ flight and high-water, credits, issued/completed/error counters (`nvrec_core`), 
 checker counters for playback. `fifo_hwm` is the ingest FIFO high-water mark **during the
 run** (`RUN_FIFO_HWM`); `ing_fifo_hwm` is the raw `ING_FIFO_HWM`, which also counts the FIFO
 filling up after the run when the source keeps running. `flags` carries
-`NVREC_STATS_HA_DEAD`, `prefill_ns` the playback prefill time.
+`NVREC_STATS_HA_DEAD`, `prefill_ns` the playback prefill time, `wr_port_stall[2]` /
+`rd_port_wait[2]` (API 4) the ring ports' wait cycles (register map 1.3; 0 before).
 
 ### Cache coherency
 
 Neither the ring writer (`S_AXI_HP` port) nor the SSDs (root port AXI master) are cache
 coherent with the APU. The CMA ring is cleaned and invalidated by the DMA API at allocation
-and never touched by the CPU afterwards; a user hugepage ring is mapped with
+and never touched by the CPU afterwards; memory 1 is never mapped by the CPU at all (no-map,
+outside the memory Linux uses); a user hugepage ring is mapped with
 `dma_map_sgtable(DMA_BIDIRECTIONAL)` (clean + invalidate), and the app must not touch it while
 it is registered. The PRP lists live in `dma_alloc_coherent` memory (non-cacheable here) and
 are ordered before the ring registers by a `wmb()`. Block-device I/O uses the standard
@@ -351,9 +500,35 @@ streaming DMA API (`dma_map_sg`) against the SSD's PCI device.
       interrupt-names = "core", "ha";
       opsero,ssd-ports = <&xdma_0>, <&xdma_1>;   /* root ports in SSD order */
       opsero,ha-sw-queues = <0>;                 /* hardware-only queues */
+      memory-region = <&nvrec_ring1>;            /* split ring: memory 1 (1.3) */
+      opsero,ring-stripe-chunk;                  /* default stripe: the whole chunk */
+   };
+};
+
+/ {
+   reserved-memory {
+      #address-cells = <2>;
+      #size-cells = <2>;
+      ranges;
+      nvrec_ring1: nvrec-ring1@2000000000 {      /* zcu106_hpc0: PL DDR4 */
+         reg = <0x20 0x00000000 0x0 0x40000000>; /* 1 GB */
+         no-map;
+      };
    };
 };
 ```
+
+`memory-region` (register map 1.3, optional) names the memory-1 region for ring B: a
+reserved-memory node with `reg` and `no-map` at an address the second ring port and the root
+ports reach and Linux does not use as RAM — `0x20_0000_0000` (PL DDR4) on `zcu106_hpc0`,
+`0x600_0000_0000` (LPDDR4, the NoC's `DDR_CH2` region) on `vck190_fmcp1`, 1 GB each, 2 MB
+aligned (the driver keeps every ring address 64 bits wide). Should a kernel refuse
+such a region, `opsero,ring1 = <base size>` (two 64-bit values) gives the same without a
+reserved-memory node. Without either, or on a design with one ring port, the driver uses a
+single ring. The board's default split-ring stripe is `opsero,ring-stripe-chunk` (a boolean:
+the whole chunk, on both reference designs) or `opsero,ring-stripe-kb = <KB>` (a power of
+two ≥ 4); `opsero,ring-stripe-chunk` wins when both are given, and without either the default
+is the whole chunk.
 
 Optional properties override the IP build parameters compiled in from `nvrec_regs.h`:
 `opsero,ha-num-ssd`, `opsero,ha-num-sq`, `opsero,ha-sw-queues` and `opsero,ha-hw-queues` (one
@@ -372,7 +547,14 @@ in this design, both see the root port BAR windows at the same AXI address).
 `ssd0_inflight_hwm`, `ssd1_inflight_hwm` (per SSD: most commands in flight, of the running
 or the last run, cleared for every SSD slot when a run starts; one file per SSD slot of the IP), `ha_counters` (per SSD: issued, completed, errors of the IP), `src_clk_hz`,
 `dp_clk_hz`, `beat_bytes` (bytes per fabric beat), `egr_fifo_depth` (egress FIFO, beats),
-`version` (register map), `ring_slots`, `chunk_bytes`, and the writable `rate_bps` (test
+`version` (register map), `ring_slots`, `chunk_bytes`, `max_slots` (hardware slot table),
+the split ring (driver 1.2): `ring_ports` (1 or 2), `ring1_base` / `ring1_bytes` (the
+memory-1 region, 0 = none), `mem1_ready` (live `STATE.MEM1_READY`), `ring_split` (the layout
+of the ring set up now: `single`, `split`, `mem1`, or `none`), `ring_stripe_kb` (its stripe
+in KB, the effective value after the cap at the chunk; 0 unless split),
+`ring_stripe_default` (the default stripe: `chunk` or the KB), `wr_port_stall0/1` and
+`rd_port_wait0/1` (`dp_clk` cycles, the running or
+last run), and the writable `rate_bps` (test
 pattern generator rate, bytes/s) and `tpg_enable`. `fifo_depth` is the ingest FIFO depth in
 beats (256 KB: 8192 × 32 B on the 256-bit targets, 4096 × 64 B on `vck190_fmcp1`;
 `egr_fifo_depth` is 4096 beats on both, 128 KB and 256 KB). The driver version is
@@ -385,6 +567,8 @@ beats (256 KB: 8192 × 32 B on the 256-bit targets, 4096 × 64 B on `vck190_fmcp
 | `play_prefill_ms` | 2000 | playback with the checker: the longest wait for the ring to fill before the sink is enabled (0 = no prefill) |
 | `admin_timeout_ms` | 5000 | admin command timeout |
 | `apst` | 0 | NVMe Autonomous Power State Transitions: 0 = switch them off on every SSD at probe, 1 = leave the drive's setting (read-only at run time: set it in `/etc/modprobe.d/`) |
+| `ring_split` | `auto` | the ring layout of a SET_RING without one (apps `--ring auto`): `auto` = split over both memories when the design can, single for single-SSD runs; `0` = single ring; `1` = split, single-SSD runs too. Writable at run time (`/sys/module/nvrec/parameters/ring_split`) |
+| `stripe_kb` | `auto` | default split-ring stripe: `auto` (or `0`) = the board's (`opsero,ring-stripe-chunk` / `opsero,ring-stripe-kb`, else the whole chunk), `chunk` = the whole chunk, or KB (power of two, 4…4096, capped at the chunk). Writable at run time; `nvrec_info.stripe_shift` reports it (`NVREC_STRIPE_SHIFT_CHUNK` = the whole chunk) |
 
 ## Building the module by hand
 
@@ -394,3 +578,9 @@ make -C sw/nvrec-driver KERNEL_SRC=<kernel build dir>
 
 The Yocto recipe (`meta-nvrec/recipes-kernel/nvrec-mod`) does the same. The module is
 dual-licensed MIT / GPL-2.0.
+
+`make -C sw/nvrec-driver/tests` builds and runs the host unit test of `nvrec_ring.h` on any
+Linux PC: for 64 KB … 4 MB chunks, 1 GB rings, odd slot counts, 4 KB / 64 KB / chunk stripes
+and all three layouts, every page the ring writer stores must land inside the parts the
+driver allocates, and an SSD following PRP1 and the driver's (chained) PRP lists must reach
+exactly the pages of its slot, in order.

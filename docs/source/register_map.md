@@ -39,7 +39,7 @@ which is shared by the kernel driver and the apps. Keep this page, the header an
   | bytes | `BYTES`, `PAD_BYTES`, `CHUNK_SIZE`, `LAST_CHUNK_BYTES` |
   | chunks / slots | `CHUNKS_*`, `CMDS_*`, `RING_FILL`, `RING_HWM`, `NUM_CHUNKS`, `MAX_SLOTS`, `LENGTH_CHUNKS` |
   | `src_clk` ticks | `CHK_UNDERFLOWS` |
-  | `dp_clk` cycles | `TIMESTAMP`, `RING_FULL_CYCLES`, `LAT_*` |
+  | `dp_clk` cycles | `TIMESTAMP`, `RING_FULL_CYCLES`, `LAT_*`, `WR_PORT_STALL*`, `RD_PORT_WAIT*` |
 
   Source and sink rates: `bytes/s = INC / 2^31 × SRC_CLK_HZ × BEAT_BYTES` (`TPG_RATE_INC`,
   `CHK_RATE_INC`); `INC = rate × 2^31 / (SRC_CLK_HZ × BEAT_BYTES)`. At `SRC_CLK_HZ` =
@@ -52,8 +52,8 @@ These offsets and their behaviour are identical to the
 [fpga-drive-recorder register map](https://recorder.fpgadrive.com/register_map.html), so
 code written for a custom data source or sink carries over. Differences:
 
-* `VERSION` reads the **nvrec** register map version (`0x0001_0002` = 1.2, the same
-  numbering as fdrec since the offsets are shared), and the new `ID` register at `0x03C`
+* `VERSION` reads the **nvrec** register map version (`0x0001_0003` = 1.3; 1.2 used the
+  same numbering as fdrec since the offsets are shared), and the new `ID` register at `0x03C`
   reads `0x4E56_5243` ("NVRC").
 * There is no packetizer: `0x040` / `0x044` (`PKT_CTRL`, `PKT_LEN`) are reserved. The ring
   writer frames the data itself. `0x048` / `0x04C` are `ING_BEATS_OUT`: beats the ring
@@ -65,7 +65,7 @@ code written for a custom data source or sink carries over. Differences:
 
 | Offset | Name | Access | Reset | Description |
 |---|---|---|---|---|
-| 0x000 | `VERSION` | RO | `0x0001_0002` | [31:16] major, [15:0] minor (1.2 = `0x0001_0002`) |
+| 0x000 | `VERSION` | RO | `0x0001_0003` | [31:16] major, [15:0] minor (1.3 = `0x0001_0003`) |
 | 0x004 | `SRC_CLK_HZ` | RO | parameter | `src_clk` frequency in Hz |
 | 0x008 | `DP_CLK_HZ` | RO | parameter | `dp_clk` frequency in Hz |
 | 0x00C | `GLOBAL_CTRL` | RW | 0 | bit0 `SOFT_RST` (SC, reads 1 while in progress) |
@@ -94,7 +94,8 @@ code written for a custom data source or sink carries over. Differences:
 ### How a run works
 
 The recording lives in a **ring** of `NUM_CHUNKS` slots of `CHUNK_SIZE` bytes at
-`RING_BASE` in PS DDR. One chunk is one NVMe command. The chunk with run index `c`
+`RING_BASE` in PS DDR, or (map 1.3) split over PS DDR and a second memory, see
+[Split ring](#split-ring). One chunk is one NVMe command. The chunk with run index `c`
 (0, 1, 2, ... from the start of the run) uses ring slot `c % NUM_CHUNKS`. Its **array chunk
 index** is `A = START_CHUNK + c`; it goes to stripe member `m = A % N_MEMBERS` at member LBA
 
@@ -131,8 +132,9 @@ every chunk as completed at START: the ring reader streams chunks `0 .. LENGTH_C
 from slot `c % NUM_CHUNKS` into the egress FIFO and the sink. After a DRY record with
 `LENGTH_CHUNKS` = `NUM_CHUNKS`, a DRY playback with the same `RING_BASE`, `CHUNK_SIZE`,
 `NUM_CHUNKS` and `LENGTH_CHUNKS` reads that recording back from the ring (the
-**ring-resident** test); a longer playback wraps over the same slots and the checker sees
-the sequence restart.
+**ring-resident** test; with a split ring, use the same `SPLIT`, `MEM1`,
+`RING_STRIPE_SHIFT` and `RING_BASE1` as the record); a longer playback wraps over the same
+slots and the checker sees the sequence restart.
 
 The SQE built by the hardware (little-endian dwords):
 
@@ -141,28 +143,72 @@ The SQE built by the hardware (little-endian dwords):
 | DW0 | opcode `0x01` (Write) or `0x02` (Read), FUSE = 0, PSDT = 0 (PRP), CID = slot number (bit 15 = 0) |
 | DW1 | NSID = `MEMBER_NSID[m]` |
 | DW2-DW5 | 0 |
-| DW6-DW7 | PRP1 = `RING_BASE + slot * CHUNK_SIZE` |
-| DW8-DW9 | PRP2: `PRP_LIST_BASE + (slot << PRP_LIST_SHIFT)` if the command spans more than 2 pages, `PRP1 + 4096` if it spans 2 pages, 0 for 1 page |
+| DW6-DW7 | PRP1 = `ADDR(slot * CHUNK_SIZE)` (= `RING_BASE + slot * CHUNK_SIZE` with a single ring) |
+| DW8-DW9 | PRP2: `PRP_LIST_BASE + (slot << PRP_LIST_SHIFT)` if the command spans more than 2 pages, `ADDR(slot * CHUNK_SIZE + 4096)` if it spans 2 pages (`PRP1 + 4096` with a single ring; the other memory with a split ring at `S` = 12), 0 for 1 page |
 | DW10-DW11 | SLBA |
 | DW12 | [15:0] NLB - 1, [30] FUA (`CONFIG.FUA`) |
 | DW13-DW15 | 0 |
 
 Software builds the PRP lists once, because the ring never moves: the list of slot `s`
 (at `PRP_LIST_BASE + (s << PRP_LIST_SHIFT)`) holds the addresses of pages 1 .. P-1 of the
-slot (P = `CHUNK_SIZE` / 4096, memory page size 4 KB). A list of more than 512 entries
+slot, page `p` at `ADDR(s * CHUNK_SIZE + p * 4096)` (P = `CHUNK_SIZE` / 4096, memory page
+size 4 KB; with a split ring every 4 KB page lies in one memory). The lists depend on
+`SPLIT`, `MEM1`, `RING_STRIPE_SHIFT` and both ring bases: rebuild them when one changes.
+The lists themselves stay in PS DDR. A list of more than 512 entries
 chains to a second page (NVMe rule: the last entry of a full list page points to the next
 list page), so 4 MB chunks need `PRP_LIST_SHIFT` = 13.
 
-Command IDs: builder commands use CID = slot (bit 15 = 0); commands from the CPU command
+Command IDs: builder commands use CID = slot (< `MAX_SLOTS`, bit 15 = 0); commands from the CPU command
 injector always have CID bit 15 = 1 (the hardware forces it).
+
+### Split ring
+
+Map 1.3. On `zcu106_hpc0` and `vck190_fmcp1` the engine has a second ring
+AXI4 master (`m_axi1`, `RING_PORTS` = 2) that reaches a second memory: the soldered 2 GB PL
+DDR4 behind a DDR4 controller in the PL (ZCU106, at `0x20_0000_0000`) or the on-board
+LPDDR4 (VCK190, 4 GB behind one LPDDR4 controller at `0x600_0000_0000`). Every byte of a recording crosses the ring
+memory twice (written by the source path, read by the SSD path, or the reverse in
+playback), so a single DDR controller carries twice the stream rate; with
+`CONFIG.SPLIT` = 1 the ring is striped over the two memories and each carries about half.
+Byte `g` of the ring (`g = slot × CHUNK_SIZE + offset`) is at bus address `ADDR(g)`:
+
+| `CONFIG` | `ADDR(g)` | Port |
+|---|---|---|
+| `SPLIT` = 0, `MEM1` = 0 | `RING_BASE + g` (the 1.2 ring) | 0 (`m_axi`) |
+| `SPLIT` = 0, `MEM1` = 1 | `RING_BASE1 + g` (memory 1 only, diagnostics) | 1 (`m_axi1`) |
+| `SPLIT` = 1 | `i = g >> S`, `r = i & 1`: `RING_BASE_r + ((i >> 1) << S) + (g & (2^S - 1))` | `r` |
+
+with `S` = `RING_STRIPE_SHIFT` (12 .. log2(`CHUNK_SIZE`), clamped at START): the ring is cut
+into stripes of 2^`S` bytes that alternate between the memories, and each memory holds its
+stripes back to back. `S` = 12 alternates every 4 KB burst, so both memories carry half of
+the stream at any moment and each SSD reads or writes both memories. `S` =
+log2(`CHUNK_SIZE`) puts whole chunks in alternating memories (slot `s` in memory `s & 1`;
+with a 2-member stripe and an even `START_CHUNK`, SSD `m` then uses memory `m` only), but
+then each memory carries the full stream rate for the length of a chunk. The
+`include/nvrec_regs.h` macros `NVREC_RING_MEM(g, S)`, `NVREC_RING_OFF(g, S)` and
+`NVREC_RING_HALF_BYTES(r, ring_bytes, S)` give the memory, the offset and the bytes each
+memory must provide (half of the ring each when `S` < log2(`CHUNK_SIZE`) or `NUM_CHUNKS`
+is even; memory 0 holds one stripe more otherwise). The writer, the reader and the PRP1 /
+PRP2 of every builder SQE use the same function; the PRP lists, built by software, must too.
+No AXI burst crosses a stripe (bursts never cross 4 KB). Each port keeps the full
+`DATA_WIDTH` at `dp_clk`. The writer sends W data in issue order (head of line, as with
+one port) and retires write responses of both ports strictly in issue order, so a chunk is
+"filled" only when all its bursts on both ports are acknowledged; the reader takes R data
+only from the port of the oldest outstanding burst. `WR_PORT_STALL0/1` and
+`RD_PORT_WAIT0/1` count the cycles each port held the datapath up: compared between the two
+ports and with the run time they tell which memory limits a run (they are not zero in a clean
+run). Memory 1 is mapped for `m_axi1` and the root ports' bridges at the same
+address (the SSDs see both memories), never for the CPUs. `STATE.MEM1_READY` reports that
+it can be used (PL DDR4 calibration done on the ZCU106); software must not set `SPLIT`
+while it is 0. With `RING_PORTS` = 1 (`uzev`) `SPLIT` and `MEM1` are ignored.
 
 ### Control and status
 
 | Offset | Name | Access | Reset | Description |
 |---|---|---|---|---|
 | 0x100 | `CTRL` | W, SC | 0 | bit0 `START`, bit1 `STOP`, bit2 `ABORT`, bit4 `CREDIT_RST` (both SSDs: credits := `CREDIT_INIT`, in-flight counters := 0), bit5 `STATS_RST` (clear the completion statistics and latency), bit6 / bit7 `CREDIT_RST` for SSD 0 / SSD 1 only |
-| 0x104 | `CONFIG` | RW | `0x10` | bit0 `MODE_PLAY` (0 record, 1 playback), bit1 `FUA`, bit2 `DRY` (1.2: fabric-only run, see above), [5:4] `N_MEMBERS` (1 or 2; 0 = 1), bit8 `CREDIT_PER_CQE` (ignore the credit in `M_AXIS` tuser, +1 per CQE). Latched at START |
-| 0x108 | `STATE` | RO | 0 | [3:0] 0 `IDLE`, 1 `RUN`, 2 `DRAIN`, 3 `DONE`, 4 `ABORTING`, 5 `ABORTED`; bit8 writer busy, bit9 reader busy, bit10 ring full now, bit11 injector busy, bit12 `HA_DEAD` (the Host Accelerator register interface stopped answering, see [below](#host-accelerator-timeout-guard); sticky until the bitstream is reloaded) |
+| 0x104 | `CONFIG` | RW | `0x10` | bit0 `MODE_PLAY` (0 record, 1 playback), bit1 `FUA`, bit2 `DRY` (1.2: fabric-only run, see above), bit3 `SPLIT` (1.3: ring striped over `RING_BASE` / `RING_BASE1`, see [Split ring](#split-ring)), [5:4] `N_MEMBERS` (1 or 2; 0 = 1), bit6 `MEM1` (1.3: with `SPLIT` = 0, the single ring is at `RING_BASE1` in memory 1), bit8 `CREDIT_PER_CQE` (ignore the credit in `M_AXIS` tuser, +1 per CQE). Latched at START; `SPLIT` / `MEM1` are ignored when `RING_PORTS` = 1 |
+| 0x108 | `STATE` | RO | 0 | [3:0] 0 `IDLE`, 1 `RUN`, 2 `DRAIN`, 3 `DONE`, 4 `ABORTING`, 5 `ABORTED`; bit8 writer busy, bit9 reader busy, bit10 ring full now, bit11 injector busy, bit12 `HA_DEAD` (the Host Accelerator register interface stopped answering, see [below](#host-accelerator-timeout-guard); sticky until the bitstream is reloaded), bit13 `MEM1_READY` (1.3: memory 1 of the split ring is usable: PL DDR4 calibration done on `zcu106_hpc0`, always 1 on `vck190_fmcp1`, 0 when `RING_PORTS` = 1; reads `0x2000` when idle on the split-ring designs) |
 | 0x10C | `IRQ_STATUS` | W1C | 0 | bit0 `DONE`, bit1 `CMD_ERROR`, bit2 `OVERFLOW` (ingest drop while the run accepted data), bit3 `INJ_CQE` (level: injector CQE FIFO not empty, not W1C), bit4 `UNEXPECTED_CQE`, bit5 `ABORTED`, bit6 `HA_DEAD` (set when `STATE.HA_DEAD` goes to 1, and again after a `SOFT_RST` while it is 1) |
 | 0x110 | `IRQ_ENABLE` | RW | 0 | same bits; the `irq` output is `|(IRQ_STATUS & IRQ_ENABLE)` (level, active high) |
 | 0x118/0x11C | `TIMESTAMP` | RO | 0 | free-running `dp_clk` cycle counter (64-bit) |
@@ -187,7 +233,7 @@ injector always have CID bit 15 = 1 (the hardware forces it).
 
 | Offset | Name | Access | Reset | Description |
 |---|---|---|---|---|
-| 0x120/0x124 | `RING_BASE` | RW | 0 | ring address in PS DDR (64-bit, 4 KB aligned) |
+| 0x120/0x124 | `RING_BASE` | RW | 0 | ring address in PS DDR (memory 0, 64-bit, 4 KB aligned) |
 | 0x128 | `NUM_CHUNKS` | RW | 256 | slots in the ring, 1 .. `MAX_SLOTS` |
 | 0x12C | `CHUNK_SIZE` | RW | `0x0010_0000` | bytes per chunk, power of 2, 64 KB .. 4 MB; must not exceed the SSD's MDTS |
 | 0x130/0x134 | `PRP_LIST_BASE` | RW | 0 | PRP list table (64-bit, 4 KB aligned) |
@@ -196,8 +242,11 @@ injector always have CID bit 15 = 1 (the hardware forces it).
 | 0x140/0x144 | `START_CHUNK` | RW | 0 | array chunk index of the first chunk of the run (64-bit) |
 | 0x148 | `LENGTH_CHUNKS` | RW | 0 | chunks to record (0 = until STOP) or to play |
 | 0x14C | `LAST_CHUNK_BYTES` | RW | 0 | playback: bytes in the last chunk (0 = full), multiple of the LBA size |
-| 0x150 | `MAX_SLOTS` | RO | parameter | slot table size = 2^`SLOT_W` (2048 on the 1.2 reference designs; 1024 before) |
+| 0x150 | `MAX_SLOTS` | RO | parameter | slot table size = 2^`SLOT_W` (4096 on the 1.3 reference designs; 2048 on 1.2, 1024 before) |
 | 0x154 | `CREDIT_INIT` | RW | 63 | initial credit per SSD (number of HW SQs x (depth - 1)) |
+| 0x158/0x15C | `RING_BASE1` | RW | 0 | 1.3: ring address in memory 1 (64-bit, 4 KB aligned), used with `CONFIG.SPLIT` or `CONFIG.MEM1` |
+| 0x160 | `RING_STRIPE_SHIFT` | RW | 12 | 1.3: log2 of the split-ring stripe in bytes; clamped at START to 12 .. log2(`CHUNK_SIZE`) (reads back the value written) |
+| 0x164 | `RING_PORTS` | RO | parameter | 1.3: ring AXI4 masters (`N_RING_PORTS`): 2 on `zcu106_hpc0` and `vck190_fmcp1` (split ring available), 1 on `uzev`; reads 0 on earlier maps (= 1) |
 
 ### Stripe members (m = 0, 1; latched at START)
 
@@ -249,6 +298,19 @@ bit 4). Every CQE returns credit (`M_AXIS` tuser[15:5], or +1 per CQE with
 | 0x248/0x24C | `RING_FULL_CYCLES` | `dp_clk` cycles the writer waited for a free slot |
 | 0x250/0x254 | `RUN_DROP_COUNT` | ingest drops (beats) while the record run was accepting data (START until STOP seen / `LENGTH_CHUNKS` reached / ABORT); taken from the ingest snapshot, so drops in the last ~0.5 us may be missed |
 | 0x258 | `RUN_FIFO_HWM` | ingest FIFO high-water mark (beats) while the record run was accepting data (same window as `RUN_DROP_COUNT`); the figure to report for a recording |
+
+### Ring port counters (map 1.3; cleared by START and `SOFT_RST`)
+
+32-bit `dp_clk` cycle counters that **saturate** at `0xFFFF_FFFF` (17 s at 250 MHz); port 1
+reads 0 with `RING_PORTS` = 1. Every memory makes the datapath wait a little, so the counters
+are not zero in a clean run (on `zcu106_hpc0` `WR_PORT_STALL1` grows by about 4 cycles per 4 KB
+burst written to the PL DDR4 at any rate); see
+[Kernel driver](driver.md#split-ring-one-ring-in-two-memories) for how to read them.
+
+| Offset | Name | Description |
+|---|---|---|
+| 0x260 / 0x264 | `WR_PORT_STALL0` / `WR_PORT_STALL1` | record: cycles the ring writer's head W beat (data ready) waited for `WREADY` of port 0 / 1 |
+| 0x268 / 0x26C | `RD_PORT_WAIT0` / `RD_PORT_WAIT1` | playback: cycles the ring reader waited for read data of port 0 / 1 (the oldest outstanding burst is on that port and its `RVALID` is low) while the egress FIFO had room |
 
 ### Completion latency (builder commands, `dp_clk` cycles from SQE accepted to CQE)
 
@@ -406,3 +468,10 @@ them only during bring-up, error interrupts and explicit debug requests (sysfs
   `MAX_SLOTS` 2048. Same offsets and numbering as fdrec 1.2. Recordings made on a 1.1
   bitstream (16-byte beats) stay valid: the byte stream of the test pattern is the same
   at every width.
+* 1.3 (2026-10-23, backwards compatible: with `SPLIT` = `MEM1` = 0 the engine behaves
+  exactly as 1.2): split ring over two memories with a second ring AXI4 master
+  (`RING_PORTS` 0x164); `CONFIG.SPLIT` (bit 3) and `CONFIG.MEM1` (bit 6); `RING_BASE1`
+  (0x158/0x15C); `RING_STRIPE_SHIFT` (0x160); `STATE.MEM1_READY` (bit 13);
+  `WR_PORT_STALL0/1` (0x260/0x264) and `RD_PORT_WAIT0/1` (0x268/0x26C); PRP1 / PRP2 through
+  the ring address function; `MAX_SLOTS` 4096. File format and recordings unchanged (the
+  ring layout is not part of a recording).

@@ -1,0 +1,194 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# nvrec-mps -- PCIe MaxPayload of the nvrec SSDs and of their root ports.
+#
+#   nvrec-mps status            MaxPayload / MaxReadReq of every SSD the nvrec
+#                               driver owns and of its root port, with the
+#                               largest each supports
+#   nvrec-mps 128|256|512       set MaxPayload on them (root ports first when
+#                               raising, SSDs first when lowering); MaxReadReq
+#                               is not touched (512 bytes); idempotent
+#   nvrec-mps boot              what nvrec-pcie-mps.service runs at boot:
+#                               NVREC_MPS from /etc/default/nvrec-mps (128 =
+#                               leave the kernel's setting), after the driver
+#                               has claimed the SSDs (waits up to
+#                               NVREC_MPS_WAIT s, default 30)
+#
+# Options (before the command): --all = every NVMe function, not only the
+# ones nvrec-nvme owns; --force = set even while a recording or playback is
+# running or block I/O is in flight (default: refuse).
+#
+# MaxPayload is the largest TLP payload a function sends; the root port and
+# the SSD on a link must use the same value, and it may not exceed what
+# either supports (Device Capabilities). Linux sets 128 bytes at enumeration
+# on these boards. 256 bytes lifts the SSDs' read and write rates on the
+# reference designs (docs/source/benchmarks.md, "MaxPayload 256"); it is set
+# here, after boot, rather than by the kernel's pci=pcie_bus_perf (which
+# would also lower MaxReadReq to the MaxPayload and pick the largest value
+# both ends support, not the measured one) or by the driver (a policy that
+# belongs to the board, visible and reversible here).
+#
+# Exit codes: 0 = done (or nothing to do), 1 = error / refused, 2 = usage.
+
+set -u
+
+SYS_BLOCK=${NVREC_MPS_SYS_BLOCK:-/sys/block}
+SYS_PCI=${NVREC_MPS_SYS_PCI:-/sys/bus/pci/devices}
+SYS_NVREC=${NVREC_MPS_SYS_NVREC:-/sys/class/misc/nvrec}
+SETPCI=${NVREC_MPS_SETPCI:-setpci}
+DEFAULTS=${NVREC_MPS_DEFAULTS:-/etc/default/nvrec-mps}
+KMSG=${NVREC_MPS_KMSG:-/dev/kmsg}
+
+ALL=0
+FORCE=0
+BOOT=0
+
+usage() {
+    sed -n '4,22p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+log() {
+    echo "nvrec-mps: $*"
+    # at boot also into the kernel log, next to the driver's lines
+    if [ "$BOOT" = 1 ] && [ -w "$KMSG" ]; then echo "nvrec-mps: $*" >"$KMSG" 2>/dev/null; fi
+    return 0
+}
+die() { log "$*"; exit 1; }
+
+# NVMe functions (class 0x010802) the command works on: those bound to
+# nvrec-nvme (the design's SSDs), or all with --all
+ssds() {
+    local d drv
+    for d in "$SYS_PCI"/*; do
+        [ -e "$d/class" ] || continue
+        [ "$(cat "$d/class")" = 0x010802 ] || continue
+        if [ "$ALL" = 0 ]; then
+            drv=$(basename "$(readlink -f "$d/driver" 2>/dev/null)" 2>/dev/null)
+            [ "$drv" = nvrec-nvme ] || continue
+        fi
+        basename "$d"
+    done
+}
+# the function's upstream port (the root port on these boards)
+port_of() { basename "$(dirname "$(readlink -f "$SYS_PCI/$1")")"; }
+
+# Device Control (PCIe capability + 8) and Device Capabilities (+ 4)
+devctl() { "$SETPCI" -s "$1" CAP_EXP+8.w 2>/dev/null; }
+devcap() { "$SETPCI" -s "$1" CAP_EXP+4.l 2>/dev/null; }
+mps_of() { local v; v=$(devctl "$1") && [ -n "$v" ] && echo $(( 128 << ((0x$v >> 5) & 7) )); }
+mrrs_of() { local v; v=$(devctl "$1") && [ -n "$v" ] && echo $(( 128 << ((0x$v >> 12) & 7) )); }
+mpss_of() { local v; v=$(devcap "$1") && [ -n "$v" ] && echo $(( 128 << (0x$v & 7) )); }
+enc() { case "$1" in 128) echo 0 ;; 256) echo 1 ;; 512) echo 2 ;; *) echo x ;; esac; }
+
+show() { # <bdf> <role>
+    echo "  $1  $2: MaxPayload $(mps_of "$1" || echo ?) (supports $(mpss_of "$1" || echo ?)), MaxReadReq $(mrrs_of "$1" || echo ?)"
+}
+
+status() {
+    local s n=0
+    for s in $(ssds); do
+        n=$((n + 1))
+        show "$s" "SSD      "
+        show "$(port_of "$s")" "root port"
+    done
+    [ "$n" -gt 0 ] || { log "no SSD$([ "$ALL" = 0 ] && echo " bound to nvrec-nvme") found"; return 1; }
+}
+
+# a recording/playback running, or block I/O in flight on an nvrec disk
+busy() {
+    local st f
+    st=$(cat "$SYS_NVREC/state" 2>/dev/null)
+    case "$st" in 1|2) echo "a recording or playback is running"; return 0 ;; esac
+    for f in "$SYS_BLOCK"/nvrec*n1/inflight; do
+        [ -e "$f" ] || continue
+        set -- $(cat "$f")
+        if [ "${1:-0}" != 0 ] || [ "${2:-0}" != 0 ]; then echo "I/O in flight on $(basename "$(dirname "$f")")"; return 0; fi
+    done
+    return 1
+}
+
+setone() { # <bdf> <bytes> <role>
+    local b=$1 want=$2 cur new
+    cur=$(mps_of "$b") || { log "$b: cannot read Device Control (run as root)"; return 1; }
+    if [ "$cur" = "$want" ]; then
+        log "$3 $b: MaxPayload $cur (unchanged)"
+        return 0
+    fi
+    "$SETPCI" -s "$b" CAP_EXP+8.w="$(printf '%04x' $(( $(enc "$want") << 5 )))":00e0 || { log "$3 $b: setpci failed"; return 1; }
+    new=$(mps_of "$b")
+    log "$3 $b: MaxPayload $cur -> $new (MaxReadReq $(mrrs_of "$b") unchanged)"
+    [ "$new" = "$want" ]
+}
+
+setmps() { # <bytes>
+    local want=$1 s p list="" why rc=0 m
+    [ "$(enc "$want")" != x ] || { echo "nvrec-mps: MaxPayload must be 128, 256 or 512" >&2; exit 2; }
+    for s in $(ssds); do list="$list $s"; done
+    [ -n "$list" ] || die "no SSD$([ "$ALL" = 0 ] && echo " bound to nvrec-nvme") found: nothing to set"
+    if [ "$FORCE" = 0 ] && why=$(busy); then
+        die "refusing while $why (--force to override)"
+    fi
+    # every function on the way must support it
+    for s in $list; do
+        for p in "$s" "$(port_of "$s")"; do
+            m=$(mpss_of "$p") || die "$p: cannot read Device Capabilities (run as root)"
+            [ "$m" -ge "$want" ] || die "$p supports MaxPayload $m only: not setting $want"
+        done
+    done
+    for s in $list; do
+        p=$(port_of "$s")
+        if [ "$want" -gt "$(mps_of "$s")" ]; then
+            setone "$p" "$want" "root port" || rc=1     # raising: the port first
+            setone "$s" "$want" "SSD      " || rc=1
+        else
+            setone "$s" "$want" "SSD      " || rc=1     # lowering: the SSD first
+            setone "$p" "$want" "root port" || rc=1
+        fi
+    done
+    return $rc
+}
+
+boot() {
+    local want=128 wait=${NVREC_MPS_WAIT:-30} i n d unbound
+    BOOT=1
+    # shellcheck disable=SC1090
+    [ -r "$DEFAULTS" ] && . "$DEFAULTS"
+    want=${NVREC_MPS:-128}
+    if [ "$want" = 128 ]; then
+        log "NVREC_MPS 128: the kernel's MaxPayload is kept"
+        return 0
+    fi
+    # wait for the driver and for every NVMe function to be claimed
+    for ((i = 0; i < wait * 2; i++)); do
+        n=0; unbound=0
+        for d in "$SYS_PCI"/*; do
+            [ -e "$d/class" ] && [ "$(cat "$d/class")" = 0x010802 ] || continue
+            n=$((n + 1))
+            [ -e "$d/driver" ] || unbound=1
+        done
+        [ -e "$SYS_NVREC" ] && [ "$n" -gt 0 ] && [ "$unbound" = 0 ] && break
+        sleep 0.5
+    done
+    if [ -z "$(ssds)" ]; then
+        log "NVREC_MPS $want: no SSD bound to nvrec-nvme after ${wait} s: nothing set"
+        return 0
+    fi
+    log "NVREC_MPS $want ($DEFAULTS): setting it on the nvrec SSDs and their root ports"
+    setmps "$want"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --all) ALL=1; shift ;;
+        --force) FORCE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        status) shift; status; exit $? ;;
+        boot) shift; boot; exit $? ;;
+        128|256|512) setmps "$1"; rc=$?; status; exit $rc ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+usage >&2
+exit 2

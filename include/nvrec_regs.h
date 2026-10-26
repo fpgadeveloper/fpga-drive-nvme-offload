@@ -71,6 +71,16 @@
  *       FIFO depth/level/HWM in fabric beats of BEAT_BYTES; BYTES (0x220) =
  *       beats << BEAT_SHIFT in record; CONFIG bit 2 DRY (fabric-only run, no
  *       NVMe command); MAX_SLOTS 2048 on the reference designs.
+ *   1.3 (2026-10-23, backwards compatible with RING_PORTS = 1 / SPLIT = 0):
+ *       split ring ("one ring per SSD in two memories"): a second ring AXI4
+ *       master (RING_PORTS 0x164, RO: 2 on vck190_fmcp1 and zcu106_hpc0, 1 on
+ *       uzev); CONFIG bit 3 SPLIT (ring striped over memory 0 at RING_BASE and
+ *       memory 1 at RING_BASE1 in units of 2^RING_STRIPE_SHIFT bytes) and
+ *       bit 6 MEM1 (single ring in memory 1, diagnostics); RING_BASE1
+ *       (0x158/0x15C); RING_STRIPE_SHIFT (0x160); STATE bit 13 MEM1_READY;
+ *       WR_PORT_STALL0/1 (0x260/0x264) and RD_PORT_WAIT0/1 (0x268/0x26C);
+ *       MAX_SLOTS 4096 (SLOT_W 12) on the reference designs. With SPLIT =
+ *       MEM1 = 0 the engine behaves exactly as 1.2.
  */
 
 #ifndef NVREC_REGS_H
@@ -86,6 +96,22 @@
 #define NVREC_NVMEHA_LITE_BASE_ZYNQMP   0x420020000ULL  /* nvmeha S_AXI_LITE (behind the 1.1 timeout guard), 64 KB */
 #define NVREC_PCIE0_BAR_WIN_ZYNQMP      0xA0000000ULL   /* xdma_0 BAR window (SSD1), 256 MB */
 #define NVREC_PCIE1_BAR_WIN_ZYNQMP      0xB0000000ULL   /* xdma_1 BAR window (SSD2), 256 MB */
+
+/*
+ * Memory 1 of the split ring (1.3; see "Split ring" below). It is mapped for
+ * the ring master nvrec_core/m_axi1 and for the PCIe root ports' bridges (the
+ * SSDs) ONLY: the CPUs have no path to it and Linux never sees it as RAM.
+ *   zcu106_hpc0 : the soldered 2 GB PL DDR4 behind a DDR4 controller in the
+ *                 PL (calibration -> STATE.MEM1_READY)
+ *   vck190_fmcp1: the on-board LPDDR4 (4 GB of it behind one NoC DDRMC, both
+ *                 x32 channels interleaved); the reference
+ *                 image reserves the first 1 GB for ring B (device tree)
+ *   uzev        : none (RING_PORTS = 1)
+ */
+#define NVREC_MEM1_BASE_ZCU106          0x2000000000ULL /* PL DDR4, 2 GB */
+#define NVREC_MEM1_SIZE_ZCU106          0x80000000ULL
+#define NVREC_MEM1_BASE_VCK190          0x60000000000ULL /* LPDDR4 (NoC DDR_CH2), 4 GB */
+#define NVREC_MEM1_SIZE_VCK190          0x100000000ULL
 
 /*
  * Queue window: the nvmeha S_AXI_SSD slave as the SSDs see it (PCIe bus
@@ -139,7 +165,8 @@
 #define NVREC_VERSION_1_0               0x00010000u
 #define NVREC_VERSION_1_1               0x00010001u
 #define NVREC_VERSION_1_2               0x00010002u   /* 1.2: + BEAT_BYTES (DATA_WIDTH), DRY */
-#define NVREC_VERSION_EXPECTED          NVREC_VERSION_1_2
+#define NVREC_VERSION_1_3               0x00010003u   /* 1.3: + split ring (RING_PORTS, SPLIT, ...) */
+#define NVREC_VERSION_EXPECTED          NVREC_VERSION_1_3
 #define NVREC_VERSION_MAJOR_SHIFT       16
 #define NVREC_VERSION_MAJOR_MASK        0xFFFF0000u
 #define NVREC_VERSION_MINOR_MASK        0x0000FFFFu
@@ -250,32 +277,81 @@
  * NVMe offload engine (nvrec_wr ring writer, nvrec_cmd command builder,
  * nvrec_cq completion router, nvrec_rd ring reader, nvrec_inj injector)
  *
- * Model: a ring of NUM_CHUNKS slots of CHUNK_SIZE bytes at RING_BASE in PS
- * DDR. One chunk = one NVMe command. Array chunk index A = START_CHUNK + c
- * (c = 0, 1, ... counted from the start of the run) is stored in ring slot
- * c % NUM_CHUNKS and goes to stripe member m = A % N_MEMBERS at member LBA
+ * Model: a ring of NUM_CHUNKS slots of CHUNK_SIZE bytes. One chunk = one
+ * NVMe command. Array chunk index A = START_CHUNK + c (c = 0, 1, ... counted
+ * from the start of the run) is stored in ring slot c % NUM_CHUNKS and goes
+ * to stripe member m = A % N_MEMBERS at member LBA
  *     MEMBER_BASE_LBA[m] + (A / N_MEMBERS) * (CHUNK_SIZE >> LBA_SHIFT)
  * which is the Linux md RAID0 layout with md chunk size = CHUNK_SIZE
  * (MEMBER_BASE_LBA = md data offset of the member + any partition offset).
+ *
+ * Ring addresses (1.3). Byte g of the ring, g = slot * CHUNK_SIZE + offset
+ * (0 <= g < NUM_CHUNKS * CHUNK_SIZE), is stored at bus address ADDR(g):
+ *   CONFIG.SPLIT = 0, MEM1 = 0 : ADDR(g) = RING_BASE + g    memory 0, as 1.2
+ *   CONFIG.SPLIT = 0, MEM1 = 1 : ADDR(g) = RING_BASE1 + g   memory 1 only
+ *   CONFIG.SPLIT = 1           : split ring, S = RING_STRIPE_SHIFT:
+ *       i = g >> S                      stripe index
+ *       r = i & 1                       memory (0: RING_BASE, 1: RING_BASE1)
+ *       ADDR(g) = RING_BASE_r + ((i >> 1) << S) + (g & (2^S - 1))
+ *     i.e. the ring is cut into stripes of 2^S bytes that alternate between
+ *     the two memories; each memory holds its stripes back to back
+ *     (NVREC_RING_MEM() / NVREC_RING_OFF() below). S = 12 alternates every
+ *     4 KB burst (both memories carry half of the stream at any time);
+ *     S = log2(CHUNK_SIZE) puts whole chunks in alternating memories (slot s
+ *     in memory s & 1).
+ * Memory r must hold NVREC_RING_HALF_BYTES(r, NUM_CHUNKS * CHUNK_SIZE, S)
+ * bytes: exactly half of the ring each when S < log2(CHUNK_SIZE) or
+ * NUM_CHUNKS is even; memory 0 holds one stripe more otherwise.
+ * Chunk-sized stripes and the stripe members (S = log2(CHUNK_SIZE), split):
+ * chunk c of the run lies in slot c % NUM_CHUNKS, i.e. in memory
+ * (c % NUM_CHUNKS) & 1, and goes to member (START_CHUNK + c) % N_MEMBERS.
+ * With 2 members and an EVEN NUM_CHUNKS, memory = c & 1 for every c, so each
+ * member's commands touch ONE memory for the whole run: member m <-> memory m
+ * for an even START_CHUNK, member m <-> memory 1 - m for an odd one (each SSD
+ * still writes / reads a single memory; NVMe data then never alternates
+ * between memories inside a command). With an ODD NUM_CHUNKS, slot
+ * NUM_CHUNKS - 1 and slot 0 are both in memory 0, so the pairing flips at
+ * every ring wrap and every SSD uses both memories: software must use an even
+ * NUM_CHUNKS with chunk-sized split stripes.
+ * Memory 0 is reached through ring port 0 (nvrec_core/m_axi), memory 1
+ * through ring port 1 (m_axi1). The SSDs see both memories at the same bus
+ * addresses as the ring ports. With RING_PORTS = 1, SPLIT and MEM1 are
+ * ignored (ADDR(g) = RING_BASE + g). Every 4 KB page lies in one memory
+ * (S >= 12), and no AXI burst crosses a stripe.
  *
  * SQE built by hardware (64 bytes, little-endian dwords):
  *   DW0  opcode (0x01 Write / 0x02 Read), FUSE=0, PSDT=0 (PRP), CID = slot
  *   DW1  NSID = MEMBER_NSID[m]
  *   DW2-5 0
- *   DW6-7 PRP1 = RING_BASE + slot * CHUNK_SIZE
+ *   DW6-7 PRP1 = ADDR(slot * CHUNK_SIZE)          (1.2: RING_BASE + slot * CHUNK_SIZE)
  *   DW8-9 PRP2 = PRP_LIST_BASE + (slot << PRP_LIST_SHIFT)   (chunk > 2 pages)
- *              = PRP1 + 4096                                  (chunk == 2 pages)
+ *              = ADDR(slot * CHUNK_SIZE + 4096)              (chunk == 2 pages; 1.2: PRP1 + 4096)
  *              = 0                                            (chunk == 1 page)
  *   DW10-11 SLBA, DW12 NLB-1 [15:0] | FUA [30] (CONFIG.FUA), DW13-15 0
  * Software builds the PRP lists once (the ring is static): for slot s the
  * list at PRP_LIST_BASE + (s << PRP_LIST_SHIFT) holds the addresses of pages
- * 1..P-1 of the slot (P = CHUNK_SIZE / 4096; 4 KB memory page size, CC.MPS=0);
- * a list longer than 512 entries chains (last entry of a list page points to
- * the next page), so use PRP_LIST_SHIFT = 13 for 4 MB chunks.
+ * 1..P-1 of the slot, page p at ADDR(s * CHUNK_SIZE + p * 4096) (P =
+ * CHUNK_SIZE / 4096; 4 KB memory page size, CC.MPS=0); a list longer than
+ * 512 entries chains (last entry of a list page points to the next page), so
+ * use PRP_LIST_SHIFT = 13 for 4 MB chunks. The lists depend on SPLIT / MEM1 /
+ * RING_STRIPE_SHIFT / both bases: rebuild them when any of these changes.
+ * The PRP lists themselves stay in memory 0's address space (PS DDR).
  *
- * CID space: bit 15 = 0 for builder commands (CID[9:0] = slot), bit 15 = 1
- * for injector commands (the hardware forces bit 15 of an injected SQE to 1).
+ * CID space: bit 15 = 0 for builder commands (CID[14:0] = slot < MAX_SLOTS),
+ * bit 15 = 1 for injector commands (the hardware forces bit 15 of an
+ * injected SQE to 1).
  * ========================================================================= */
+
+/* Split-ring address function (CONFIG.SPLIT = 1), g = ring byte, s = stripe
+ * shift as latched (12 .. log2(CHUNK_SIZE)); 64-bit arithmetic:
+ *   NVREC_RING_MEM(g, s) : memory of byte g (0 = RING_BASE, 1 = RING_BASE1)
+ *   NVREC_RING_OFF(g, s) : offset of byte g from that memory's ring base
+ *   NVREC_RING_HALF_BYTES(r, ring_bytes, s): bytes of the ring in memory r */
+#define NVREC_RING_MEM(g, s)            ((unsigned int)(((g) >> (s)) & 1u))
+#define NVREC_RING_OFF(g, s)            ((((g) >> 1) & ~((1ULL << (s)) - 1)) | \
+                                         ((g) & ((1ULL << (s)) - 1)))
+#define NVREC_RING_HALF_BYTES(r, ring_bytes, s) \
+        (((((ring_bytes) >> (s)) + 1 - (r)) >> 1) << (s))
 
 /* 0x100 CTRL (W, SC; reads 0) */
 #define NVREC_CTRL                      0x100
@@ -322,7 +398,8 @@
  *             chunks 0 .. LENGTH_CHUNKS-1 from slot c % NUM_CHUNKS into the
  *             egress FIFO / sink. After a DRY record with LENGTH_CHUNKS =
  *             NUM_CHUNKS, a DRY playback with the same RING_BASE / CHUNK_SIZE /
- *             NUM_CHUNKS and LENGTH_CHUNKS = NUM_CHUNKS reads that recording
+ *             NUM_CHUNKS (and, 1.3, the same SPLIT / MEM1 / RING_STRIPE_SHIFT /
+ *             RING_BASE1) and LENGTH_CHUNKS = NUM_CHUNKS reads that recording
  *             back from the ring = ring-resident test.
  *             LENGTH_CHUNKS > NUM_CHUNKS wraps over the same slots (the
  *             checker then sees the sequence restart).
@@ -330,8 +407,22 @@
  *   filled (at most 2); playback = 0.
  */
 #define NVREC_CONFIG_DRY                (1u << 2)
+/*
+ * SPLIT (1.3): the ring is striped over memory 0 (RING_BASE, ring port 0) and
+ * memory 1 (RING_BASE1, ring port 1) in stripes of 2^RING_STRIPE_SHIFT bytes
+ * (address function: "Ring addresses" above). Writer, reader and the PRP1 /
+ * PRP2 of every builder SQE use it; DRY works the same (a DRY playback must
+ * use the same SPLIT / RING_STRIPE_SHIFT / bases as the DRY record).
+ * Ignored when RING_PORTS = 1. Software must not set it while
+ * STATE.MEM1_READY = 0.
+ * MEM1 (1.3, diagnostics): with SPLIT = 0, the single ring is at RING_BASE1
+ * in memory 1 (ring port 1) instead of RING_BASE: measures memory 1 alone.
+ * Ignored when SPLIT = 1 or RING_PORTS = 1.
+ */
+#define NVREC_CONFIG_SPLIT              (1u << 3)
 #define NVREC_CONFIG_N_MEMBERS_SHIFT    4           /* [5:4] stripe members: 1 or 2 (0 = 1) */
 #define NVREC_CONFIG_N_MEMBERS_MASK     (3u << 4)
+#define NVREC_CONFIG_MEM1               (1u << 6)
 #define NVREC_CONFIG_CREDIT_PER_CQE     (1u << 8)   /* 1 = ignore M_AXIS tuser credit, +1 per CQE */
 #define NVREC_CONFIG_RESET              0x00000010u /* 1 member, record */
 
@@ -352,6 +443,12 @@
                                                        interface stopped answering (evaluation
                                                        license expired); sticky until the
                                                        bitstream is reloaded */
+/* 1.3: memory 1 of the split ring is usable: the PL DDR4 controller has
+ * finished calibration (zcu106_hpc0; 0 = calibration running or failed),
+ * constant 1 on vck190_fmcp1 (the LPDDR4 controllers are calibrated by the
+ * platform loader before the PL runs), 0 when RING_PORTS = 1. (Bit 12 is
+ * HA_DEAD since 1.1, so MEM1_READY is bit 13.) */
+#define NVREC_STATE_MEM1_READY          (1u << 13)
 
 /* 0x10C IRQ_STATUS (W1C except INJ_CQE which is a level) */
 #define NVREC_IRQ_STATUS                0x10C
@@ -385,9 +482,23 @@
 #define NVREC_LAST_CHUNK_BYTES          0x14C   /* playback: bytes of the last chunk, 0 = full;
                                                    multiple of the LBA size */
 #define NVREC_MAX_SLOTS                 0x150   /* RO: slot table size = 2^SLOT_W (RTL
-                                                   parameter; 2048 on the 1.2 reference
-                                                   designs, 1024 before) */
+                                                   parameter; 4096 on the 1.3 reference
+                                                   designs, 2048 on 1.2, 1024 before) */
 #define NVREC_CREDIT_INIT               0x154   /* RW: initial credits per SSD, reset 63 */
+/* 1.3: second memory of the split ring (CONFIG.SPLIT / MEM1), 4 KB aligned
+ * ([11:0] ignored), reset 0 */
+#define NVREC_RING_BASE1_LO             0x158
+#define NVREC_RING_BASE1_HI             0x15C
+/* 1.3: RING_STRIPE_SHIFT (RW, latched at START): log2 of the split-ring
+ * stripe in bytes; reset 12 (4 KB). Clamped at START to 12 .. log2(CHUNK_SIZE)
+ * (the register reads back the value written). Only used with SPLIT = 1. */
+#define NVREC_RING_STRIPE_SHIFT         0x160
+#define NVREC_RING_STRIPE_SHIFT_MIN     12
+#define NVREC_RING_STRIPE_SHIFT_RESET   12
+/* 1.3: RING_PORTS (RO): number of ring AXI4 masters (RTL parameter
+ * N_RING_PORTS): 2 = split ring available, 1 = single ring only. Reads 0 on
+ * register maps before 1.3: treat 0 as 1. */
+#define NVREC_RING_PORTS                0x164
 
 /* ---- Stripe members m = 0, 1 (RW, latched at START) -------------------- */
 #define NVREC_MEMBER_BASE(m)            (0x180 + (m) * 0x20)
@@ -456,6 +567,22 @@
  * was accepting data; cleared at START / SOFT_RST. ING_FIFO_HWM also sees the
  * FIFO fill up after the run when the source keeps running. */
 #define NVREC_RUN_FIFO_HWM              0x258
+/* 1.3: per ring port p = 0, 1 (32 bits, dp_clk cycles, cleared at START and
+ * SOFT_RST, SATURATE at 0xFFFF_FFFF = 17 s at 250 MHz; 0 when RING_PORTS = 1
+ * for p = 1). They tell which memory limits a run:
+ *   WR_PORT_STALL(p): cycles the ring writer's head W beat (data ready) waited
+ *                     for WREADY of port p (record)
+ *   RD_PORT_WAIT(p) : cycles the ring reader waited for read data of port p
+ *                     (the oldest outstanding burst is on port p and none of
+ *                     its data has arrived; the reader keeps fetching from the
+ *                     other port into its skid FIFO meanwhile)
+ *                     while the egress FIFO had room (playback) */
+#define NVREC_WR_PORT_STALL(p)          (0x260 + (p) * 4)
+#define NVREC_WR_PORT_STALL0            0x260
+#define NVREC_WR_PORT_STALL1            0x264
+#define NVREC_RD_PORT_WAIT(p)           (0x268 + (p) * 4)
+#define NVREC_RD_PORT_WAIT0             0x268
+#define NVREC_RD_PORT_WAIT1             0x26C
 
 /* ---- Completion latency of builder commands (dp_clk cycles, submit->CQE) */
 #define NVREC_LAT_MIN                   0x280   /* 0xFFFF_FFFF if no sample */

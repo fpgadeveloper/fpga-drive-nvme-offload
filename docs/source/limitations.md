@@ -71,12 +71,21 @@ limit. With a purchased license none of this applies.
   drive's maximum transfer size if that is smaller (512 KB on the Samsung 980 PRO). The
   hardware does not split a chunk into several commands. With two SSDs the md RAID0 chunk
   must equal the recording chunk (`nvsetup-raid0.sh` takes care of it).
-* **Ring size.** The ring has at most 2048 chunks (the hardware slot table) and 1 GB, and it
-  and its PRP lists (4 KB per slot) must fit in the CMA pool that the image reserves (1 GB on
-  `uzev`, 1.5 GB on `zcu106_hpc0` and `vck190_fmcp1`, `NVREC_CMA`). The default is 512 MB
-  whatever the chunk (2048 × 256 KB, 1024 × 512 KB, 512 × 1 MB); a 1 GB ring
-  (1024 × 1 MB) needs 1028 MB and does not fit the 1 GB pool of `uzev`. At 8 GB/s the
-  default ring covers 64 ms of SSD stall.
+* **Ring size.** The ring has at most 4096 chunks (the hardware slot table) and 1 GB in each
+  memory: a single ring up to 1 GB, a split ring (`zcu106_hpc0`, `vck190_fmcp1`) up to 2 GB.
+  Its PS DDR part and the PRP lists (4 KB per slot) must fit in the CMA pool that the image
+  reserves (1 GB on `uzev`, 1.5 GB on `zcu106_hpc0` and `vck190_fmcp1`, `NVREC_CMA`), its
+  second-memory part in the 1 GB region the device tree reserves there. The default is 512 MB
+  for a single ring and 1 GB for a split ring (512 MB in each memory) whatever the chunk; a
+  1 GB single ring (1024 × 1 MB) needs 1028 MB of CMA and does not fit the 1 GB pool of
+  `uzev`. At 8 GB/s a 512 MB ring covers 64 ms of SSD stall, at 12.5 GB/s a 1 GB ring 85 ms.
+* **Split ring: two memories, one CPU-invisible.** The second memory of a split ring (PL DDR4
+  on `zcu106_hpc0`, LPDDR4 on `vck190_fmcp1`) is reached only by the ring port and the PCIe
+  root ports; Linux never maps it, so the CPU cannot read a ring there (it never needs to: the
+  sample data does not pass through the CPU). `uzev` has one ring port (its PL DDR4 is 16 bits
+  wide, too narrow for half of the stream) and always uses a single ring. On `zcu106_hpc0` a
+  split ring needs the PL DDR4 controller calibrated (`STATE.MEM1_READY`); if it is not, the
+  driver falls back to a single ring and refuses `--ring split` / `mem1`.
 
 ## SSDs
 
@@ -101,10 +110,10 @@ limit. With a purchased license none of this applies.
   drive.
 * **No per-command abort.** A command that times out disables the SSD's controller; unbind
   and rebind the SSD (or reboot) to bring it back.
-* **Drive behaviour.** One Sabrent Rocket 2230 writes ~5 % slower with this design than with
-  fpga-drive-recorder, on Gen3 and Gen4 links, in and past its SLC cache (~1.73 against
-  ~1.8 GB/s past it; the cause has not been isolated), and both drives wrote 3-5 % slower after
-  about 4.9 TB had been written to them in one night. See
+* **Drive behaviour.** One Sabrent Rocket 2230 writes 5-8 % slower with this design than with
+  fpga-drive-recorder (2.76-2.78 against 2.88-2.95 GB/s in its SLC cache on a Gen3 x4 link,
+  4.21-4.23 against 4.57-4.65 GB/s on Gen4 x4); the cause has not been isolated. A drive's SLC
+  cache needs idle time to recover after a long recording. See
   [Supported SSDs](supported_ssds.md#observations-with-the-tested-drives).
 
 ## Data path
@@ -118,25 +127,56 @@ limit. With a purchased license none of this applies.
 * **Rate ceilings.** The source and sink run at up to one beat per `src_clk` cycle (250 MHz):
   8 GB/s at 256 bits, 16 GB/s at 512 bits. What a target sustains is lower, and measured (see
   [Ceilings at a glance](benchmarks.md#ceilings-at-a-glance)):
-  * Zynq UltraScale+: the ring goes through one 128-bit HP port into DDR, at 322.19 MHz on the
-    ZCU106 (5.16 GB/s peak; 327.77 MHz and 5.24 GB/s on the UltraZed-EV). Recording, with or
-    without SSDs, is clean up to 5000 MB/s. RAID0 playback holds 4250 MB/s with two Samsung
-    980 PRO and 4500 MB/s with two Sabrent Rocket 2230: the SSDs writing DDR and the ring reader
-    reading it share the DDR. One drive is bound
-    by its Gen3 x4 slot (~2.8-3.0 GB/s write, ~3.2 GB/s read at MaxPayload 128 bytes).
-  * Versal: without SSDs the 512-bit datapath records 14 500 MB/s and plays back 13 750 MB/s.
-    With two Samsung 980 PRO the single DDR4 controller sets the limit, since every byte crosses
-    it twice: 9250 MB/s recording, 8750 MB/s playback. With two Sabrent Rocket 2230 the drives
-    do: 7750 MB/s recording, 7500 MB/s sustained playback (8750 MB/s for a 10 GiB file; short
-    underflows above 7500 MB/s over long files).
+  * ZCU106: the split ring goes through a 128-bit HP port into PS DDR (322.19 MHz, 5.16 GB/s
+    peak) and through a DDR4 controller in the PL into the PL DDR4 (~7.8 GB/s for the ring).
+    The ring writer and reader stream in order and alternate between the two, so the split
+    ring does not reach the PL DDR4 port's 7750 MB/s: without SSDs it records 6000 MB/s and
+    plays back 6250 MB/s with whole-chunk stripes (7000 / 6750 MB/s with 4 KB stripes). Two
+    Samsung 980 PRO and two Sabrent Rocket 2230 record 6000 MB/s and play back 5750 and
+    6000 MB/s at the default MaxPayload of 256 bytes (5250 MB/s at 128). One drive is bound by its Gen3 x4
+    slot (~2.8-3.0 GB/s write, ~3.2 GB/s read at MaxPayload 128 bytes). The UltraZed-EV has the HP port only (327.77 MHz, 5.24 GB/s peak).
+  * Versal: without SSDs the split ring records 14 750 MB/s and plays back 15 000 MB/s with
+    whole-chunk stripes (15 750 / 16 000 MB/s with 4 KB stripes). Two Samsung 980 PRO record
+    10 000 MB/s (their write rate) and play back 11 000 MB/s sustained; about 12 GB/s of
+    playback is not reached (11.84 GB/s at a 12 000 MB/s sink, the ring reader and its
+    memories being the limit). Two Sabrent Rocket 2230 record 8250 MB/s and play back
+    9250 MB/s, both their drives' rates.
   * A recording crosses DDR twice (the fabric writes the ring, the SSDs read it), and the SSDs'
     own write rates, especially past their SLC cache, are usually lower still.
   * `src_clk` and `dp_clk` run at the same 250 MHz, so a source at one beat every cycle leaves
-    the ingest FIFO no time to drain after a pause of the ring writer: a 256-bit Versal build
-    records without an SSD only up to 7750 MB/s (playback 7500 MB/s), which is why the Versal
-    design is 512 bits wide.
+    the ingest FIFO no time to drain after a pause of the ring writer: a 256-bit datapath on
+    the VCK190 (fpga-drive-recorder's) records without an SSD only up to 7750 MB/s (playback
+    7500 MB/s), which is why the Versal design is 512 bits wide.
 * **Fabric-only mode needs register map 1.2.** `nvrec --no-write` and `nvplay --ring-only`
-  refuse to run on a bitstream of the previous revision (register map 1.1).
+  refuse to run on a bitstream of register map 1.1.
+* **The split ring needs register map 1.3** and a device tree with the second memory's
+  region (`memory-region`); on older bitstreams and on `uzev` the apps' `--ring auto` is a
+  single ring and `--ring split` / `mem1` are refused.
+* **Playback near the top fails by short underflows.** With whole-chunk stripes a playback
+  close to the highest sustained rate does not fall short steadily but runs dry for short,
+  intermittent moments (on `vck190_fmcp1` 11 000 MB/s was clean in 3 of 3 runs of a 40 GiB file
+  on the release image but in 8 of 9 in the measurement session, and 11 250-11 750 MB/s in some
+  runs only). Leave a margin below the published rate.
+* **One SSD must stay on a single ring.** One SSD whose writes alternate between the two
+  memories plays back much slower: **one Samsung 980 PRO on `zcu106_hpc0` plays only
+  ~1.44 GB/s on the split ring** (12 ms read latency) against 3000 MB/s on the single ring; one
+  Sabrent there ~13 % slower; one 980 PRO on `vck190_fmcp1` 5750 against 6250 MB/s with 4 KB
+  stripes. The driver therefore keeps a single-SSD run on a single ring by default
+  (`ring_split=auto`); loading it with `ring_split=1`, or `--ring split` on one SSD, forces the
+  split and should not be used for one drive.
+* **Whole-chunk stripes are essential with 512 KB chunks.** With `--stripe 4` every 512 KB
+  NVMe command of a Samsung 980 PRO switches memory 128 times, and the 980 PRO pair on
+  `zcu106_hpc0` plays back only ~3.8-4.0 GB/s (6.3 ms read latency at MaxPayload 128) instead
+  of 5750 MB/s (5250 MB/s at 128). With the Sabrent pair's 256 KB chunks 4 KB and whole-chunk
+  stripes tie in playback. Keep the default stripe (the whole chunk).
+* **The single ring on `vck190_fmcp1`** (`--ring single`) records RAID0 at 9250 MB/s with
+  drops in 3 of 3 runs (9.24-9.25 GB/s written), less than the Release 1.1 build sustained
+  with the same ring; the NoC bandwidth requests and MaxPayload were ruled out, the cause was
+  not isolated. The default split ring is not affected.
+* **Ring port counters saturate.** `WR_PORT_STALL0/1` and `RD_PORT_WAIT0/1` are 32-bit cycle
+  counters: they stop at 17 179.886 ms, which a run longer than about 17 s can reach without
+  meaning anything about the memory. They are also not zero in a clean run (see
+  [Kernel driver](driver.md#split-ring-one-ring-in-two-memories)).
 * **No backpressure to the source.** By design, the source is never stalled. When the SSDs
   cannot keep up, beats are dropped at the ingest FIFO and counted; a recording is valid only
   if its drop count is 0. There is no mode that pauses the source instead.
@@ -176,9 +216,9 @@ limit. With a purchased license none of this applies.
 ## Platforms and tools
 
 * **Targets.** The design is available for the targets in the
-  [target table](build_instructions.md#target-designs). `zcu106_hpc0` and `vck190_fmcp1` have
-  been tested on hardware in this revision, each with two Samsung 980 PRO 1TB (FPGA Drive FMC
-  Gen4) and with two Sabrent Rocket 2230 1TB (M.2 M-key Stack FMC); `uzev` is built but not
+  [target table](build_instructions.md#target-designs). `zcu106_hpc0` has been tested on
+  hardware in this revision with two Samsung 980 PRO 1TB (FPGA Drive FMC Gen4) and with two
+  Sabrent Rocket 2230 1TB (M.2 M-key Stack FMC), and so has `vck190_fmcp1`; `uzev` is built but not
   tested on hardware in this revision (see [supported carriers](supported_carriers.md)).
 * **Linux only.** There is no standalone (baremetal) application and no PetaLinux flow; the
   Linux image is built with the Yocto / EDF flow, which needs a native Linux build machine.

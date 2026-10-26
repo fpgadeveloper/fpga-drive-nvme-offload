@@ -13,12 +13,15 @@
 // Chunk c of the run (slot = c % num_chunks), array chunk A = start_chunk + c:
 //   member m = A % N (N = 1 or 2), row = A / N
 //   SLBA     = member_lba[m] + (row << (chunk_shift - lba_shift))
-//   PRP1     = ring_base + (slot << chunk_shift)
+//   PRP1     = ADDR(slot << chunk_shift)
 //   PRP2     = len > 2 pages : prp_base + (slot << prp_shift)
-//              len = 2 pages : PRP1 + 4096
+//              len = 2 pages : ADDR((slot << chunk_shift) + 4096)
 //              len = 1 page  : 0
+//   ADDR(g)  = ring address function (nvrec_ring_addr, register map 1.3):
+//              ring_base + g (1.2), ring_base1 + g (mem1), or the split ring
+//              (page 1 of a slot may be in the other memory than page 0)
 //   NLB-1    = (len >> lba_shift) - 1, FUA = fua (writes only)
-//   CID      = {6'b0, slot}  (bit 15 = 0; injector CIDs have bit 15 = 1)
+//   CID      = {0, slot}  (bit 15 = 0; injector CIDs have bit 15 = 1)
 //
 // Eligibility of chunk c:
 //   record   : c < filled_cnt (the ring writer has finished the chunk)
@@ -34,8 +37,9 @@
 `timescale 1ns / 1ps
 
 module nvrec_cmd #(
-  parameter integer SLOT_W = 10,
-  parameter integer ADDR_W = 64
+  parameter integer SLOT_W = 12,
+  parameter integer ADDR_W = 64,
+  parameter integer N_RING_PORTS = 2
 ) (
   input  wire               clk,
   input  wire               rst,
@@ -53,6 +57,10 @@ module nvrec_cmd #(
   input  wire [4:0]         chunk_shift,
   input  wire [SLOT_W:0]    num_chunks,
   input  wire [ADDR_W-1:0]  ring_base,
+  input  wire [ADDR_W-1:0]  ring_base1,
+  input  wire               split,
+  input  wire               mem1,
+  input  wire [4:0]         stripe_shift,
   input  wire [ADDR_W-1:0]  prp_base,
   input  wire [4:0]         prp_shift,
   input  wire [63:0]        start_chunk,
@@ -140,7 +148,6 @@ module nvrec_cmd #(
   reg  [ADDR_W-1:0] s_prp_off;
   // stage 2
   reg  [63:0] s_lba;
-  reg  [ADDR_W-1:0] s_prp1;
   reg  [ADDR_W-1:0] s_prp_list;
   reg  [15:0] s_nlbm1;
   reg  [1:0]  s_pages;                // 1, 2, 3 (= more than 2)
@@ -150,6 +157,20 @@ module nvrec_cmd #(
   reg  [5:0]  b_sq;
 
   wire [4:0]  spc_shift = chunk_shift - {1'b0, lba_shift};
+
+  // PRP1 / 2-page PRP2 through the ring address function: s_slot_off is set
+  // in B_C1, the 2-stage function result is valid in B_C3 (as s_prp1 was)
+  localparam integer G_W = SLOT_W + 23;
+  wire [G_W-1:0]    g_pg0 = s_slot_off[G_W-1:0];
+  wire [G_W-1:0]    g_pg1 = s_slot_off[G_W-1:0] + {{(G_W-13){1'b0}}, 13'd4096};
+  wire [ADDR_W-1:0] a_pg0, a_pg1;
+
+  nvrec_ring_addr #(.N_RING_PORTS(N_RING_PORTS), .G_W(G_W), .ADDR_W(ADDR_W)) u_ra0 (
+    .clk(clk), .split(split), .mem1(mem1), .stripe_shift(stripe_shift),
+    .base0(ring_base), .base1(ring_base1), .g(g_pg0), .port(), .addr(a_pg0));
+  nvrec_ring_addr #(.N_RING_PORTS(N_RING_PORTS), .G_W(G_W), .ADDR_W(ADDR_W)) u_ra1 (
+    .clk(clk), .split(split), .mem1(mem1), .stripe_shift(stripe_shift),
+    .base0(ring_base), .base1(ring_base1), .g(g_pg1), .port(), .addr(a_pg1));
 
   wire rec_avail  = (issued_cnt < filled_cnt);
   wire play_avail = (issued_cnt < length_chunks) &&
@@ -206,7 +227,6 @@ module nvrec_cmd #(
           end
           B_C2: begin
             s_lba      <= (s_m ? m1_lba : m0_lba) + s_row;
-            s_prp1     <= {ring_base[ADDR_W-1:12], 12'd0} + s_slot_off;
             s_prp_list <= {prp_base[ADDR_W-1:12], 12'd0} + s_prp_off;
             s_nlbm1    <= (s_len >> lba_shift) - 23'd1;
             s_pages    <= (s_len > 23'd8192) ? 2'd3 : ((s_len > 23'd4096) ? 2'd2 : 2'd1);
@@ -218,9 +238,9 @@ module nvrec_cmd #(
                                (mode_play ? 8'h02 : 8'h01)};
             b_sqe[63:32]   <= s_m ? m1_nsid : m0_nsid;          // DW1 NSID
             b_sqe[191:64]  <= 128'd0;                           // DW2-5
-            b_sqe[255:192] <= s_prp1;                           // DW6-7 PRP1
+            b_sqe[255:192] <= a_pg0;                            // DW6-7 PRP1
             b_sqe[319:256] <= (s_pages == 2'd3) ? s_prp_list :
-                              (s_pages == 2'd2) ? (s_prp1 + 64'd4096) : 64'd0; // DW8-9
+                              (s_pages == 2'd2) ? a_pg1 : 64'd0; // DW8-9
             b_sqe[383:320] <= s_lba;                            // DW10-11 SLBA
             b_sqe[415:384] <= {1'b0, (fua & ~mode_play), 14'd0, s_nlbm1}; // DW12
             b_sqe[511:416] <= 96'd0;                            // DW13-15

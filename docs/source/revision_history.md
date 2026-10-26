@@ -1,5 +1,118 @@
 # Revision History
 
+## v1.2 (2025.2), October 2026
+
+One ring per SSD in two memories: on `zcu106_hpc0` and `vck190_fmcp1` the recording ring is
+split over PS DDR and a second memory that the CPU does not use (the PL DDR4 on the ZCU106, the
+LPDDR4 on the VCK190), in whole-chunk stripes, so that each SSD of a RAID0 pair writes and
+reads one memory and each memory carries half of the traffic. Two Samsung 980 PRO on
+`vck190_fmcp1` now record 10 000 MB/s (their write rate) and play back 11 000 MB/s sustained,
+two Sabrent Rocket 2230 there 8250 and 9250 MB/s; on `zcu106_hpc0` both pairs record 6000 MB/s
+and play back 5750-6000 MB/s at the default MaxPayload of 256 bytes (5250 MB/s at 128).
+
+* **Register map 1.3: a second ring port.** `nvrec_core` has a second ring AXI master
+  (`m_axi1`; `RING_PORTS` = 2, build parameter `N_RING_PORTS`), `RING_BASE1`, `CONFIG.SPLIT`
+  (bit 3) and `CONFIG.MEM1` (bit 6, a single ring in memory 1), the run-time stripe
+  `RING_STRIPE_SHIFT` (4 KB to one chunk), `STATE.MEM1_READY` (bit 13), and per-port counters
+  `WR_PORT_STALL0/1` and `RD_PORT_WAIT0/1` (32-bit `dp_clk` cycles, saturating at about 17 s).
+  The ring writer keeps one write stream, in issue order, over both ports and retires their
+  write responses in order; PRP1 and PRP2 follow the same address function. The slot table
+  has 4096 entries (`SLOT_W` 12), so 256 KB chunks also reach a 1 GB ring. `VERSION`
+  0x0001_0003.
+* **Ring reader skid FIFOs.** Each ring port's read data lands in a skid FIFO of 512 beats
+  (32 KB at 512 bits, 16 KB at 256 bits), so the reader keeps fetching from one memory while
+  the stream drains the other: a switch of memory at a chunk boundary costs little.
+* **Memory paths.** `zcu106_hpc0`: ring B in the board's soldered 64-bit PL DDR4-2400 through
+  a DDR4 controller in the PL (`ddr4_0`, 512 bits at 300 MHz) at `0x20_0000_0000`; ring A on
+  `S_AXI_HP2_FPD` as before; both PCIe Root Ports reach both memories. `vck190_fmcp1`: ring B
+  in the on-board LPDDR4 behind one LPDDR4 controller (a second NoC instance, `noc_lpddr4`, its
+  two x32 channels interleaved every 256 bytes) at `0x600_0000_0000`. One controller, because
+  interleaving ring B over the board's two LPDDR4 controllers every 128 bytes capped its writes
+  at 1.8-2.0 GB/s per NoC master (the NoC orders writes strictly). NoC QoS requests: 14 000 MB/s
+  per direction for each ring port, 7000 MB/s to the DDR4 and 4000 MB/s to the LPDDR4 for each
+  Root Port; `report_noc_qos` meets them all. `uzev` keeps one ring port (its PL DDR4 is
+  16 bits wide).
+* **Timing and resources.** Every target meets timing: `zcu106_hpc0` WNS +0.040 ns, 115 240
+  LUTs (50.0 %), 207 block RAMs (66.3 %; two pblocks keep the DDR4 controller's write-data
+  registers next to their banks); `uzev` WNS +0.071 ns, 79 470 LUTs (34.5 %), 173.5 block RAMs;
+  `vck190_fmcp1` WNS +0.052 ns, 100 036 LUTs (11.1 %), 222 block RAMs (23.0 %), 24 UltraRAMs
+  (see [Architecture](architecture.md#resource-usage)). On the ZCU106 the PL DDR4 controller and
+  its I/O banks raise the steady VCCAUX current from about 0.145 A to 0.54-0.55 A.
+* **Driver 1.2 (ioctl API 4).** Split ring: ring A (the PS DDR part) from CMA, ring B at the
+  start of a 1 GB `no-map` region of the second memory that the device tree hands to the
+  driver (`memory-region`); layouts `single`, `split` (stripes of 4 KB … one chunk, run-time
+  `RING_STRIPE_SHIFT`) and `mem1`; the PRP list of every slot follows the register map 1.3
+  address function page by page; a split or `mem1` ring is refused while the second memory
+  is not ready (`STATE.MEM1_READY`). Module parameters `ring_split` (`auto` / 0 / 1: the
+  default layout; `auto` splits RAID0 and fabric-only runs, not single-SSD runs, which play
+  back ~13 % slower on a split ring) and `stripe_kb` (`auto`, `chunk` or KB; default: the
+  board's device tree, `opsero,ring-stripe-chunk` = whole chunks on `zcu106_hpc0` and
+  `vck190_fmcp1`, measured best on both). Slot table up to
+  4096 entries; a split ring up to 2 GB (1 GB per memory).
+  Ring-port wait counters (`WR_PORT_STALL`, `RD_PORT_WAIT`) in the statistics and sysfs;
+  sysfs `ring_ports`, `ring1_base`, `ring1_bytes`, `mem1_ready`, `ring_split`,
+  `ring_stripe_kb`, `ring_stripe_default`, `max_slots`. A host unit test (`sw/nvrec-driver/tests`) checks the
+  address function and the PRP lists against a model of the hardware.
+* **Apps 1.2.** `nvrec` / `nvplay` `--ring auto|single|split|mem1` and `--stripe <KB>|chunk`;
+  the default ring is 1 GB when split (512 MB in each memory) and 512 MB otherwise; only the
+  PS DDR part counts against CMA. The summaries and `RESULT` lines give the layout (`ring`,
+  `stripe_kb`, `ring_mem1_bytes`) and, with two ring ports, the time the ring writer and
+  reader waited for each memory (`wr_port_stall_ms`, `rd_port_wait_ms`). `nvbench-suite.sh`
+  (version 3) passes `--ring` / `--stripe` to every run, keeps them in the run ids
+  (`/ring=split/stripe=4K`) and runs comma lists of them as an A/B in one call. `nvregs`
+  shows the register map 1.3 registers. The file format and `nvverify` are unchanged.
+* **PCIe MaxPayload 256 on `zcu106_hpc0` and `vck190_fmcp1` by default.** `nvrec-mps` (apps)
+  shows and sets the MaxPayload of the SSDs and their root ports (`setpci`, MaxReadReq
+  untouched); `nvrec-pcie-mps.service` sets the board's value at boot (`NVREC_MPS`: 256 on
+  `zcu106_hpc0` and `vck190_fmcp1`, 128 on `uzev`). The RAID0 playback gains without PCIe
+  errors: 11 000 instead of 10 750 MB/s sustained with two Samsung 980 PRO on `vck190_fmcp1`;
+  on `zcu106_hpc0` 6000 instead of 5250 MB/s with two Sabrent Rocket 2230 (which also record
+  6000 instead of 5250 MB/s) and 5750 instead of 5250 MB/s with two 980 PRO, whose single
+  drive records 3250 and plays back 3500 MB/s instead of 3000 / 3000 MB/s. Release 1.1 had
+  found RAID0 playback worse at 256 bytes on `zcu106_hpc0`, with its single ring, where the
+  SSDs' writes and the ring reader shared one DDR controller; the split ring changed that.
+  Every `RESULT` line and suite result records the `mps` in force.
+* **Even slot count for whole-chunk stripes.** A split ring with whole-chunk stripes always
+  has an even number of slots, so each SSD writes and reads one memory only (member *m* ↔
+  memory *m* XOR the parity of the first chunk). The apps size every ring in whole 2 MB, which
+  gives an even count below 2 MB chunks; the driver rounds an odd request down by one (2 MB and
+  4 MB chunks, or a program's own `SET_RING`). `nvrec` and `nvplay` print a note when the slots
+  used differ from `--buffers`.
+* **Yocto.** `nvrec-mod` and `nvrec-apps` 1.2; the 1 GB carve-out and the default stripe in
+  the device trees of `zcu106_hpc0` (PL DDR4, `0x20_0000_0000`) and `vck190_fmcp1` (LPDDR4,
+  `0x600_0000_0000`); `cma=` unchanged (1536M); `nvrec-pcie-mps.service` enabled with
+  `NVREC_MPS=256` on `zcu106_hpc0` and `vck190_fmcp1`. `uzev` keeps a single ring and
+  MaxPayload 128.
+* `uzev` is built (XSA and image) but not tested on hardware in this revision.
+* **Measured results** (see [Benchmarks](benchmarks) and [Comparison](comparison)), with two
+  Samsung 980 PRO 1TB and two Sabrent Rocket 2230 1TB on each tested board (Release 1.1 in
+  brackets). `vck190_fmcp1`: the 980 PRO pair records RAID0 at 10 000 MB/s over 32 GB (9250;
+  the drives' write rate), 10 250 / 10 000 MB/s for 10 / 40 GB, and plays back 11 000 MB/s
+  sustained at MaxPayload 256 (8750; 10 750 MB/s at 128); about 12 GB/s is not reached
+  (11.84 GB/s at a 12 000 MB/s sink, short intermittent underflows at 11 000-11 750 MB/s in some
+  runs; the limit is on the ring reader and memory side, not isolated). The Sabrent pair
+  records 8250 MB/s (7750; with the 1 GB ring) and plays back 9250 MB/s (7500) at MaxPayload
+  256 and 128 alike, its drives' rates; Release 1.1's short underflows above 7500 MB/s are
+  gone. Without an SSD 14 750 / 15 000 MB/s (15 750 / 16 000 MB/s with 4 KB stripes).
+  `zcu106_hpc0`, at the default MaxPayload of 256 bytes: the 980 PRO pair plays back 5750 MB/s
+  (4250) and records 6000 MB/s (5000; the split ring's writer, at 128 bytes too); the
+  Sabrent pair records and plays back 6000 MB/s (5000 / 4500); at 128 bytes both pairs play
+  back 5250 MB/s and the Sabrent pair records 5250 MB/s; without an SSD 6000 /
+  6250 MB/s (5000 / 5000, the HP port), limited by the in-order stream alternating between the
+  HP port and the PL DDR4 port. Past the SLC cache every pair holds its 1.1 rate over 350 GiB
+  (3250 MB/s; 3500 MB/s with the 980 PROs on `zcu106_hpc0`); one drive records / plays back as
+  with 1.1: 980 PRO 5000 / 6250 MB/s on `vck190_fmcp1` and 3250 / 3500 MB/s at 256 bytes on
+  `zcu106_hpc0` (3000 / 3000 at 128, Release 1.1's default), Sabrent 4000 / 4500 and
+  2750 / 3000 MB/s (at 128 bytes on `zcu106_hpc0`). Whole-chunk stripes beat 4 KB stripes by 500 MB/s of playback with the 980 PROs on
+  `vck190_fmcp1` (SSD command latency 0.2 against 1.7-1.85 ms), and with 512 KB chunks they are
+  essential: with 4 KB stripes the 980 PRO pair on `zcu106_hpc0` plays back only ~3.8 GB/s. One
+  SSD forced onto the split ring plays back far slower (one 980 PRO on `zcu106_hpc0`
+  ~1.44 GB/s), so single-SSD runs stay on the single ring. MaxPayload 256 is clean (no AER) with
+  both pairs on both boards. The ring size needed at the recording tops ranges from 41 MB to
+  the whole 1 GB default (the Sabrent pair on `vck190_fmcp1`); a 256 MB ring drops with three of
+  the four pairs. `nvrec` and `nvplay` use 2-6 % of one core. The Sabrents reached 65 °C in the
+  350 GiB recordings.
+
 ## v1.1 (2025.2), October 2026
 
 The source/sink datapath is widened so that rates above the 3.2 GB/s of the first release

@@ -86,7 +86,9 @@
       "license": false,
       "flashsize": "0",
       "flashintf": "0",
-      "ip_license": true
+      "ip_license": true,
+      "ring_mem": "pl_ddr4",
+      "ring_mem_intf": "ddr4_sdram_062"
     },
     {
       "publish": true,
@@ -110,7 +112,8 @@
       "flashsize": "0",
       "flashintf": "0",
       "ip_license": true,
-      "data_width": 512
+      "data_width": 512,
+      "ring_mem": "lpddr4"
     }
   ]
 }

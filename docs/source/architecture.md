@@ -56,6 +56,8 @@ Cells of the block design (`Vivado/src/bd/bd_zynqmp.tcl`):
 | `smc_q` | both root ports to the Host Accelerator's queue window (`S_AXI_SSD`) |
 | `smc_db`, `smc_bar_0/1` | Host Accelerator doorbell writes to the root ports' BAR windows, merged with the PS path |
 | `nvmeha_guard` | AXI-Lite timeout guard (`nvrec_axil_guard`) in front of the Host Accelerator's `S_AXI_LITE` (see [Resource usage](#resource-usage)) |
+| `ddr4_0`, `rst_mig` | `zcu106_hpc0` only: DDR4 controller for the soldered 2 GB PL DDR4, memory 1 of the [split ring](#split-ring) |
+| `smc_mig` | `zcu106_hpc0` only: the ring's second master (`m_axi1`) and both root ports (`smc_ssd_N/M02_AXI`) to the PL DDR4 controller |
 
 ## Datapath width
 
@@ -90,9 +92,100 @@ the recording's byte stream are the same at every width (16-byte words, see the
 The source / sink rate is not the limit of a recording: the DDR-side path of the ring is.
 On Zynq UltraScale+ that is `S_AXI_HP2_FPD`, 128 bits at `pl_clk3` = 5.16 GB/s (ZCU106) /
 5.24 GB/s (UltraZed-EV) per direction; on Versal the ring's own NoC port, 512 bits at
-`dp_clk` = 16.0 GB/s per direction (NoC QoS request 14000 MB/s), and then the DDR4
+`dp_clk` = 16.0 GB/s per direction, and then the DDR4
 memory controller itself (DDR4-3200 x64, 25.6 GB/s peak, shared with both SSDs). During a recording every byte crosses DDR twice (the
-ring writer writes it, the SSDs read it back).
+ring writer writes it, the SSDs read it back) -- which is why register map 1.3 can split the
+ring over two memories on `zcu106_hpc0` and `vck190_fmcp1`, see [Split ring](#split-ring).
+
+## Split ring
+
+Every byte of a recording crosses the ring memory twice: the ring writer writes it and an SSD
+reads it back (the reverse in playback). With one ring in PS DDR the single DDR controller
+therefore carries twice the stream rate, and its mixed read / write throughput is the
+ceiling of the design (about 9.3 GB/s mixed on the ZCU106's DDR4-2133, about 18.5 GB/s on
+the VCK190's DDR4-3200). Register map 1.3 adds a **second ring AXI4 master** (`m_axi1`,
+`RING_PORTS` = 2) to `nvrec_core` and lets the ring be **split** over PS DDR and a second
+memory, so that each controller carries about half of the traffic:
+
+| Target | Memory 0 (`m_axi`, `RING_BASE`) | Memory 1 (`m_axi1`, `RING_BASE1`) | `RING_PORTS` |
+|---|---|---|---|
+| `zcu106_hpc0` | PS DDR4 through `S_AXI_HP2_FPD` (as before) | the soldered 2 GB x64 PL DDR4 (DDR4-2400) behind a DDR4 controller in the PL (`ddr4_0`, 512 bits at 300 MHz), at `0x20_0000_0000` | 2 |
+| `vck190_fmcp1` | DDR4 UDIMM through `axi_noc_0` (as before) | the on-board LPDDR4: 4 GB of it behind one DDRMC (second NoC instance `noc_lpddr4`, both x32 channels interleaved), at `0x600_0000_0000` | 2 |
+| `uzev` | PS DDR4 through `S_AXI_HP2_FPD` | none (its PL DDR4 is 16 bits wide, too slow for half of the stream) | 1 |
+
+How the ring is laid out: byte `g` of the ring goes to memory `(g >> S) & 1`, where `S` is
+the run-time stripe shift `RING_STRIPE_SHIFT` (4 KB .. one chunk). Each memory holds its
+stripes back to back (see the [register map](register_map) for the address function). With
+4 KB stripes every burst alternates between the memories, both carry half of the stream at
+any time, and each SSD reads or writes both of them; with chunk-sized stripes whole chunks
+alternate (with two members and an even `START_CHUNK`, SSD `m` uses memory `m` only), but
+each memory then carries the full stream rate for the length of a chunk. The default, chosen
+by measurement, is the whole chunk on both boards (`--stripe` in the apps; see
+[Benchmarks](benchmarks.md#stripe-whole-chunk-4-kb-or-64-kb)).
+
+How the engine handles two memories with one stream:
+
+* **Record.** One address register drives both ports' AW channels (`awvalid` of the
+  burst's port). The W data is sent to both ports; only the port of the head burst sees
+  `wvalid`, so data leaves in issue order exactly as with one port (head of line: a
+  stalled memory stalls the stream). Each port answers its write responses in its own
+  order; per-port counters of unconsumed responses let the B queue retire bursts strictly
+  in issue order, so a chunk counts as filled, and its NVMe Write is issued, only when all
+  of its bursts on both ports are acknowledged.
+* **Playback.** Read bursts go to the port of their memory; the R queue remembers each
+  burst's port. Each port's read data lands in its own skid FIFO (512 beats: 32 KB at 512
+  bits, 16 KB at 256 bits), and the reader streams from the FIFO of the port of the oldest
+  outstanding burst (a registered select drives the `DATA_WIDTH`-bit mux), so the stream
+  leaves in ring order while the other memory keeps fetching ahead: with chunk-sized
+  stripes the next chunk's first 32 KB are already on chip when the stream switches memory.
+  (Without the FIFOs the other port's read channel was held, its interconnect stopped
+  fetching after a few bursts, and every switch cost one read latency; in simulation with
+  NoC-like ports that the reader can just keep busy, the FIFOs cut the waits at chunk
+  boundaries from about 124 to 22 cycles each and the sink's starvation from 3258 to 110
+  cycles per 1 MB.)
+* **Commands.** PRP1 and a 2-page PRP2 go through the same address function (page 1 of a
+  slot can be in the other memory); the PRP lists are built by software with it.
+* **Which memory limits a run**: `WR_PORT_STALL0/1` and `RD_PORT_WAIT0/1` count the cycles
+  each port held the datapath up (not zero in a clean run: compare the two ports with each
+  other and with the run time, see [Kernel driver](driver.md#split-ring-one-ring-in-two-memories)). `CONFIG.MEM1` puts a single ring in memory 1 alone, to
+  measure that memory by itself.
+
+Memory 1 is mapped for `m_axi1` and for the root ports' bridges, at the same address (the
+SSDs reach both memories), and never for the CPUs: Linux does not see it as RAM. On the
+ZCU106 the PL DDR4 controller's calibration flag is `STATE.MEM1_READY`; software does not
+split the ring before it is set. On the VCK190 the platform loader calibrates the LPDDR4
+controllers before the PL runs (`MEM1_READY` is constant 1).
+
+Block design changes, Zynq UltraScale+ (`zcu106_hpc0`, `ring_mem` `pl_ddr4` in
+`config/data.json`): `ddr4_0` is configured from the board interface (`ring_mem_intf`,
+default `ddr4_sdram_062`; system clock `user_si570_sysclk` 300 MHz); `smc_mig` merges
+`nvrec_core_0/m_axi1` (256 bits at `dp_clk`) and a third master port of each root port's
+`smc_ssd_N` (128 bits at `dp_clk`) into the controller's 512-bit AXI slave (`ui_clk`
+300 MHz); `rst_mig` resets the controller's AXI side; the controller's system reset is the
+`dp_clk` peripheral reset. The ring's first port stays on `S_AXI_HP2_FPD`.
+
+Block design changes, Versal (`vck190_fmcp1`, `ring_mem` `lpddr4`): `noc_lpddr4` (ONE
+LPDDR4 controller, board interfaces `ch0_lpddr4_c0` + `ch1_lpddr4_c0`, system clock
+`lpddr4_sma_clk1`, its two x32 channels interleaved inside the controller every 256 B,
+region `DDR_CH2` at `0x600_0000_0000`, 4 GB; not `DDR_LOW1`, because a NoC port that
+reaches the DDR4's `DDR_LOW0` may not reach a `DDR_LOW` region of another NoC instance)
+with three routes in: its own PL NMU for `nvrec_core_0/m_axi1` (through `axi_smc_dma1`,
+512 bits at `dp_clk`, port `MC_0`, QoS request 14000 MB/s), and one INI link from each
+root port's NoC port (`S08_AXI` -> `M00_INI` -> `MC_1`, `S10_AXI` -> `M01_INI` -> `MC_2`,
+4000 MB/s each, on top of their 7000 MB/s to the DDR4). The PS NMUs get no route to the
+LPDDR4.
+
+Why one LPDDR4 controller and not the two interleaved ones of the AMD VCK190 BSP: the
+Versal AXI NoC orders writes strictly (the only `MC_ORDERING` choice of the first-generation
+NoC). An NoC master port (NMU) writing to two interleaved controllers cuts every burst into
+interleave-size pieces (128 B) and sends the next piece only after the write response of
+the previous one, so a first build with the BSP's two interleaved controllers wrote the
+LPDDR4 at only 1.8-2.0 GB/s per NoC master (reads, which the NMU reorders, ran at
+12.45 GB/s). Behind one controller each NMU has a single LPDDR4 destination and the
+controller spreads the data over its two channels itself: the peak is the same two x32
+channels at 3906 MT/s (2 x 15.6 GB/s) the ring used before. The same rule still costs one
+write round trip each time a root port's NMU switches between the DDR4 and the LPDDR4,
+i.e. once per split-ring stripe.
 
 ## The record path
 
@@ -106,7 +199,7 @@ In more detail:
    (8192 x 256 bits = 256 KB, 32 us at 8 GB/s) from `src_clk` to `dp_clk`. The source is
    never stalled; a beat that arrives while the FIFO is full is dropped and counted.
 2. **Ring writer** (`nvrec_wr`): writes the stream into the ring, `NUM_CHUNKS` slots of
-   `CHUNK_SIZE` bytes (chunk = 1 MB or the drive's MDTS, whichever is smaller; the apps default to a 512 MB ring: 512 MB / chunk slots, 256 to 2048) at `RING_BASE`, with 4 KB AXI bursts (128 beats of 256 bits). It only
+   `CHUNK_SIZE` bytes (chunk = 1 MB or the drive's MDTS, whichever is smaller; the ring size and layout are chosen by the driver and the apps, see the driver page; at most `MAX_SLOTS` = 4096 slots) at `RING_BASE` (or split over two memories, see [Split ring](#split-ring)), with 4 KB AXI bursts (128 beats of 256 bits). It only
    issues a burst when the data is already in the FIFO, and only opens a slot that has been
    released. A chunk is *filled* when all its write responses are back. If no slot is free
    (the SSDs are not keeping up), the writer waits, the FIFO fills and beats are dropped:
@@ -186,7 +279,11 @@ addresses, so these are also the PCIe bus addresses):
 As seen from the Host Accelerator's doorbell master (`M_AXI_SSD`, through the doorbell
 monitor): the two BAR windows at the same addresses as the PS (`0xA000_0000`,
 `0xB000_0000`), so the PCIe base register of each SSD is programmed with the BAR0 bus
-address the CPU uses. As seen from the ring writer / reader (`HP2`): all of PS DDR.
+address the CPU uses. As seen from the ring writer / reader port 0 (`HP2`): all of PS DDR.
+
+Split ring memory 1 (`zcu106_hpc0`): the PL DDR4 at `0x20_0000_0000` (2 GB), mapped for
+the ring's port 1 (`nvrec_core_0/m_axi1`) and both root ports' `M_AXI_B` only, not for
+the PS.
 
 The queue window is not `0xA000_0000` (PG328's example) because that is a BAR window here,
 and not `0xC000_0000` / `0xE000_0000` (QSPI / PCIe-low in the HP-port map).
@@ -200,6 +297,7 @@ and not `0xC000_0000` / `0xE000_0000` (QSPI / PCIe-low in the HP-port map).
 | `pl_clk3` | PS `pl_clk3` (RPLL) | 322.19 MHz (ZCU106), 327.77 MHz (UltraZed-EV); 333 MHz requested | `S_AXI_HP2_FPD` (the ring) and the master side of `axi_smc_dma` only |
 | `pl_clk0` | PS `pl_clk0` | 100 MHz | `M_AXI_HPM0/1_FPD`, `nvmeha_0/clk_axi_lite` (PG328: at most 100 MHz) |
 | `axi_aclk` | XDMA | 250 MHz | PCIe root ports |
+| `c0_ddr4_ui_clk` | `ddr4_0` (`zcu106_hpc0`) | 300 MHz | PL DDR4 controller AXI slave, master side of `smc_mig` |
 
 Unlike the base design, the SSDs' DMA ports `S_AXI_HP0/1_FPD` run on `dp_clk`
 (250 MHz x 128 bits = 4 GB/s per SSD) instead of `pl_clk0`. The ring's port
@@ -239,14 +337,16 @@ pipeline stages for timing closure) with the same `nvrec_core`, `nvmeha_0` and
   wide (`data_width` 512): 16 GB/s at 250 MHz.
 * **Ring writer / reader** reach DDR through their own NoC port (`axi_smc_dma` ->
   `axi_noc_0/S09_AXI`, a PL NMU 512 bits wide at `dp_clk`, DDR memory controller port
-  `MC_2`). Its NoC QoS request is 14000 MB/s read and write: the NoC compiler adds the
-  packetization overhead (write data x 1.0625, read requests 1/16 of the read rate) and
-  accepts at most 16000 MB/s per NMU and per memory-controller port, so 16000 MB/s is not
-  feasible.
+  `MC_2`). Its NoC QoS request is 14000 MB/s read and write (the second ring port has its
+  own NMU into the LPDDR4 with the same request, see [Split ring](#split-ring)): the NoC
+  compiler adds the packetization overhead (write data
+  x 1.0625, read requests 1/16 of the read rate) and accepts at most 16000 MB/s per NMU and
+  per memory-controller port, so 16000 MB/s is not feasible.
 * **One NoC port per root port.** `qdma_0/M_AXI_BRIDGE` goes through `smc_m_axi_bridge` to
   NoC port `S08_AXI` (`MC_1`), `qdma_1/M_AXI_BRIDGE` through `smc_m_axi_bridge_1` to its own
   NoC port `S10_AXI` (`MC_3`), each 256 bits at `pl0_ref_clk` with a QoS request of
-  7000 MB/s per direction (a Gen4 x4 link moves up to ~7 GB/s). The second master port of
+  7000 MB/s per direction to the DDR4 plus 4000 MB/s over an INI link to the LPDDR4 (a
+  Gen4 x4 link moves up to ~7 GB/s). The second master port of
   each of these SmartConnects goes to `smc_q`, which merges both root ports' paths to the
   Host Accelerator's queue window (`S_AXI_SSD`), as on Zynq UltraScale+. Two NoC ports
   instead of one shared port give each SSD's DMA its own NMU and request. The QoS values are bandwidth
@@ -268,8 +368,10 @@ Address map as seen from the PS (`M_AXI_FPD`):
 | `qdma_0` / `qdma_1` 64-bit BAR windows | `0x04_8000_0000` / `0x04_C000_0000` | 1 GB each |
 
 As seen from the SSDs (`M_AXI_BRIDGE`; the bridges translate no addresses): DDR at
-`0x0` (2 GB) and `0x500_0000_0000` (6 GB), and the Host Accelerator queue window at
-`0x9000_0000` (64 KB), as on Zynq UltraScale+. The doorbell master sees the BAR0 windows at
+`0x0` (2 GB) and `0x500_0000_0000` (6 GB), the LPDDR4 (split ring memory 1) at
+`0x600_0000_0000` (8 GB), and the Host Accelerator queue window at `0x9000_0000` (64 KB), as
+on Zynq UltraScale+. The ring's port 1 (`nvrec_core_0/m_axi1`) sees the LPDDR4 at the same
+address; the PS does not see it. The doorbell master sees the BAR0 windows at
 the same addresses as the PS, so an SSD must get its BAR0 in the 32-bit windows: an SSD
 with a prefetchable BAR0, which Linux would place in a 64-bit window, cannot be used (the
 driver refuses it).
@@ -277,36 +379,48 @@ driver refuses it).
 ## Resource usage
 
 Post-implementation utilization of the `zcu106_hpc0` build (XCZU7EV), whole design including
-the PS-side IP, both PCIe root ports and the NVMe Host Accelerator:
+the PS-side IP, both PCIe root ports, the NVMe Host Accelerator and, since register map 1.3,
+the PL DDR4 controller of the [split ring](#split-ring):
 
 | Resource | Used | Available | % |
 |---|---|---|---|
-| CLB LUTs | 68 949 | 230 400 | 29.9 |
-| CLB registers | 108 341 | 460 800 | 23.5 |
-| Block RAM tiles (36 Kb) | 171.5 | 312 | 55.0 |
+| CLB LUTs | 115 240 | 230 400 | 50.0 |
+| CLB registers | 178 782 | 460 800 | 38.8 |
+| Block RAM tiles (36 Kb) | 207 | 312 | 66.3 |
 | UltraRAM | 0 | 96 | 0 |
-| DSP | 0 | 1 728 | 0 |
+| DSP | 3 | 1 728 | 0.2 |
 
-Timing is met (register map 1.2 build, 256-bit datapath, 2026-10-22: WNS +0.386 ns,
-WHS +0.010 ns; `pl_clk3` (HP2, 322.19 MHz) +0.386 ns, `dp_clk` +0.407 ns, `src_clk`
-+0.420 ns, `pl_clk0` +5.503 ns). The ring writer and reader plan each burst over 4 clock
-cycles and the completion router releases slots every 2 cycles; the tightest paths are the
-address fan-out of the 256 KB ingest / 128 KB egress FIFO block RAMs and the HP2-side
-width converter of `axi_smc_dma`.
+Timing is met (register map 1.3 build, 2026-10-24: WNS +0.040 ns, WHS +0.010 ns, no
+pulse-width violation; the PL DDR4 controller's `ui_clk` (300 MHz) +0.040 ns, `dp_clk`
++0.091 ns, `src_clk` +0.360 ns, `pl_clk3` (HP2, 322.19 MHz) +0.160 ns, `pl_clk0`
++3.416 ns). Compared with the single-ring 1.2 build (68 949 LUTs, 108 341 registers, 171.5
+block RAMs) the growth is the DDR4 controller with its calibration processor, the
+SmartConnects into it (`smc_mig`, the third master port of `smc_ssd_N`), the ring
+reader's two 16 KB skid FIFOs and the 4096-slot table (`SLOT_W` 12). The design is routing-congested around the DDR4 banks: the controller's
+write-data registers are kept in the clock regions of their DQ banks by two pblocks in
+`zcu106_hpc0.xdc`, otherwise the XIPHY's "Min Skew" pulse-width check between the `D[1]`
+and `D[2]` inputs of a DQ bitslice can fail. The ring writer and reader plan each burst
+over 4 clock cycles and the completion router releases slots every 2 cycles.
 
-The other targets (register map 1.2 builds, 2026-10-22; `vck190_fmcp1` 2026-10-23):
+The other targets (register map 1.3 builds, 2026-10-24):
 
 | Target | Device | CLB LUTs | Registers | Block RAM | UltraRAM | WNS |
 |---|---|---|---|---|---|---|
-| `uzev` | XCZU7EV | 68 992 (29.9 %) | 108 370 (23.5 %) | 171.5 (55.0 %) | 0 | +0.096 ns |
-| `vck190_fmcp1` (512-bit) | XCVC1902 | 91 240 (10.1 %) | 132 068 (7.3 %) | 205 (21.2 %) | 24 (5.2 %) | +0.036 ns |
+| `uzev` (single ring) | XCZU7EV | 79 470 (34.5 %) | 112 587 (24.4 %) | 173.5 (55.6 %) | 0 | +0.071 ns |
+| `vck190_fmcp1` (512-bit, split ring) | XCVC1902 | 100 036 (11.1 %) | 139 148 (7.7 %) | 222 (23.0 %) | 24 (5.2 %) | +0.052 ns |
 
-On `uzev` the worst path is the HP2-side FIFO of `axi_smc_dma` at `pl_clk3` = 327.77 MHz.
-On `vck190_fmcp1` the worst path is in the base design's PCIe PIPE clock (`ch0_txoutclk`);
-`dp_clk` closes with +0.254 ns and `src_clk` with +0.098 ns (the 256 KB egress FIFO's read
-side), WHS +0.007 ns. `report_noc_qos` on the implemented design: status OPTIMAL, the ring
-port `S09_AXI` gets its 14000 MB/s read and write, the root ports' `S08_AXI` and `S10_AXI`
-their 7000 MB/s read and write each.
+On `uzev` (`N_RING_PORTS` 1: the second ring port and the reader's skid FIFOs are folded
+away) the growth over 1.2 (68 992 LUTs) is the 4096-slot table; the worst path is `pl_clk3`
+(HP2, 327.77 MHz, +0.071 ns), `dp_clk` closes with +0.155 ns. On `vck190_fmcp1` the worst
+path is in the base design's PCIe PIPE clock (`ch0_txoutclk`, +0.052 ns); `dp_clk` closes
+with +0.337 ns and `src_clk` with +0.294 ns, WHS +0.011 ns (one LPDDR4 controller, the
+reader's two 32 KB skid FIFOs). `report_noc_qos`
+on the implemented design: status OPTIMAL, every request met: ring port 0 `S09_AXI`
+14000 MB/s read and write to the DDR4, ring port 1 `noc_lpddr4/S00_AXI` 14000 MB/s to the
+LPDDR4, the root ports' `S08_AXI` and `S10_AXI` 7000 MB/s to the DDR4 and 4000 MB/s to the
+LPDDR4, read and write. (The QoS estimate does not model the NoC's write ordering: it also
+reported OPTIMAL for the first build with two interleaved LPDDR4 controllers, which wrote
+the LPDDR4 at under 2 GB/s per NoC master.)
 
 Vivado reports `IP license key 'nvmehc@2019.04' is enabled with a Hardware_Evaluation
 license` when the evaluation license is used: the bitstream then contains the evaluation

@@ -25,7 +25,7 @@
 
 #include "nvrec_uapi.h"
 
-#define NVREC_DRV_VERSION	"1.1"
+#define NVREC_DRV_VERSION	"1.2"
 
 /* ------------------------------------------------------------------------ */
 /* NVMe definitions (NVM Express Base Specification 2.0; only what we use)  */
@@ -138,6 +138,14 @@ struct nvrec_ha_cfg {
 	s64 bar_offset;		/* IP's view of an SSD BAR = CPU phys + offset */
 	u32 inj_depth;		/* injector commands in flight per SSD */
 	u32 max_slots;		/* MAX_SLOTS register */
+	/* memory 1 of the split ring (register map 1.3): the device tree's
+	 * memory-region (a no-map carve-out the CPU never uses) */
+	phys_addr_t ring1_phys;
+	u64 ring1_size;		/* 0 = no region */
+	u32 stripe_kb;		/* opsero,ring-stripe-kb: the board's default
+				 * stripe (0 = none given) */
+	bool stripe_chunk;	/* opsero,ring-stripe-chunk: the board's default
+				 * stripe is the whole chunk (wins over stripe_kb) */
 };
 
 /* One SSD = one PCIe device behind one of our root ports */
@@ -220,6 +228,8 @@ struct nvrec_dev {
 	u32 beat_bytes;			/* bytes per fabric beat: BEAT_BYTES (1.2), 16 before */
 	u32 fifo_depth;			/* ingest FIFO, beats */
 	u32 egr_fifo_depth;		/* egress FIFO, beats */
+	u32 ring_ports;			/* RING_PORTS (1.3), 1 before */
+	dma_addr_t ring1_dma;		/* memory-1 region as the fabric sees it */
 	u32 caps;
 
 	struct mutex ssd_lock;		/* ssd[] attach/detach */
@@ -242,15 +252,18 @@ struct nvrec_dev {
 	struct nvrec_stats final;	/* snapshot at STOP/ABORT/DONE */
 	bool final_valid;
 
-	/* ring: one physically contiguous region (see nvrec_main.c) */
+	/* ring: one physically contiguous region per memory (nvrec_main.c) */
 	bool ring_ours;			/* allocated by the driver (CMA) */
 	void *ring_cookie;		/* dma_alloc_attrs() cookie */
 	struct page **pages;		/* user ring: pinned pages */
 	unsigned long npages;
 	struct sg_table sgt;
 	bool sgt_mapped;
-	dma_addr_t ring_dma;
-	u64 ring_bytes;
+	dma_addr_t ring_dma;		/* memory-0 part (0 for MEM1) */
+	u64 ring_bytes;			/* memory-0 allocation (CMA / user) */
+	u32 ring_layout;		/* NVREC_RING_SINGLE / SPLIT / MEM1, 0 = no ring */
+	u32 stripe_shift;		/* SPLIT: log2 of the stripe, else 0 */
+	u64 ring1_used;			/* bytes of memory 1 the ring uses */
 	bool ring_ssd_ok;		/* fabric and SSD views of the ring were checked
 					 * equal (a live SSD at SET_RING); else DRY only */
 	u32 chunk;
@@ -276,6 +289,7 @@ static inline bool nvrec_ha_is_dead(struct nvrec_dev *nv)
 }
 bool nvrec_hw_ha_dead(struct nvrec_dev *nv);
 void nvrec_hw_mark_ha_dead(struct nvrec_dev *nv);
+bool nvrec_hw_mem1_ready(struct nvrec_dev *nv);	/* STATE.MEM1_READY (1.3, 2 ports) */
 
 int nvrec_hw_probe(struct nvrec_dev *nv);	/* map, read IDs, config, reset */
 void nvrec_hw_remove(struct nvrec_dev *nv);

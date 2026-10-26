@@ -20,13 +20,20 @@
  *
  * Recording model (docs/source/driver.md has the full description):
  *
- *   1. NVREC_IOC_SET_RING: the ring of chunk-sized slots in PS DDR. One chunk
- *      = one NVMe command. The ring must be physically contiguous (the
- *      hardware addresses slot s at ring base + s * chunk), so by default
- *      (addr = 0) the driver allocates it from CMA; an app may instead pass
- *      a 2 MB-hugepage mapping, accepted only if physically contiguous. The
+ *   1. NVREC_IOC_SET_RING: the ring of chunk-sized slots. One chunk = one
+ *      NVMe command. The ring must be physically contiguous (the hardware
+ *      addresses slot s at ring base + s * chunk), so by default (addr = 0)
+ *      the driver allocates it from CMA; an app may instead pass a
+ *      2 MB-hugepage mapping, accepted only if physically contiguous. The
  *      driver builds the PRP list of every slot once and programs the ring.
  *      The CPU never touches the sample data.
+ *      Split ring (API 4, register map 1.3, NVREC_CAP_SPLIT_RING): on a
+ *      design with two ring ports the ring can be striped over two memories
+ *      -- memory 0 (PS DDR, CMA) and memory 1 (a second DDR the CPU does not
+ *      use, reserved for the ring in the device tree) -- in stripes of
+ *      2^stripe_shift bytes that alternate between them, so each memory
+ *      carries half of the stream (NVREC_RING_SPLIT). NVREC_RING_MEM1 puts
+ *      the whole ring in memory 1 (diagnostics).
  *   2. NVREC_IOC_SET_GEOMETRY: stripe members (SSD, NSID, base LBA), the
  *      array chunk index of the first chunk and the run length. Array chunk
  *      A goes to member A mod N at LBA base[A mod N] + (A div N) * chunk/LBA
@@ -77,8 +84,18 @@
  *    nvrec_info.egr_fifo_depth, NVREC_START_DRY / NVREC_CAP_DRY,
  *    nr_members = 0 in NVREC_IOC_SET_GEOMETRY (DRY runs only),
  *    NVREC_RING_MAX_SLOTS 2048. Same structure layout as 2.
+ * 4: register map 1.3 (driver 1.2) -- split ring: nvrec_ring.flags
+ *    NVREC_RING_SINGLE / SPLIT / MEM1 (in: the layout, 0 = the driver's
+ *    default; out: the layout used), nvrec_ring.stripe_shift (was
+ *    reserved0), nvrec_ring.dma_addr1 (was reserved[0]);
+ *    nvrec_info.ring_ports, ring1_base, ring1_bytes, ring_default,
+ *    stripe_shift (were reserved), NVREC_CAP_SPLIT_RING,
+ *    NVREC_STATUS_MEM1_DOWN; nvrec_stats.wr_port_stall[] / rd_port_wait[]
+ *    (struct nvrec_stats grew by 32 bytes: NVREC_IOC_GET_STATS / STOP /
+ *    ABORT have new numbers); NVREC_RING_MAX_SLOTS 4096. nvrec_info,
+ *    nvrec_ring and the other structures keep their size.
  */
-#define NVREC_API_VERSION               3
+#define NVREC_API_VERSION               4
 
 #define NVREC_DEV_NAME                  "nvrec"         /* /dev/nvrec */
 #define NVREC_DISK_PREFIX               "nvrec"         /* /dev/nvrec<ssd>n1 */
@@ -89,10 +106,13 @@
 #define NVREC_HUGEPAGE                  (2u * 1024 * 1024)
 #define NVREC_MIN_CHUNK                 (64u * 1024)    /* chunk: power of 2 */
 #define NVREC_MAX_CHUNK                 (4u * 1024 * 1024)
-#define NVREC_RING_MAX_SLOTS            2048            /* largest hardware slot table
-							 * (MAX_SLOTS: 2048 on the 1.2
-							 * designs, 1024 before) */
-#define NVREC_RING_MAX_BYTES            (1ull << 30)
+#define NVREC_RING_MAX_SLOTS            4096            /* largest hardware slot table
+							 * (MAX_SLOTS: 4096 on the 1.3
+							 * designs, 2048 on 1.2, 1024
+							 * before) */
+#define NVREC_RING_MAX_BYTES            (1ull << 30)    /* per memory: a single ring,
+							 * each half of a split ring */
+#define NVREC_RING_MAX_BYTES_SPLIT      (2ull << 30)    /* a split ring, both memories */
 
 /* struct nvrec_info.caps */
 #define NVREC_CAP_TPG                   (1u << 0)   /* test pattern generator */
@@ -103,6 +123,11 @@
 #define NVREC_CAP_SWQ                   (1u << 5)   /* IP software queue interface */
 #define NVREC_CAP_DRY                   (1u << 6)   /* fabric-only runs (NVREC_START_DRY),
 						     * register map >= 1.2 */
+#define NVREC_CAP_SPLIT_RING            (1u << 7)   /* API 4: two ring ports (register map
+						     * 1.3) AND a memory-1 region in the
+						     * device tree: NVREC_RING_SPLIT and
+						     * NVREC_RING_MEM1 rings (usable while
+						     * memory 1 is ready: status) */
 
 /* struct nvrec_ssd_info.io_path: how /dev/nvrecXn1 reaches the SSD */
 #define NVREC_PATH_NONE                 0
@@ -141,6 +166,28 @@ struct nvrec_ssd_info {
 						     * responding (evaluation license
 						     * expired?): no NVMe I/O until the
 						     * bitstream is reloaded */
+#define NVREC_STATUS_MEM1_DOWN          (1u << 1)   /* API 4: NVREC_CAP_SPLIT_RING, but
+						     * memory 1 is not ready (STATE.
+						     * MEM1_READY = 0: the PL DDR4
+						     * controller did not calibrate): no
+						     * split / MEM1 ring */
+
+/* struct nvrec_ring.flags: the ring layout (API 4), one of */
+#define NVREC_RING_SINGLE               (1u << 0)   /* one ring in memory 0 (as API 3) */
+#define NVREC_RING_SPLIT                (1u << 1)   /* striped over memory 0 and 1 */
+#define NVREC_RING_MEM1                 (1u << 2)   /* one ring in memory 1 (diagnostics) */
+#define NVREC_RING_LAYOUT_MASK          (NVREC_RING_SINGLE | NVREC_RING_SPLIT | NVREC_RING_MEM1)
+#define NVREC_STRIPE_SHIFT_MIN          12          /* 4 KB stripes */
+#define NVREC_STRIPE_SHIFT_CHUNK        31          /* "one chunk": nvrec_info.stripe_shift
+						     * when the default stripe is the whole
+						     * chunk; accepted by SET_RING too */
+
+/* nvrec_info.ring_default: the layout of a SET_RING with flags = 0 (the
+ * driver's module parameter ring_split) for runs over 2 members and for
+ * fabric-only runs [7:0], for runs over 1 member [15:8]. SET_RING itself
+ * uses [7:0]; apps that know their member count pass the layout. */
+#define NVREC_RING_DEFAULT(ring_default, members) \
+	((__u32)(((members) == 1 ? (ring_default) >> 8 : (ring_default)) & 0xffu))
 
 /* NVREC_IOC_GET_INFO */
 struct nvrec_info {
@@ -161,28 +208,64 @@ struct nvrec_info {
 	__u32 status;           /* NVREC_STATUS_* */
 	struct nvrec_ssd_info ssd[NVREC_MAX_SSD];
 	__u32 egr_fifo_depth;   /* egress FIFO depth in beats (API 3) */
-	__u32 reserved0;
-	__u64 reserved[3];
+	__u32 ring_ports;       /* API 4: ring AXI4 masters (RING_PORTS): 1, or 2 =
+				 * the hardware can split the ring */
+	__u64 ring1_base;       /* API 4: memory-1 region for the ring (device
+				 * tree memory-region), bus address; 0 = none */
+	__u64 ring1_bytes;      /* API 4: its size (0 = no memory 1: single ring
+				 * only); the memory-1 part of a ring must fit */
+	__u32 ring_default;     /* API 4: NVREC_RING_DEFAULT() */
+	__u32 stripe_shift;     /* API 4: the driver's default split-ring stripe,
+				 * log2(bytes) (module parameter stripe_kb /
+				 * device tree), used up to log2(chunk);
+				 * NVREC_STRIPE_SHIFT_CHUNK = the whole chunk */
 };
 
 /*
- * NVREC_IOC_SET_RING. addr = 0: the driver allocates bytes from CMA
- * (physically contiguous; the cma= kernel argument must leave room).
+ * NVREC_IOC_SET_RING. addr = 0: the driver allocates the memory-0 part from
+ * CMA (physically contiguous; the cma= kernel argument must leave room).
  * addr != 0: a 2 MB aligned hugepage mapping of bytes, accepted only if
- * physically contiguous. bytes: multiple of 2 MB, at most
- * NVREC_RING_MAX_BYTES; chunk: power of two in [NVREC_MIN_CHUNK,
- * NVREC_MAX_CHUNK], at most every live SSD's MDTS; slots = bytes / chunk
- * in 2..max_slots. Only while idle; bytes = 0 frees the ring.
+ * physically contiguous, for a single ring in memory 0 only. bytes:
+ * multiple of 2 MB, the whole ring (both memories when split); chunk:
+ * power of two in [NVREC_MIN_CHUNK, NVREC_MAX_CHUNK], at most every live
+ * SSD's MDTS; slots = bytes / chunk in 2..max_slots. Only while idle;
+ * bytes = 0 frees the ring.
+ *
+ * Layout (flags, API 4; 0 = the driver's default, NVREC_RING_DEFAULT()):
+ *   SINGLE  bytes <= NVREC_RING_MAX_BYTES in memory 0 (as API 3)
+ *   SPLIT   needs NVREC_CAP_SPLIT_RING and memory 1 ready. Ring byte g
+ *           (g = slot * chunk + offset) is in stripe i = g >> S (S =
+ *           stripe_shift, 12 .. log2(chunk); NVREC_STRIPE_SHIFT_CHUNK =
+ *           log2(chunk)), stripe i in memory i & 1 at
+ *           ((i >> 1) << S) + (g & (2^S - 1)) from that memory's base: S = 12
+ *           alternates every 4 KB, S = log2(chunk) puts slot s in memory
+ *           s & 1. Memory 0 (CMA) holds ceil(stripes / 2) stripes, memory 1
+ *           (the start of the memory-1 region) the rest: an even slot count
+ *           (or S < log2(chunk)) is exactly half each. bytes <=
+ *           NVREC_RING_MAX_BYTES_SPLIT, each part <= NVREC_RING_MAX_BYTES,
+ *           the memory-1 part <= nvrec_info.ring1_bytes.
+ *   MEM1    the whole ring at the start of the memory-1 region (no CMA):
+ *           bytes <= nvrec_info.ring1_bytes.
+ * The PRP lists are always in memory 0 (CMA, 4 KB per slot; 8/16 KB for
+ * 4 MB chunks).
  */
 struct nvrec_ring {
 	__u64 addr;             /* 0 = driver-allocated */
 	__u64 bytes;
 	__u32 chunk;            /* bytes per chunk = per NVMe command */
-	__u32 flags;            /* must be 0 */
+	__u32 flags;            /* in: NVREC_RING_SINGLE / SPLIT / MEM1, or 0 = the
+				 * driver's default; out: the layout used */
 	__u32 slots;            /* out: bytes / chunk */
-	__u32 reserved0;
-	__u64 dma_addr;         /* out: ring bus address (diagnostics) */
-	__u64 reserved[2];
+	__u32 stripe_shift;     /* API 4. in: SPLIT stripe, log2(bytes) in
+				 * 12..log2(chunk), NVREC_STRIPE_SHIFT_CHUNK =
+				 * one chunk, 0 = the driver's default
+				 * (nvrec_info.stripe_shift, at most log2(chunk));
+				 * out: the stripe used, 0 unless SPLIT */
+	__u64 dma_addr;         /* out: bus address of the memory-0 part
+				 * (diagnostics), 0 for MEM1 */
+	__u64 dma_addr1;        /* API 4. out: bus address of the memory-1 part
+				 * (SPLIT, MEM1), else 0 */
+	__u64 reserved[1];
 };
 
 struct nvrec_member {
@@ -313,7 +396,14 @@ struct nvrec_stats {
 	__u64 prefill_ns;       /* playback with the checker: start -> sink
 				 * enabled (ring prefill); elapsed_ns - prefill_ns
 				 * is the streaming time */
-	__u64 reserved[1];
+	/* API 4 (register map 1.3), per ring port p = memory p, dp_clk cycles
+	 * since START, saturating at 0xFFFFFFFF (17 s at 250 MHz); 0 before 1.3 */
+	__u32 wr_port_stall[2]; /* record: the ring writer's head beat waited
+				 * for port p (WR_PORT_STALL) */
+	__u32 rd_port_wait[2];  /* playback: the ring reader waited for read
+				 * data of port p with room in the egress FIFO
+				 * (RD_PORT_WAIT) */
+	__u64 reserved[3];
 };
 
 /* NVREC_IOC_WAIT: block until the run has ended, or timeout */

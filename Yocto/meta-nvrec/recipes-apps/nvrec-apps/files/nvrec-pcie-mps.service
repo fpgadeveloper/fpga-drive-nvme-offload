@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# PCIe MaxPayload of the nvrec SSDs and their root ports at boot (nvrec-mps):
+# NVREC_MPS in /etc/default/nvrec-mps (the image's NVREC_MPS; 128 = the
+# kernel's setting is kept). Enabled in images whose NVREC_MPS is not 128
+# (vck190_fmcp1, zcu106_hpc0: 256). Runs once the driver has claimed the SSDs; logs the
+# values before and after (journal and kernel log).
+[Unit]
+Description=PCIe MaxPayload of the FPGA Drive NVMe-offload SSDs (nvrec-mps)
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nvrec-mps boot
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

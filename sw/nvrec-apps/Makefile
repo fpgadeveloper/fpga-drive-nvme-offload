@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Opsero Electronic Design Inc.  All rights reserved.
 #
-# FPGA Drive NVMe-offload recorder apps: nvrec, nvplay, nvverify,
-# nvbench.sh, nvbench-suite.sh, nvsetup-raid0.sh.
+# FPGA Drive NVMe-offload recorder apps: nvrec, nvplay, nvverify, nvregs,
+# nvbench.sh, nvbench-suite.sh, nvsetup-raid0.sh, nvrec-mps.
 #
 #   make                         build with the system compiler
 #   make CC=aarch64-linux-gnu-gcc
@@ -23,7 +23,7 @@ CFLAGS ?= -O2 -g
 NVREC_CFLAGS = -Wall -Wextra -std=gnu11 -I$(NVREC_INCLUDE) -DNVREC_TARGET='"$(NVREC_TARGET)"'
 
 PROGS = nvrec nvplay nvverify nvregs
-SCRIPTS = nvbench.sh nvbench-suite.sh nvsetup-raid0.sh
+SCRIPTS = nvbench.sh nvbench-suite.sh nvsetup-raid0.sh nvrec-mps
 HEADERS = nvrec_common.h nvrec_file.h nvrec_vol.h nvrec_ctl.h $(NVREC_INCLUDE)/nvrec_uapi.h
 LIBSRC = nvrec_vol.c nvrec_ctl.c
 

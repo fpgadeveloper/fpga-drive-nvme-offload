@@ -18,7 +18,10 @@ inherit module
 # version). 1.1: fabric beat size from the BEAT_BYTES register (register map
 # 1.2: 128/256/512-bit datapaths), fabric-only (DRY) runs, APST switched off
 # at probe (module parameter apst), SMART temperature in sysfs.
-PV = "1.1"
+# 1.2: split ring over two memories (register map 1.3, uapi API 4): ring B in
+# the device tree's memory-region (bsp/<target> system-user.dtsi), module
+# parameters ring_split and stripe_kb, ring-port wait counters.
+PV = "1.2"
 
 # Sources come straight from this repository (no fetch): sw/nvrec-driver and
 # the shared headers in include/ (nvrec_regs.h, nvrec_uapi.h). Both unpack

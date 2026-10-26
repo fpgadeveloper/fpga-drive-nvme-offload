@@ -72,3 +72,19 @@ set_property LOC PCIE40E4_X0Y1 [get_cells -hierarchical -filter { PRIMITIVE_TYPE
 
 set_property LOC PCIE40E4_X0Y0 [get_cells -hierarchical -filter { PRIMITIVE_TYPE =~ ADVANCED.PCIE.* && NAME =~ "*xdma_1*" }]
 
+
+#####################################################################
+# Split ring (register map 1.3): PL DDR4 controller ddr4_0 (banks 64-66)
+#####################################################################
+# Keep each byte lane's write-data registers (the MIG's u_ddr_mc_write
+# genByte[n]) in the clock region of its I/O bank: data bytes 0-3 sit in
+# CLOCKREGION_X2Y1, bytes 4-7 in X2Y2 (address/command in X2Y3). Left free,
+# the placer moved part of them one clock region away in this congested
+# design and the XIPHY pulse-width check "Min Skew" between the D[1] and D[2]
+# inputs of a DQ bitslice failed (-0.283 ns, byte lane 1, 2026-10-23).
+create_pblock pb_ddr4_wr_x2y1
+add_cells_to_pblock pb_ddr4_wr_x2y1 [get_cells -hierarchical -regexp -filter {IS_PRIMITIVE && NAME =~ "nvrec_i/ddr4_0/.*/u_ddr_mc_write/genByte\[[0-3]\]\..*"}]
+resize_pblock pb_ddr4_wr_x2y1 -add {CLOCKREGION_X2Y1:CLOCKREGION_X2Y1}
+create_pblock pb_ddr4_wr_x2y2
+add_cells_to_pblock pb_ddr4_wr_x2y2 [get_cells -hierarchical -regexp -filter {IS_PRIMITIVE && NAME =~ "nvrec_i/ddr4_0/.*/u_ddr_mc_write/genByte\[[4-7]\]\..*"}]
+resize_pblock pb_ddr4_wr_x2y2 -add {CLOCKREGION_X2Y2:CLOCKREGION_X2Y2}

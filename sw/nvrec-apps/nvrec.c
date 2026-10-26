@@ -78,7 +78,9 @@ struct opts {
 	bool rate_set;
 	uint32_t chunk;
 	bool chunk_set;
-	uint32_t slots;         /* 0 = default: 512 MB of slots */
+	uint32_t slots;         /* 0 = default: 512 MB of slots (1 GB split) */
+	uint32_t ring;          /* --ring: NVREC_RING_*, 0 = auto */
+	uint32_t stripe_kb;     /* --stripe: 0 = driver default, CTL_STRIPE_CHUNK */
 	uint32_t qd;
 	bool no_tpg;
 	bool fua;
@@ -110,11 +112,22 @@ static void usage(FILE *f)
 "  --chunk <bytes>       bytes per NVMe command (default: 1M or the drives'\n"
 "                        MDTS, whichever is smaller; must equal the md chunk of\n"
 "                        a RAID0 volume)\n"
-"  --buffers <n>         ring slots of --chunk bytes in DDR, 2..2048, at most the\n"
-"                        hardware slot table (default: 512 MB of slots, 512 MB /\n"
-"                        chunk within 256..2048: 2048 x 256K, 1024 x 512K,\n"
-"                        512 x 1M); the ring and its PRP lists come from CMA\n"
-"                        (cma= kernel argument)\n"
+"  --buffers <n>         ring slots of --chunk bytes in DDR, 2..4096, at most the\n"
+"                        hardware slot table (default: 512 MB of slots, 1 GB\n"
+"                        for a split ring: bytes / chunk within 256..4096, e.g.\n"
+"                        1024 x 512K single, 2048 x 512K split); the ring (its\n"
+"                        PS DDR part) and its PRP lists come from CMA (cma=\n"
+"                        kernel argument); a split ring with whole-chunk\n"
+"                        stripes uses an even count (an odd one is rounded\n"
+"                        down: each SSD then writes one memory only)\n"
+"  --ring <layout>       auto (default: the driver's choice -- split on a design\n"
+"                        with a second ring memory, single for one SSD), single\n"
+"                        (PS DDR), split (striped over PS DDR and the second\n"
+"                        memory, half the load on each) or mem1 (all in the\n"
+"                        second memory, diagnostics); register map 1.3\n"
+"  --stripe <KB>|chunk   split ring: stripe unit, a power of two from 4 KB to the\n"
+"                        chunk (default: the driver's, the whole chunk on VCK190\n"
+"                        and ZCU106); 'chunk' = whole slots alternate\n"
 "  --qd <n>              NVMe commands in flight per SSD, 1..63 (default 32)\n"
 "  --no-tpg              do not touch the generator (user's own data source)\n"
 "  --fua                 Force Unit Access on every write\n"
@@ -153,6 +166,8 @@ static int parse_args(int argc, char **argv, struct opts *o)
 		{ "rate", required_argument, NULL, 'r' },
 		{ "chunk", required_argument, NULL, 'c' },
 		{ "buffers", required_argument, NULL, 'b' },
+		{ "ring", required_argument, NULL, 'G' },
+		{ "stripe", required_argument, NULL, 'X' },
 		{ "qd", required_argument, NULL, 'Q' },
 		{ "no-tpg", no_argument, NULL, 'N' },
 		{ "fua", no_argument, NULL, 'F' },
@@ -202,6 +217,14 @@ static int parse_args(int argc, char **argv, struct opts *o)
 			if (parse_size(optarg, &v) || v < 2 || v > NVREC_RING_MAX_SLOTS)
 				return die_usage("--buffers must be 2..%d", NVREC_RING_MAX_SLOTS);
 			o->slots = (uint32_t)v;
+			break;
+		case 'G':
+			if (ctl_parse_ring(optarg, &o->ring))
+				return die_usage("--ring must be auto, single, split or mem1");
+			break;
+		case 'X':
+			if (ctl_parse_stripe(optarg, &o->stripe_kb))
+				return die_usage("--stripe must be a power of two in KB, 4..4096, or 'chunk'");
 			break;
 		case 'Q':
 			if (parse_size(optarg, &v) || v < 1 || v > 63)
@@ -296,17 +319,20 @@ static void fill_header(struct nvrec_file_header *h, const struct opts *o,
 	h->lat_max_ns = htole64((uint64_t)(ctl_cycles_to_us(info, st->lat_max) * 1e3));
 }
 
-/* ring slots: the default (512 MB of slots) or --buffers within the hardware */
-static int pick_slots(struct opts *o, const struct nvrec_info *info)
+/* ring slots: the default (512 MB of slots, 1 GB split) or --buffers within
+ * the hardware (ctl_set_ring checks the sizes) */
+static int pick_slots(struct opts *o, const struct nvrec_info *info, uint32_t layout)
 {
 	if (!o->slots) {
-		o->slots = ctl_default_slots(o->chunk, info->max_slots);
+		o->slots = ctl_default_slots(o->chunk, info->max_slots, layout);
 	} else if (info->max_slots && o->slots > info->max_slots) {
 		err_msg("--buffers %u exceeds the hardware slot table (%u)", o->slots, info->max_slots);
 		return -1;
-	} else if ((uint64_t)o->chunk * o->slots > NVREC_RING_MAX_BYTES) {
-		err_msg("ring of %u x %u bytes is larger than %llu MB: use fewer --buffers",
-			o->slots, o->chunk, NVREC_RING_MAX_BYTES >> 20);
+	} else if ((uint64_t)o->chunk * o->slots > (layout == NVREC_RING_SPLIT ?
+						      NVREC_RING_MAX_BYTES_SPLIT : NVREC_RING_MAX_BYTES)) {
+		err_msg("%s ring of %u x %u bytes is larger than %llu MB: use fewer --buffers",
+			ctl_ring_name(layout), o->slots, o->chunk,
+			(layout == NVREC_RING_SPLIT ? NVREC_RING_MAX_BYTES_SPLIT : NVREC_RING_MAX_BYTES) >> 20);
 		return -1;
 	}
 	return 0;
@@ -325,14 +351,17 @@ static int record_dry(struct opts *o)
 	struct nvrec_ring ring;
 	struct nvrec_start start;
 	struct nvrec_stats st;
-	char res[CTL_RESULT_MAX];
+	char res[CTL_RESULT_MAX], rdesc[64];
 	uint64_t nchunks;
+	uint32_t layout;
 	double seconds;
 	int fd, r, ret = 1;
 
 	fd = ctl_open(o->device, &info, true);
 	if (fd < 0)
 		return ctl_exit_code();
+	if (ctl_ring_layout(&info, o->ring, o->stripe_kb, 0, &layout))
+		goto out;
 	if (o->chunk > info.max_chunk) {
 		/* SET_RING still checks the chunk against the live SSDs' MDTS */
 		if (o->chunk_set) {
@@ -342,7 +371,7 @@ static int record_dry(struct opts *o)
 		}
 		o->chunk = info.max_chunk;
 	}
-	if (pick_slots(o, &info))
+	if (pick_slots(o, &info, layout))
 		goto out;
 	nchunks = (o->size + o->chunk - 1) / o->chunk;
 	if (nchunks > UINT32_MAX) {
@@ -358,7 +387,7 @@ static int record_dry(struct opts *o)
 		}
 		o->rate = rr.rate_bps;
 	}
-	if (ctl_set_ring(fd, o->chunk, o->slots, &ring))
+	if (ctl_set_ring(fd, &info, o->chunk, o->slots, layout, o->stripe_kb, &ring))
 		goto out;
 	memset(&g, 0, sizeof(g));
 	g.nr_members = 0;			/* no SSD */
@@ -375,8 +404,9 @@ static int record_dry(struct opts *o)
 	}
 	if (!o->quiet)
 		fprintf(stderr, "nvrec: --no-write: %" PRIu64 " x %u-byte chunks into the ring (%u slots, %"
-			PRIu64 " MB), fabric only, %u-byte beats, nothing is written\n",
-			nchunks, o->chunk, ring.slots, (uint64_t)ring.bytes >> 20, info.beat_bytes);
+			PRIu64 " MB, %s), fabric only, %u-byte beats, nothing is written\n",
+			nchunks, o->chunk, ring.slots, (uint64_t)ring.bytes >> 20,
+			ctl_ring_describe(&ring, rdesc, sizeof(rdesc)), info.beat_bytes);
 	{
 		struct ctl_run_opts ro = {
 			.stats = o->stats, .timeout = o->timeout, .quiet = o->quiet,
@@ -391,8 +421,9 @@ static int record_dry(struct opts *o)
 	ctl_print_summary(prog_name, &info, &st, seconds, true);
 	printf("nvrec: dropped beats %" PRIu64 ", FIFO high-water during the run %u of %u beats\n",
 	       (uint64_t)st.drop_count, st.fifo_hwm, st.fifo_depth);
-	printf("nvrec: ring %u slots x %u bytes = %" PRIu64 " MB (filled and released at once)\n",
-	       ring.slots, o->chunk, (uint64_t)ring.bytes >> 20);
+	printf("nvrec: ring %u slots x %u bytes = %" PRIu64 " MB, %s (filled and released at once)\n",
+	       ring.slots, o->chunk, (uint64_t)ring.bytes >> 20,
+	       ctl_ring_describe(&ring, rdesc, sizeof(rdesc)));
 	snprintf(res, sizeof(res), "bytes=%" PRIu64 " seconds=%.3f rate_bps=%" PRIu64
 		 " drops=%" PRIu64 " fifo_hwm=%u fifo_depth=%u error=%d nvme_errors=%u"
 		 " chunk=%u qd=0 members=0 ring_hwm=%u lat_avg_us=0 lat_max_us=0"
@@ -430,10 +461,10 @@ int main(int argc, char **argv)
 	struct vol_target t;
 	struct exfat_vol vol = { .fd = -1 };
 	struct exfat_file xf;
-	char err[512], res[CTL_RESULT_MAX];
+	char err[512], res[CTL_RESULT_MAX], rdesc[64];
 	bool unmounted = false;
 	uint64_t dev_off = 0, alloc = 0, array_off, nchunks, prealloc = 0, stop_ns;
-	uint32_t data_off = 0;
+	uint32_t data_off = 0, layout;
 	unsigned lba_shift = 9;
 	double seconds;
 	int fd = -1, ret = 1, r;
@@ -499,7 +530,9 @@ int main(int argc, char **argv)
 			info.max_chunk);
 		goto out;
 	}
-	if (pick_slots(&o, &info))
+	if (ctl_ring_layout(&info, o.ring, o.stripe_kb, g.nr_members, &layout))
+		goto out;
+	if (pick_slots(&o, &info, layout))
 		goto out;
 	nchunks = (o.size + o.chunk - 1) / o.chunk;
 	if (nchunks > UINT32_MAX) {
@@ -602,7 +635,7 @@ int main(int argc, char **argv)
 		}
 		o.rate = rr.rate_bps;
 	}
-	if (ctl_set_ring(fd, o.chunk, o.slots, &ring))
+	if (ctl_set_ring(fd, &info, o.chunk, o.slots, layout, o.stripe_kb, &ring))
 		goto out_unlink;
 	g.start_chunk = array_off / o.chunk;
 	g.length_chunks = (uint32_t)nchunks;
@@ -620,9 +653,10 @@ int main(int argc, char **argv)
 	}
 	if (!o.quiet)
 		fprintf(stderr, "nvrec: %s: %" PRIu64 " x %u-byte chunks from array chunk %" PRIu64
-			" over %u member(s), ring %u slots (%" PRIu64 " MB), qd %u\n",
+			" over %u member(s), ring %u slots (%" PRIu64 " MB, %s), qd %u\n",
 			o.raw ? t.dev : o.output, nchunks, o.chunk, (uint64_t)g.start_chunk,
-			g.nr_members, ring.slots, (uint64_t)ring.bytes >> 20, o.qd ? o.qd : 32);
+			g.nr_members, ring.slots, (uint64_t)ring.bytes >> 20,
+			ctl_ring_describe(&ring, rdesc, sizeof(rdesc)), o.qd ? o.qd : 32);
 	{
 		struct ctl_run_opts ro = {
 			.stats = o.stats, .timeout = o.timeout, .quiet = o.quiet,
@@ -697,8 +731,9 @@ int main(int argc, char **argv)
 	printf("nvrec: dropped beats %" PRIu64 ", FIFO high-water during the run %u of %u beats%s\n",
 	       (uint64_t)st.drop_count, st.fifo_hwm, st.fifo_depth,
 	       o.raw ? "" : "; file header + padding before the data");
-	printf("nvrec: ring %u slots x %u bytes = %" PRIu64 " MB, high-water %u slots\n",
-	       ring.slots, o.chunk, (uint64_t)ring.bytes >> 20, st.ring_hwm);
+	printf("nvrec: ring %u slots x %u bytes = %" PRIu64 " MB, %s, high-water %u slots\n",
+	       ring.slots, o.chunk, (uint64_t)ring.bytes >> 20,
+	       ctl_ring_describe(&ring, rdesc, sizeof(rdesc)), st.ring_hwm);
 	/* one machine-readable line for scripts (nvbench.sh), fdrec-compatible keys */
 	snprintf(res, sizeof(res), "bytes=%" PRIu64 " seconds=%.3f rate_bps=%" PRIu64
 	       " drops=%" PRIu64 " fifo_hwm=%u fifo_depth=%u error=%d nvme_errors=%u"

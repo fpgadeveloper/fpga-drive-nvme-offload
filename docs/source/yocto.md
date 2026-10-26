@@ -101,8 +101,8 @@ On top of the EDF defaults, two layers are added:
 
   | Recipe / file | What it adds |
   |---------------|--------------|
-  | `recipes-kernel/nvrec-mod` | the `nvrec.ko` kernel module (version 1.1), built from `sw/nvrec-driver` and `include/`, loaded at boot; `/etc/modprobe.d/nvrec-blacklist-nvme.conf` (`blacklist nvme`) |
-  | `recipes-apps/nvrec-apps` | `nvrec`, `nvplay`, `nvverify`, `nvregs`, `nvbench.sh`, `nvbench-suite.sh`, `nvsetup-raid0.sh` (version 1.1), built from `sw/nvrec-apps` |
+  | `recipes-kernel/nvrec-mod` | the `nvrec.ko` kernel module (version 1.2), built from `sw/nvrec-driver` and `include/`, loaded at boot; `/etc/modprobe.d/nvrec-blacklist-nvme.conf` (`blacklist nvme`) |
+  | `recipes-apps/nvrec-apps` | `nvrec`, `nvplay`, `nvverify`, `nvregs`, `nvbench.sh`, `nvbench-suite.sh`, `nvsetup-raid0.sh`, `nvrec-mps` (version 1.2), built from `sw/nvrec-apps`; `nvrec-pcie-mps.service` and `/etc/default/nvrec-mps` (`NVREC_MPS`, below) |
   | `recipes-apps/speed-tests` | the base design's dd speed tests |
   | `recipes-kernel/linux/linux-xlnx_%.bbappend` + `nvrec.cfg` | kernel options: `CONFIG_BLK_DEV_NVME=m` (+ `NVME_CORE=m`), `CONFIG_DMA_CMA`, `CONFIG_HUGETLBFS`, `CONFIG_MD_RAID0` (+ `CONFIG_BLK_DEV_MD`), `CONFIG_EXFAT_FS`, `CONFIG_NLS_UTF8` |
   | `recipes-core/images/edf-linux-disk-image.bbappend` | image packages: the module and apps, `mdadm`, `exfatprogs`, `nvme-cli`, `fio`, util-linux tools, and bench tools (`devmem2`, `i2c-tools`, `ethtool`, `iproute2`, `iperf3`, `phytool`, `pciutils`, SSH server) |
@@ -134,11 +134,31 @@ CMA pool is 1024M; on `vck190_fmcp1` it is 1536M, as on `zcu106_hpc0`.
 
 The target-specific arguments come from `BSP_EXTRA_BOOTARGS` in
 `Yocto/bsp/<target>/conf/local.conf.append`. `cma=` sizes the contiguous memory pool from
-which the driver allocates the recording ring (one physically contiguous region; by default
-512 MB of chunks of 1 MB or the MDTS, plus 4 KB of PRP list per chunk; at most 2048 chunks
-and 1 GB): variable `NVREC_CMA` (1536M on `zcu106_hpc0`
+which the driver allocates the recording ring's PS DDR part (one physically contiguous
+region; by default 512 MB of chunks of 1 MB or the MDTS — the whole single ring, or the
+PS DDR half of the default 1 GB split ring — plus 4 KB of PRP list per chunk; at most 4096
+chunks and 1 GB): variable `NVREC_CMA` (1536M on `zcu106_hpc0`
 and `vck190_fmcp1`, 1024M on `uzev`). `NVREC_HUGEPAGES` (default 0) adds
 `hugepagesz=2M hugepages=N` for apps that bring their own ring.
+
+**PCIe MaxPayload.** `nvrec-pcie-mps.service` (from `nvrec-apps`) sets the MaxPayload of the
+SSDs and their root ports at boot to the recipe variable `NVREC_MPS` (`nvrec-mps boot`, see
+[Apps](apps.md#nvrec-mps)). The recipe's default is 128 — the kernel's setting is kept and the
+service is not enabled, as on `uzev` — and the `meta-user/recipes-apps/nvrec-apps/nvrec-apps.bbappend`
+of `bsp/zcu106_hpc0` and of `bsp/vck190_fmcp1` set 256 for those targets, where it was measured
+to help. Set it per target the same way;
+it is written to `/etc/default/nvrec-mps`, where it can also be changed on the board. A
+boot-time `setpci` is used rather than the kernel's `pci=pcie_bus_perf`, which would also
+lower MaxReadReq to the MaxPayload, pick the largest value both ends support instead of the
+measured one, and apply to every PCIe device.
+
+The other half of a split ring is not CMA: on `zcu106_hpc0` and `vck190_fmcp1` the target's
+`system-user.dtsi` reserves the first 1 GB of the second ring memory (PL DDR4 at
+`0x20_0000_0000`, LPDDR4 at `0x600_0000_0000`) as a `no-map` reserved-memory region and hands it
+to the `opsero,nvrec` node (`memory-region`), together with the board's default stripe
+(`opsero,ring-stripe-chunk`: whole chunks on both; why:
+[Kernel driver](driver.md#split-ring-one-ring-in-two-memories)); see
+[Kernel driver](driver.md#device-tree).
 
 ## Boot from SD card
 
@@ -186,24 +206,36 @@ Then boot:
 5. Power up the board.
 
 On the VCK190, U-Boot first prints `FPGA Drive FMC: enabling VADJ (1.5V) via IR38164`
-(see [supported carriers](supported_carriers.md#vck190)). During boot, look for the PCIe
-links, the recorder driver and its SSD lines (ZCU106 with two Samsung 980 PRO; values
+(see [supported carriers](supported_carriers.md#vck190)). During boot, look for the second
+memory's reserved region, the PCIe links, the recorder driver and its SSD lines, and the
+MaxPayload that `nvrec-pcie-mps.service` sets (ZCU106 with two Samsung 980 PRO 1TB; values
 depend on the drives; the `nvrec 420010000.nvrec` line is one line, wrapped here):
 
 ```none
+OF: reserved mem: 0x0000002000000000..0x000000203fffffff (1048576 KiB) nomap non-reusable nvrec-ring1@2000000000
 xilinx-xdma-pcie 400000000.axi-pcie: PCIe Link is UP
 xilinx-xdma-pcie 500000000.axi-pcie: PCIe Link is UP
-nvrec 420010000.nvrec: /dev/nvrec: driver 1.1, nvrec_core v1.2, src_clk 249975021 Hz, dp_clk 249975021 Hz,
-  beat 32 bytes, FIFO 8192/4096 beats (ingest/egress), 2048 ring slots, DRY; nvmeha: 2 SSDs x 1 queues
+nvrec 420010000.nvrec: /dev/nvrec: driver 1.2, nvrec_core v1.3, src_clk 249975021 Hz, dp_clk 249975021 Hz,
+  beat 32 bytes, FIFO 8192/4096 beats (ingest/egress), 4096 ring slots, DRY, ring ports 2,
+  mem1 0x2000000000 1024 MB, default ring split, stripe chunk; nvmeha: 2 SSDs x 1 queues
   (SQ window 0x90000000, CQ window 0x90008000), hardware queues, CPU I/O via the injector
-nvrec-nvme 0000:01:00.0: SSD0: APST enabled by the drive -> disabled (module parameter apst=0)
+nvrec-nvme 0000:01:00.0: SSD0: APST disabled (the drive's setting)
 nvrec-nvme 0000:01:00.0: SSD0: Samsung SSD 980 PRO 1TB (<serial>, fw 5B2QGXA7): 1953525168 x 512-byte LBAs (1000 GB), MDTS 512 KB, DSTRD 0, 1 I/O queues granted, 0 SW + 1 HW queues in the IP, block I/O via the CPU command injector -> /dev/nvrec0n1
-nvrec-nvme 0000:01:00.0: SSD0: composite temperature 34 C (warning 82 C, critical 85 C; 0 = not reported)
+nvrec-nvme 0000:01:00.0: SSD0: composite temperature 32 C (warning 82 C, critical 85 C; 0 = not reported)
 nvrec-nvme 0001:01:00.0: SSD1: ...
+nvrec-mps: NVREC_MPS 256 (/etc/default/nvrec-mps): setting it on the nvrec SSDs and their root ports
+nvrec-mps: root port 0000:00:00.0: MaxPayload 128 -> 256 (MaxReadReq 512 unchanged)
+nvrec-mps: SSD       0000:01:00.0: MaxPayload 128 -> 256 (MaxReadReq 512 unchanged)
+nvrec-mps: root port 0001:00:00.0: MaxPayload 128 -> 256 (MaxReadReq 512 unchanged)
+nvrec-mps: SSD       0001:01:00.0: MaxPayload 128 -> 256 (MaxReadReq 512 unchanged)
 ```
 
-`driver 1.1, nvrec_core v1.2, beat 32 bytes` identifies this revision (256-bit datapath; the
-512-bit `vck190_fmcp1` shows `beat 64 bytes`);
+On `vck190_fmcp1` the region is `nvrec-ring1@60000000000` (the LPDDR4); `uzev` keeps the
+kernel's MaxPayload of 128 bytes and logs no `nvrec-mps` lines.
+
+`driver 1.2, nvrec_core v1.3, beat 32 bytes, ring ports 2` identifies this revision (256-bit
+datapath, split ring; the 512-bit `vck190_fmcp1` shows `beat 64 bytes` and `mem1 0x60000000000`,
+`uzev` `ring ports 1, single ring`);
 [Test the design in Linux](linux_test.md#1-check-the-pcie-links-and-the-ssds) explains every
 field.
 

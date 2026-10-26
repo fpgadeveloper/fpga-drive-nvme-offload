@@ -460,6 +460,13 @@ if {$dual_design} {
 #  PS:       M_AXI_HPM0_FPD -> periph_intercon_0 -> nvrec_core_0 regs,
 #            nvmeha_guard (AXI-Lite timeout guard) -> nvmeha_0 S_AXI_LITE,
 #            and (through smc_bar_0) xdma_0/S_AXI_B; M_AXI_HPM1_FPD -> periph_intercon_1 -> smc_bar_1
+#  Split ring (register map 1.3, ring_mem pl_ddr4 in config/data.json): memory 1 =
+#  the soldered PL DDR4 behind a DDR4 controller (ddr4_0, board interface
+#  nvrec_ring_mem_intf, 64 bits, 512-bit AXI at ui_clk 300 MHz), 2 GB at
+#  0x20_0000_0000, for the ring master and the root ports only (not the PS):
+#            nvrec_core_0/m_axi1 --DWb @ dp_clk--> smc_mig -> ddr4_0/C0_DDR4_S_AXI
+#            xdma_N/M_AXI_B -> smc_ssd_N/M02_AXI --> smc_mig (S01/S02)
+#            ddr4_0/c0_init_calib_complete -> nvrec_core_0/mem1_ready (STATE.MEM1_READY)
 #
 # DWb = nvrec_data_width bits (256 on the reference designs: 8.0 GB/s from the
 # source and into the sink). The HP2 port (128 bits x pl_clk3: 5.16 GB/s peak on
@@ -562,7 +569,9 @@ set_property -dict [list CONFIG.DATA_WIDTH $nvrec_data_width \
   CONFIG.DP_CLK_HZ $dp_clk_hz \
   CONFIG.FIFO_DEPTH $nvrec_ing_fifo_depth \
   CONFIG.EGR_FIFO_DEPTH $nvrec_egr_fifo_depth \
-  CONFIG.SLOT_W $nvrec_slot_w] [get_bd_cells nvrec_core_0]
+  CONFIG.SLOT_W $nvrec_slot_w \
+  CONFIG.N_RING_PORTS $nvrec_ring_ports \
+  CONFIG.RD_SKID_DEPTH $nvrec_rd_skid_depth] [get_bd_cells nvrec_core_0]
 
 connect_bd_intf_net [get_bd_intf_pins user_data_source/M_AXIS] [get_bd_intf_pins nvrec_core_0/s_axis]
 foreach p {tpg_enable tpg_seq_rst tpg_rate_inc tpg_seq_next} {
@@ -643,15 +652,65 @@ foreach n {0 1} {
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect smc_q
 set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {1}] [get_bd_cells smc_q]
 connect_bd_intf_net [get_bd_intf_pins smc_q/M00_AXI] [get_bd_intf_pins nvmeha_0/S_AXI_SSD]
+set nvrec_smc_ssd_mi [expr {$nvrec_ring_mem eq "pl_ddr4" ? 3 : 2}]
 foreach n {0 1} {
   create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect smc_ssd_${n}
-  set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2} CONFIG.NUM_CLKS {2}] [get_bd_cells smc_ssd_${n}]
+  set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI $nvrec_smc_ssd_mi CONFIG.NUM_CLKS {2}] [get_bd_cells smc_ssd_${n}]
   connect_bd_intf_net [get_bd_intf_pins xdma_${n}/M_AXI_B] [get_bd_intf_pins smc_ssd_${n}/S00_AXI]
   connect_bd_intf_net [get_bd_intf_pins smc_ssd_${n}/M00_AXI] [get_bd_intf_pins zynq_ultra_ps_e_0/S_AXI_HP${n}_FPD]
   connect_bd_intf_net [get_bd_intf_pins smc_ssd_${n}/M01_AXI] [get_bd_intf_pins smc_q/S0${n}_AXI]
   connect_bd_net [get_bd_pins xdma_${n}/axi_aclk] [get_bd_pins smc_ssd_${n}/aclk]
   connect_bd_net [get_bd_pins zynq_ultra_ps_e_0/pl_clk1] [get_bd_pins smc_ssd_${n}/aclk1]
   connect_bd_net [get_bd_pins xdma_${n}/axi_aresetn] [get_bd_pins smc_ssd_${n}/aresetn]
+}
+
+# ----------------------------------------------------------
+# Split ring (register map 1.3): memory 1 = PL DDR4
+# ----------------------------------------------------------
+# ring_mem pl_ddr4 (config/data.json, zcu106_hpc0): a DDR4 controller (ddr4
+# IP, "MIG") for the soldered 2 GB x64 PL DDR4, configured from the board
+# interface (nvrec_ring_mem_intf, default ddr4_sdram_062: DDR4-2400, system
+# clock user_si570_sysclk 300 MHz, 512-bit AXI at ui_clk = 300 MHz). smc_mig
+# merges the ring's second master (nvrec_data_width bits @ dp_clk) and both
+# root ports (smc_ssd_N third master port, 128 bits @ dp_clk) into the
+# controller's AXI slave. The calibration flag goes to STATE.MEM1_READY; the
+# controller's system reset is the dp_clk peripheral reset (released after
+# pl_resetn0). Not mapped to the PS (no route): Linux never sees it as RAM.
+if {$nvrec_ring_mem eq "pl_ddr4"} {
+  create_bd_cell -type ip -vlnv xilinx.com:ip:ddr4 ddr4_0
+  set_property -dict [list CONFIG.C0_DDR4_BOARD_INTERFACE $nvrec_ring_mem_intf \
+    CONFIG.C0_CLOCK_BOARD_INTERFACE {user_si570_sysclk}] [get_bd_cells ddr4_0]
+  apply_board_connection -board_interface $nvrec_ring_mem_intf -ip_intf ddr4_0/C0_DDR4 -diagram $block_name
+  apply_board_connection -board_interface user_si570_sysclk -ip_intf ddr4_0/C0_SYS_CLK -diagram $block_name
+  set_property -dict [list CONFIG.C0.DDR4_AxiSelection {true} CONFIG.C0.DDR4_AxiDataWidth {512}] [get_bd_cells ddr4_0]
+  foreach k {C0.DDR4_MemoryPart C0.DDR4_DataWidth C0.DDR4_TimePeriod C0.DDR4_InputClockPeriod C0.DDR4_AxiDataWidth C0.DDR4_AxiAddressWidth C0.DDR4_CasLatency C0.DDR4_Specify_MandD C0.DDR4_Ordering} {
+    puts "INFO: nvrec ddr4_0 $k = [get_property -quiet CONFIG.$k [get_bd_cells ddr4_0]]"
+  }
+  # system reset (active high) and the AXI reset in the ui_clk domain
+  connect_bd_net [get_bd_pins rst_dp_clk/peripheral_reset] [get_bd_pins ddr4_0/sys_rst]
+  # (ext_reset_in polarity follows the active-high ui_clk_sync_rst by propagation)
+  create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset rst_mig
+  connect_bd_net [get_bd_pins ddr4_0/c0_ddr4_ui_clk] [get_bd_pins rst_mig/slowest_sync_clk]
+  connect_bd_net [get_bd_pins ddr4_0/c0_ddr4_ui_clk_sync_rst] [get_bd_pins rst_mig/ext_reset_in]
+  connect_bd_net [get_bd_pins rst_mig/peripheral_aresetn] [get_bd_pins ddr4_0/c0_ddr4_aresetn]
+  connect_bd_net [get_bd_pins ddr4_0/c0_init_calib_complete] [get_bd_pins nvrec_core_0/mem1_ready]
+
+  create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect smc_mig
+  set_property -dict [list CONFIG.NUM_SI {3} CONFIG.NUM_MI {1} CONFIG.NUM_CLKS {2}] [get_bd_cells smc_mig]
+  connect_bd_intf_net [get_bd_intf_pins nvrec_core_0/m_axi1] [get_bd_intf_pins smc_mig/S00_AXI]
+  connect_bd_intf_net [get_bd_intf_pins smc_ssd_0/M02_AXI] [get_bd_intf_pins smc_mig/S01_AXI]
+  connect_bd_intf_net [get_bd_intf_pins smc_ssd_1/M02_AXI] [get_bd_intf_pins smc_mig/S02_AXI]
+  connect_bd_intf_net [get_bd_intf_pins smc_mig/M00_AXI] [get_bd_intf_pins ddr4_0/C0_DDR4_S_AXI]
+  connect_bd_net [get_bd_pins zynq_ultra_ps_e_0/pl_clk1] [get_bd_pins smc_mig/aclk]
+  connect_bd_net [get_bd_pins ddr4_0/c0_ddr4_ui_clk] [get_bd_pins smc_mig/aclk1]
+  connect_bd_net [get_bd_pins rst_dp_clk/interconnect_aresetn] [get_bd_pins smc_mig/aresetn]
+  puts "INFO: nvrec ring port 1 nvrec_core_0/m_axi1 + smc_ssd_0/1 M02 -> smc_mig -> ddr4_0 ($nvrec_ring_mem_intf)"
+} else {
+  # single ring (N_RING_PORTS 1): m_axi1 stays unconnected and idle; tie the
+  # memory-1 status low explicitly (an open input is a BD 41-759 warning)
+  create_bd_cell -type inline_hdl -vlnv xilinx.com:inline_hdl:ilconstant:1.0 const_mem1_ready
+  set_property CONFIG.CONST_VAL {0} [get_bd_cells const_mem1_ready]
+  connect_bd_net [get_bd_pins const_mem1_ready/dout] [get_bd_pins nvrec_core_0/mem1_ready]
 }
 
 # AXI-Lite from the PS: nvrec registers, nvmeha S_AXI_LITE
@@ -743,9 +802,32 @@ nvrec_map nvrec_core_0/m_axi_db xdma_1/S_AXI_B/BAR0 0xB0000000 256M
 # SSD view (root port M_AXI_B, no inbound translation): queue window
 nvrec_map xdma_0/M_AXI_B nvmeha_0/S_AXI_SSD/Reg 0x90000000 64K
 nvrec_map xdma_1/M_AXI_B nvmeha_0/S_AXI_SSD/Reg 0x90000000 64K
+# Split ring memory 1 (PL DDR4): 2 GB at 0x20_0000_0000 for the ring's second
+# master and both root ports (the same address: fabric view = SSD view);
+# outside PS DDR (DDR_LOW / DDR_HIGH), outside the root ports' AXI windows
+# (0xA000_0000 / 0xB000_0000, 0x4_0000_0000 / 0x5_0000_0000) and not at the
+# xdma default 0x10_0000_0000. The PS has no path to smc_mig.
+if {$nvrec_ring_mem eq "pl_ddr4"} {
+  set mig_seg [get_bd_addr_segs ddr4_0/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK]
+  foreach sp {nvrec_core_0/m_axi1 xdma_0/M_AXI_B xdma_1/M_AXI_B} {
+    nvrec_map $sp $mig_seg 0x2000000000 2G
+  }
+}
 assign_bd_address
+if {$nvrec_ring_mem eq "pl_ddr4"} {
+  foreach sp {nvrec_core_0/m_axi1 xdma_0/M_AXI_B xdma_1/M_AXI_B} {
+    set seg [nvrec_find_seg $sp $mig_seg]
+    if {$seg eq "" || [string is true -strict [get_property EXCLUDED $seg]] || [expr {[get_property OFFSET $seg]}] != 0x2000000000} {
+      error "nvrec: PL DDR4 not mapped at 0x20_0000_0000 for $sp"
+    }
+  }
+  if {[nvrec_find_seg zynq_ultra_ps_e_0/Data $mig_seg] ne ""} {
+    error "nvrec: the PS address space maps the PL DDR4: it must not"
+  }
+}
 
-foreach sp {zynq_ultra_ps_e_0/Data nvmeha_guard/m_axi nvmeha_0/Data nvrec_core_0/m_axi_db nvrec_core_0/m_axi xdma_0/M_AXI_B xdma_1/M_AXI_B} {
+foreach sp {zynq_ultra_ps_e_0/Data nvmeha_guard/m_axi nvmeha_0/Data nvrec_core_0/m_axi_db nvrec_core_0/m_axi nvrec_core_0/m_axi1 xdma_0/M_AXI_B xdma_1/M_AXI_B} {
+  if {[llength [get_bd_addr_spaces -quiet $sp]] == 0} { continue }
   foreach seg [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces $sp]] {
     puts "INFO: addr $sp [get_property NAME $seg] offset [get_property OFFSET $seg] range [get_property RANGE $seg]"
   }
@@ -761,6 +843,12 @@ foreach ip {nvrec_core_0/m_axi axi_smc_dma/S00_AXI axi_smc_dma/M00_AXI zynq_ultr
 }
 foreach clk {aclk aclk1} {
   puts "INFO: nvrec axi_smc_dma/$clk <- [get_bd_nets -of_objects [get_bd_pins axi_smc_dma/$clk]]"
+}
+if {$nvrec_ring_mem eq "pl_ddr4"} {
+  foreach ip {nvrec_core_0/m_axi1 smc_mig/S00_AXI smc_mig/S01_AXI smc_mig/M00_AXI ddr4_0/C0_DDR4_S_AXI} {
+    set ipin [get_bd_intf_pins $ip]
+    puts "INFO: nvrec $ip DATA_WIDTH [get_property CONFIG.DATA_WIDTH $ipin] FREQ_HZ [get_property CONFIG.FREQ_HZ $ipin]"
+  }
 }
 
 # Restore current instance

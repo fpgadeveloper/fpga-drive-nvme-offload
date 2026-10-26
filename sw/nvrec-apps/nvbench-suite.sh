@@ -40,9 +40,21 @@
 # license limit and continue after a power-cycle with the same command.
 #
 # Ring: nvrec/nvplay's default (512 MB of slots: 2048 x 256 KB, 1024 x
-# 512 KB, 512 x 1 MB) unless --buffers is given (then in the run ids as
-# /slots=N); chunk and inflight keep --ring-mb constant. Every run stores the
-# ring the app set up (ring_slots, ring_bytes from its RESULT line).
+# 512 KB, 512 x 1 MB; a split ring 1 GB: 4096 x 256 KB, 2048 x 512 KB, ..)
+# unless --buffers is given (then in the run ids as /slots=N); chunk and
+# inflight keep --ring-mb constant. Every run stores the ring the app set up
+# (ring_slots, ring_bytes, ring = single/split/mem1, stripe_kb,
+# ring_mem1_bytes from its RESULT line) and the ring ports' wait times
+# (wr_port_stall_ms / rd_port_wait_ms, register map 1.3).
+# Ring layout (register map 1.3): --ring single|split|mem1|auto and --stripe
+# <KB>|chunk are passed to nvrec / nvplay and appended to every id
+# (/ring=split/stripe=4K); without them the apps' default (the driver's:
+# split on a design with a second ring memory, single for one SSD) runs
+# under the plain id. Comma lists (--ring single,split --stripe 4,64,chunk)
+# run the whole command once per combination: A/B of ring layouts and
+# stripes in one call (a stripe only combines with split; --stripe alone
+# means --ring split). The playback source is always recorded with the
+# default ring (the file is the same).
 # --tag <word> is appended to every id (/tag=<word>) for A/B runs of the same
 # steps (MaxPayload, APST, ...).
 # --budget-min stops cleanly before a run that would not finish in time.
@@ -58,7 +70,7 @@
 
 set -u
 
-VERSION=2
+VERSION=3
 SYS_NVREC=${NVBENCH_SYS_NVREC:-/sys/class/misc/nvrec}
 SYS_BLOCK=${NVBENCH_SYS_BLOCK:-/sys/block}
 SYS_PCI=${NVBENCH_SYS_PCI:-/sys/bus/pci/devices}
@@ -87,6 +99,7 @@ STEP_SET=0
 STOP_AFTER=1
 CONFIRM_FAIL=0
 PASSES=1
+FILL_RATE=2000
 TAG=""
 SOURCE_FRESH=0
 QD=32
@@ -102,6 +115,10 @@ QDS="1 2 4 8 16 32 63"
 RUNS=2
 RING_MB=512
 BUFFERS=""
+RING_LIST=""
+STRIPE_LIST=""
+RING=""
+STRIPE=""
 NOTE=""
 
 usage() {
@@ -188,10 +205,22 @@ Options:
   --qds "<..>"         SSD_MAX_INFLIGHT values for 'inflight' (1..63)
   --runs <n>           cpu: runs per direction (default $RUNS)
   --ring-mb <MB>       chunk/inflight: ring size kept constant (default $RING_MB;
-                       slots = MB / chunk, at most 2048)
-  --buffers <n>        ring slots for every other run, 2..2048 (default: the
-                       apps' default, 512 MB of slots; in the ids as /slots=n)
+                       slots = MB / chunk, at most the hardware's slots)
+  --buffers <n>        ring slots for every other run, 2..4096 (default: the
+                       apps' default, 512 MB of slots, 1 GB split; in the ids
+                       as /slots=n)
+  --ring <l[,l..]>     ring layout for nvrec / nvplay: single, split, mem1 or
+                       auto (register map 1.3); in the ids as /ring=<l>; a
+                       list runs the command once per layout (A/B)
+  --stripe <s[,s..]>   split-ring stripe: KB (4, 64, ..; power of two up to
+                       the chunk) or chunk; in the ids as /stripe=4K; a list
+                       runs the command once per stripe; implies --ring split
+                       when --ring is not given
   --passes <n>         fabricplay: playbacks of the ring per run (default $PASSES)
+  --fill-rate <MB/s>   fabricplay: generator rate of the ring fill before the
+                       playbacks (nvplay --fill-rate, default $FILL_RATE); the fill
+                       must not drop a beat, so lower it for a slow ring memory
+                       (--ring mem1); stored as fill_rate_mbps, not in the ids
   --source-fresh       record the 10 GB playback source again (once per layout
                        in this invocation) even when the one on the volume is
                        still valid for the layout, chunk and beat size
@@ -225,6 +254,7 @@ while [ $# -gt 0 ]; do
         --temp-max) TEMP_MAX="${2:?}"; shift 2 ;;
         --temp-resume) TEMP_RESUME="${2:?}"; shift 2 ;;
         --passes) PASSES="${2:?}"; shift 2 ;;
+        --fill-rate) FILL_RATE="${2:?}"; FILL_RATE=${FILL_RATE%[Mm][Bb]}; shift 2 ;;
         --source-fresh) SOURCE_FRESH=1; shift ;;
         --qd) QD="${2:?}"; shift 2 ;;
         --to) TO="${2:?}"; shift 2 ;;
@@ -238,7 +268,20 @@ while [ $# -gt 0 ]; do
         --ring-mb) RING_MB="${2:?}"; shift 2 ;;
         --buffers) BUFFERS="${2:?}"; shift 2
             case "$BUFFERS" in ''|*[!0-9]*) usage >&2; exit 2 ;; esac
-            [ "$BUFFERS" -ge 2 ] && [ "$BUFFERS" -le 2048 ] || { echo "nvbench-suite: --buffers must be 2..2048" >&2; exit 2; } ;;
+            [ "$BUFFERS" -ge 2 ] && [ "$BUFFERS" -le 4096 ] || { echo "nvbench-suite: --buffers must be 2..4096" >&2; exit 2; } ;;
+        --ring) RING_LIST="${2:?}"; shift 2
+            for v in ${RING_LIST//,/ }; do
+                case "$v" in auto|single|split|mem1) ;; *) echo "nvbench-suite: --ring: auto, single, split or mem1 (comma list)" >&2; exit 2 ;; esac
+            done ;;
+        --stripe) STRIPE_LIST="${2:?}"; shift 2
+            for v in ${STRIPE_LIST//,/ }; do
+                [ "$v" = chunk ] || v=${v%[Kk]}
+                case "$v" in
+                    chunk) ;;
+                    ''|*[!0-9]*) echo "nvbench-suite: --stripe: KB (power of two, 4..4096) or chunk (comma list)" >&2; exit 2 ;;
+                    *) [ "$v" -ge 4 ] && [ "$v" -le 4096 ] && [ $(( v & (v - 1) )) -eq 0 ] || { echo "nvbench-suite: --stripe: KB (power of two, 4..4096) or chunk" >&2; exit 2; } ;;
+                esac
+            done ;;
         --verify-mbps) VERIFY_MBPS="${2:?}"; shift 2 ;;
         --note) NOTE="${2:?}"; shift 2 ;;
         --dry-run) DRY=1; shift ;;
@@ -248,10 +291,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$CMD" ] || { usage >&2; exit 2; }
-for v in STOP_AFTER CONFIRM_FAIL PASSES TEMP_MAX TEMP_RESUME FROM STEP QD; do
+for v in STOP_AFTER CONFIRM_FAIL PASSES TEMP_MAX TEMP_RESUME FROM STEP QD FILL_RATE; do
     case "${!v}" in ''|*[!0-9]*) echo "nvbench-suite: --$(echo "$v" | tr 'A-Z_' 'a-z-') must be a number" >&2; exit 2 ;; esac
 done
-[ "$STOP_AFTER" -ge 1 ] && [ "$STEP" -ge 1 ] && [ "$PASSES" -ge 1 ] || { echo "nvbench-suite: --stop-after, --step and --passes must be >= 1" >&2; exit 2; }
+[ "$STOP_AFTER" -ge 1 ] && [ "$STEP" -ge 1 ] && [ "$PASSES" -ge 1 ] && [ "$FILL_RATE" -ge 1 ] || { echo "nvbench-suite: --stop-after, --step, --passes and --fill-rate must be >= 1" >&2; exit 2; }
 [ "$QD" -ge 1 ] && [ "$QD" -le 63 ] || { echo "nvbench-suite: --qd must be 1..63" >&2; exit 2; }
 [ -n "$RESULTS" ] || RESULTS=$STATE_DIR/results.jsonl
 LOGDIR=$(dirname "$RESULTS")/logs
@@ -285,16 +328,25 @@ nap() { [ "$TEST" = 1 ] || sleep "$1"; }
 # ---------------------------------------------------------------- fixture
 dev_of() { case "$1" in single1) echo nvrec0n1 ;; single2) echo nvrec1n1 ;; esac; }
 members_of() { case "$1" in single1) echo nvrec0n1 ;; single2) echo nvrec1n1 ;; raid0) echo "nvrec0n1 nvrec1n1" ;; fabric) echo "" ;; *) die "unknown layout '$1'" ;; esac; }
+# PCIe MaxPayload / MaxReadReq of a function (Device Control via setpci, root)
+SETPCI=${NVBENCH_SETPCI:-setpci}
+pci_ctl() { "$SETPCI" -s "$1" CAP_EXP+8.w 2>/dev/null; }
+mps_of_pci() { local v; v=$(pci_ctl "$1"); case "$v" in ''|*[!0-9a-fA-F]*) return 0 ;; esac; echo $(( 128 << ((0x$v >> 5) & 7) )); }
+mrrs_of_pci() { local v; v=$(pci_ctl "$1"); case "$v" in ''|*[!0-9a-fA-F]*) return 0 ;; esac; echo $(( 128 << ((0x$v >> 12) & 7) )); }
+port_of_pci() { basename "$(dirname "$(readlink -f "$SYS_PCI/$1")")"; }
 drive_json() { # <nvrecXn1>
-    local d=$1 s=$SYS_BLOCK/$1/nvrec pci link=""
+    local d=$1 s=$SYS_BLOCK/$1/nvrec pci link="" rp=""
     pci=$(rd "$s/pci")
     if [ -n "$pci" ] && [ -e "$SYS_PCI/$pci/current_link_speed" ]; then
         link="$(rd "$SYS_PCI/$pci/current_link_speed") x$(rd "$SYS_PCI/$pci/current_link_width")"
     fi
-    printf '{"dev":%s,"model":%s,"serial":%s,"firmware":%s,"mdts_bytes":%s,"nr_io_queues":%s,"pci":%s,"link":%s,"apst":%s,"temperature_warn":%s,"temperature_crit":%s}' \
+    [ -n "$pci" ] && [ -e "$SYS_PCI/$pci" ] && rp=$(port_of_pci "$pci")
+    printf '{"dev":%s,"model":%s,"serial":%s,"firmware":%s,"mdts_bytes":%s,"nr_io_queues":%s,"pci":%s,"link":%s,"mps":%s,"mrrs":%s,"root_port":%s,"rp_mps":%s,"apst":%s,"temperature_warn":%s,"temperature_crit":%s}' \
         "$(jstr "$d")" "$(jstr "$(rd "$s/model")")" "$(jstr "$(rd "$s/serial")")" \
         "$(jstr "$(rd "$s/firmware")")" "$(jnum "$(rd "$s/mdts_bytes")")" \
         "$(jnum "$(rd "$s/nr_io_queues")")" "$(jstr "$pci")" "$(jstr "$link")" \
+        "$(jnum "$([ -n "$pci" ] && mps_of_pci "$pci")")" "$(jnum "$([ -n "$pci" ] && mrrs_of_pci "$pci")")" \
+        "$(jstr "$rp")" "$(jnum "$([ -n "$rp" ] && mps_of_pci "$rp")")" \
         "$(jstr "$(rd "$s/apst")")" "$(jnum "$(rd "$s/temperature_warn")")" "$(jnum "$(rd "$s/temperature_crit")")"
 }
 serials_of() { local d out=""; for d in $(members_of "$1"); do out="$out+$(rd "$SYS_BLOCK/$d/nvrec/serial")"; done; echo "${out#+}"; }
@@ -327,8 +379,14 @@ src_max_mbps() { local c; c=$(rd "$SYS_NVREC/src_clk_hz"); [ -n "$c" ] && [ "$c"
 SRC_MAX=$(src_max_mbps)
 # id suffixes: --buffers (/slots=N), --qd other than 32 (/qd=N), --tag
 # (/tag=word); fab_sfx for the fabric-only runs (no NVMe command, no qd)
-id_sfx() { echo "${BUFFERS:+/slots=$BUFFERS}$([ "$QD" != 32 ] && echo "/qd=$QD")${TAG:+/tag=$TAG}"; }
-fab_sfx() { echo "${BUFFERS:+/slots=$BUFFERS}${TAG:+/tag=$TAG}"; }
+id_sfx() { echo "${BUFFERS:+/slots=$BUFFERS}$([ "$QD" != 32 ] && echo "/qd=$QD")$(ring_sfx)${TAG:+/tag=$TAG}"; }
+fab_sfx() { echo "${BUFFERS:+/slots=$BUFFERS}$(ring_sfx)${TAG:+/tag=$TAG}"; }
+# the ring layout of this pass (--ring / --stripe): id suffix, app options
+stripe_name() { case "$1" in chunk) echo chunk ;; *) echo "${1}K" ;; esac; }
+ring_sfx() { echo "${RING:+/ring=$RING}${STRIPE:+/stripe=$(stripe_name "$STRIPE")}"; }
+ring_args() { echo "${RING:+--ring $RING}${STRIPE:+ --stripe $STRIPE}"; }
+# hardware slot table (driver 1.2 sysfs max_slots; 2048 before)
+MAX_SLOTS=$(rd "$SYS_NVREC/max_slots"); case "$MAX_SLOTS" in ''|*[!0-9]*) MAX_SLOTS=2048 ;; esac
 cap_rate() { if [ "$1" -gt "$SRC_MAX" ]; then echo "$SRC_MAX"; else echo "$1"; fi; }
 # cap_id <id> <requested> <capped>: the id's rate=<requested> -> rate=<capped>
 cap_id() { echo "$1" | sed "s#/rate=$2\(/\|\$\)#/rate=$3\1#"; }
@@ -341,12 +399,16 @@ fixture_json() {
             [ -e "$SYS_BLOCK/$d/nvrec" ] && drives="$drives,$(drive_json $d)"
         done
         [ -r /etc/os-release ] && os=$(sed -n 's/^\(BUILD_ID\|VERSION_ID\)=//p' /etc/os-release | tr -d '"' | tr '\n' ' ')
-        FIXTURE_JSON=$(printf '"target":%s,"board":%s,"kernel":%s,"image":%s,"hw_version":%s,"drv_version":%s,"src_clk_hz":%s,"dp_clk_hz":%s,"beat_bytes":%s,"fifo_depth":%s,"egr_fifo_depth":%s,"apst_param":%s,"cpus":%s,"drives":[%s]' \
+        FIXTURE_JSON=$(printf '"target":%s,"board":%s,"kernel":%s,"image":%s,"hw_version":%s,"drv_version":%s,"src_clk_hz":%s,"dp_clk_hz":%s,"beat_bytes":%s,"fifo_depth":%s,"egr_fifo_depth":%s,"apst_param":%s,"ring_ports":%s,"ring1_bytes":%s,"mem1_ready":%s,"ring_split_param":%s,"stripe_kb_param":%s,"ring_stripe_default":%s,"cpus":%s,"drives":[%s]' \
             "$(jstr "$(target_name)")" "$(jstr "$(rd /proc/device-tree/model)")" "$(jstr "$(uname -r)")" \
             "$(jstr "$os")" "$(jstr "$(rd "$SYS_NVREC/version")")" "$(jstr "$(rd "$SYS_MODULE/version")")" \
             "$(jnum "$(rd "$SYS_NVREC/src_clk_hz")")" "$(jnum "$(rd "$SYS_NVREC/dp_clk_hz")")" "$BEAT" \
             "$(jnum "$(rd "$SYS_NVREC/fifo_depth")")" "$(jnum "$(rd "$SYS_NVREC/egr_fifo_depth")")" \
-            "$(jnum "$(rd "$SYS_MODULE/parameters/apst")")" "$(grep -c '^cpu[0-9]' "$PROC_STAT")" "${drives#,}")
+            "$(jnum "$(rd "$SYS_MODULE/parameters/apst")")" \
+            "$(jnum "$(rd "$SYS_NVREC/ring_ports")")" "$(jnum "$(rd "$SYS_NVREC/ring1_bytes")")" \
+            "$(jnum "$(rd "$SYS_NVREC/mem1_ready")")" "$(jstr "$(rd "$SYS_MODULE/parameters/ring_split")")" \
+            "$(jstr "$(rd "$SYS_MODULE/parameters/stripe_kb")")" "$(jstr "$(rd "$SYS_NVREC/ring_stripe_default")")" \
+            "$(grep -c '^cpu[0-9]' "$PROC_STAT")" "${drives#,}")
     fi
     printf '%s' "$FIXTURE_JSON"
 }
@@ -555,11 +617,21 @@ stats_json() { # <app log>
         "$(jnum "$(res_or_lat "$1" ring_wait_ms 5)")" "$h" "$b0"
 }
 # "buffers" = the slots the app used (RESULT ring_slots; apps before that key:
-# the requested count), "buffers_req" = --buffers given (null = app default)
+# the requested count), "buffers_req" = --buffers given (null = app default);
+# the ring layout used (ring, stripe_kb, ring_mem1_bytes; apps 1.2) and the
+# one asked for (ring_req / stripe_req, null = default); the ring ports'
+# wait times (register map 1.3, ms per memory)
+jarr() { case "${1:-}" in '') printf 'null' ;; *) printf '[%s]' "$1" ;; esac; }
 ring_json() { # <app log> <requested slots|"">
     local rs; rs=$(res_get "$1" ring_slots); [ -n "$rs" ] || rs=$2
-    printf '"buffers":%s,"buffers_req":%s,"ring_slots":%s,"ring_bytes":%s' "$(jnum "$rs")" "$(jnum "$2")" \
-        "$(jnum "$(res_get "$1" ring_slots)")" "$(jnum "$(res_get "$1" ring_bytes)")"
+    printf '"mps":%s,"buffers":%s,"buffers_req":%s,"ring_slots":%s,"ring_bytes":%s,"ring":%s,"stripe_kb":%s,"ring_mem1_bytes":%s,"ring_req":%s,"stripe_req":%s,"wr_port_stall_ms":%s,"rd_port_wait_ms":%s' \
+        "$(m=$(res_get "$1" mps); case "$m" in ''|0) printf null ;; *) printf '%s' "$m" ;; esac)" \
+        "$(jnum "$rs")" "$(jnum "$2")" \
+        "$(jnum "$(res_get "$1" ring_slots)")" "$(jnum "$(res_get "$1" ring_bytes)")" \
+        "$(r=$(res_get "$1" ring); [ -n "$r" ] && jstr "$r" || printf null)" \
+        "$(jnum "$(res_get "$1" stripe_kb)")" "$(jnum "$(res_get "$1" ring_mem1_bytes)")" \
+        "$([ -n "$RING" ] && jstr "$RING" || printf null)" "$([ -n "$STRIPE" ] && jstr "$STRIPE" || printf null)" \
+        "$(jarr "$(res_get "$1" wr_port_stall_ms)")" "$(jarr "$(res_get "$1" rd_port_wait_ms)")"
 }
 # nvverify 1.1 reports 16-byte words: "GAP at word N (file offset X)",
 # "discontinuities D, words missing W (B beats...)", "corrupted words C"
@@ -620,8 +692,9 @@ rec_run() {
     fi
     say "record $id"
     s0=$(cpusnap)
+    # shellcheck disable=SC2046
     run_app "$l" "$log" nvrec --rate "${rate}MB" --size "$bytes" --chunk "$chunk" --qd "$qd" \
-        ${slots:+--buffers "$slots"} --stats 0 --force "$f"
+        ${slots:+--buffers "$slots"} $(ring_args) --stats 0 --force "$f"
     t=$APP_TIME
     s1=$(cpusnap)
     rc=$(sed -n 's/^RC=//p' "$log" | tail -n1)
@@ -679,7 +752,8 @@ play_run() {
     sync; echo 3 2>/dev/null >/proc/sys/vm/drop_caches; nap 5
     say "play $id"
     s0=$(cpusnap)
-    run_app "$l" "$log" nvplay --rate "${rate}MB" --qd "$qd" ${slots:+--buffers "$slots"} --stats 0 "$f"
+    # shellcheck disable=SC2046
+    run_app "$l" "$log" nvplay --rate "${rate}MB" --qd "$qd" ${slots:+--buffers "$slots"} $(ring_args) --stats 0 "$f"
     t=$APP_TIME
     s1=$(cpusnap)
     rc=$(sed -n 's/^RC=//p' "$log" | tail -n1)
@@ -844,7 +918,9 @@ playsrc_valid() { # <layout> <chunk> <bytes>
     [ -n "$off" ] && [ "$size" = "$(( off + sbytes ))" ]
 }
 ensure_playsrc() { # <layout> <chunk>
-    local l=$1 c=$2 sbytes; sbytes=$(to_bytes 10G)
+    # the source is recorded with the default ring (RING / STRIPE local: unset
+    # for the recording below, the file does not depend on them)
+    local l=$1 c=$2 sbytes RING="" STRIPE=""; sbytes=$(to_bytes 10G)
     [ "$DRY" -eq 1 ] && [ -n "${PLAYSRC_OK:-}" ] && return 0
     if [ "$DRY" -eq 0 ] && { [ "$SOURCE_FRESH" = 0 ] || [[ " $FRESH_DONE " == *" $l:$c "* ]]; } && \
        mount_volume "$l" "$c" && playsrc_valid "$l" "$c" "$sbytes"; then
@@ -916,18 +992,18 @@ t_chunk() {
     for c in $list; do
         c=$(to_bytes "$c")
         [ "$c" -le "$m" ] || { say "chunk $(chunk_name "$c") > MDTS $(chunk_name "$m"): skipped"; continue; }
-        slots=$(( RING_MB * 1048576 / c )); [ "$slots" -gt 2048 ] && slots=2048
-        rec_run "chunk/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/chunk=$c/slots=$slots$([ "$QD" != 32 ] && echo "/qd=$QD")${TAG:+/tag=$TAG}" chunk "$LAYOUT" "$bytes" "$r" "$c" "$QD" "$slots" trim || true
+        slots=$(( RING_MB * 1048576 / c )); [ "$slots" -gt "$MAX_SLOTS" ] && slots=$MAX_SLOTS
+        rec_run "chunk/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/chunk=$c/slots=$slots$([ "$QD" != 32 ] && echo "/qd=$QD")$(ring_sfx)${TAG:+/tag=$TAG}" chunk "$LAYOUT" "$bytes" "$r" "$c" "$QD" "$slots" trim || true
     done
 }
 t_inflight() {
     need_layout
     local c q r bytes slots
     c=$(default_chunk "$LAYOUT"); r=$(auto_rate "$LAYOUT"); bytes=$(to_bytes "${SIZE:-10G}")
-    slots=$(( RING_MB * 1048576 / c )); [ "$slots" -gt 2048 ] && slots=2048
+    slots=$(( RING_MB * 1048576 / c )); [ "$slots" -gt "$MAX_SLOTS" ] && slots=$MAX_SLOTS
     for q in $QDS; do
         [ "$q" -ge 1 ] && [ "$q" -le 63 ] || { say "qd $q outside 1..63: skipped"; continue; }
-        rec_run "inflight/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/qd=$q${TAG:+/tag=$TAG}" inflight "$LAYOUT" "$bytes" "$r" "$c" "$q" "$slots" trim || true
+        rec_run "inflight/$(fx "$LAYOUT" "$c")/size=$bytes/rate=$r/qd=$q$(ring_sfx)${TAG:+/tag=$TAG}" inflight "$LAYOUT" "$bytes" "$r" "$c" "$q" "$slots" trim || true
     done
 }
 # longrun: the post-SLC-cache sustained rate (the recorder's long recordings):
@@ -970,10 +1046,12 @@ fab_run() {
     budget_ok "$est"
     say "fabric $kind $id"
     s0=$(cpusnap)
+    # shellcheck disable=SC2046
     if [ "$kind" = rec ]; then
-        run_app fabric "$log" nvrec --no-write --rate "${rate}MB" --size "$FB_BYTES" ${BUFFERS:+--buffers "$BUFFERS"} --stats 0
+        run_app fabric "$log" nvrec --no-write --rate "${rate}MB" --size "$FB_BYTES" ${BUFFERS:+--buffers "$BUFFERS"} $(ring_args) --stats 0
     else
-        run_app fabric "$log" nvplay --ring-only --rate "${rate}MB" --passes "$PASSES" ${BUFFERS:+--buffers "$BUFFERS"} --stats 0
+        run_app fabric "$log" nvplay --ring-only --rate "${rate}MB" --passes "$PASSES" --fill-rate "${FILL_RATE}MB" \
+            ${BUFFERS:+--buffers "$BUFFERS"} $(ring_args) --stats 0
     fi
     t=$APP_TIME
     s1=$(cpusnap)
@@ -982,7 +1060,7 @@ fab_run() {
         die "$test failed before running (rc $rc), not stored as a result: see $log"
     fi
     pass=false; [ "$rc" = 0 ] && pass=true
-    emit "$id" "$test" fabric "$(printf '"direction":%s,"fabric_only":true,"size_bytes":%s,"rate_req_mbps":%s,"rate_capped":%s,"rate_mbps":%s,"seconds":%s,"bytes":%s,"chunk":%s,%s,"exit":%s,"pass":%s,"drops":%s,"fifo_hwm":%s,"fifo_depth":%s,"underflows":%s,"chk_errors":%s,"gaps":%s,"gap_beats":%s,"beats":%s,"complete":%s,"passes":%s,"fill_rate_bps":%s,"prefill_s":%s,"beat_bytes":%s,"tag":%s,%s' \
+    emit "$id" "$test" fabric "$(printf '"direction":%s,"fabric_only":true,"size_bytes":%s,"rate_req_mbps":%s,"rate_capped":%s,"rate_mbps":%s,"seconds":%s,"bytes":%s,"chunk":%s,%s,"exit":%s,"pass":%s,"drops":%s,"fifo_hwm":%s,"fifo_depth":%s,"underflows":%s,"chk_errors":%s,"gaps":%s,"gap_beats":%s,"beats":%s,"complete":%s,"passes":%s,"fill_rate_mbps":%s,"fill_rate_bps":%s,"prefill_s":%s,"beat_bytes":%s,"tag":%s,%s' \
         "$(jstr "$([ "$kind" = rec ] && echo record || echo play)")" "$([ "$kind" = rec ] && echo "$FB_BYTES" || echo null)" \
         "$rate" "$capped" \
         "$(awk -v b="$(res_get "$log" bytes)" -v s="$(res_get "$log" seconds)" 'BEGIN { if (s > 0) printf "%.1f", b / s / 1e6; else print "null" }')" \
@@ -991,7 +1069,8 @@ fab_run() {
         "$(jnum "$(res_get "$log" drops)")" "$(jnum "$(res_get "$log" fifo_hwm)")" "$(jnum "$(res_get "$log" fifo_depth)")" \
         "$(jnum "$(res_get "$log" underflows)")" "$(jnum "$(res_get "$log" errors)")" "$(jnum "$(res_get "$log" gaps)")" \
         "$(jnum "$(res_get "$log" gap_beats)")" "$(jnum "$(res_get "$log" beats)")" "$(jnum "$(res_get "$log" complete)")" \
-        "$(jnum "$(res_get "$log" passes)")" "$(jnum "$(res_get "$log" fill_rate_bps)")" "$(jnum "$(res_get "$log" prefill_seconds)")" \
+        "$(jnum "$(res_get "$log" passes)")" "$([ "$kind" = rec ] && echo null || echo "$FILL_RATE")" \
+        "$(jnum "$(res_get "$log" fill_rate_bps)")" "$(jnum "$(res_get "$log" prefill_seconds)")" \
         "$(jnum "$(res_get "$log" beat_bytes)")" "$(jstr "$TAG")" "$(cpu_json "$s0" "$s1" "$t")")"
     if [ "$kind" = rec ]; then
         say "  -> rc=$rc drops=$(res_get "$log" drops) pass=$pass"
@@ -1143,23 +1222,52 @@ DRY_EST=0
 REC_EXTRA=""
 [ "$DRY" -eq 1 ] && say "dry run: deadline in $(left_s) s; results $RESULTS"
 
+run_cmd() {
+    case "$CMD" in
+        sustained) t_sustained ;;
+        glance) t_glance ;;
+        burst) t_burst ;;
+        playback) t_playback ;;
+        cpu) t_cpu ;;
+        chunk) t_chunk ;;
+        inflight) t_inflight ;;
+        longrun) t_longrun ;;
+        fabric) t_fabric ;;
+        fabricplay) t_fabricplay ;;
+        all) t_all ;;
+        gaps) t_gaps ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
 case "$CMD" in
     info) t_info ;;
     status) t_status ;;
-    sustained) t_sustained ;;
-    glance) t_glance ;;
-    burst) t_burst ;;
-    playback) t_playback ;;
-    cpu) t_cpu ;;
-    chunk) t_chunk ;;
-    inflight) t_inflight ;;
-    longrun) t_longrun ;;
-    fabric) t_fabric ;;
-    fabricplay) t_fabricplay ;;
     verify) t_verify; exit $? ;;
-    all) t_all ;;
-    gaps) t_gaps ;;
-    *) usage >&2; exit 2 ;;
+    *)
+        # --ring / --stripe lists: the command once per combination (A/B);
+        # a stripe only with split (--stripe alone = split), a non-split
+        # layout once without one
+        [ -n "$STRIPE_LIST" ] && [ -z "$RING_LIST" ] && RING_LIST=split
+        ab_rings=${RING_LIST:-_}
+        # the options every pass starts from ('all' / 'gaps' / longrun change them)
+        ab_save="$FROM|$STEP|$SIZE|$RATES|$CONFIRM|$RATE|$LAYOUT|$IDLE"
+        for RING in ${ab_rings//,/ }; do
+            [ "$RING" = _ ] && RING=""
+            if [ "$RING" = split ] && [ -n "$STRIPE_LIST" ]; then
+                ab_stripes=$STRIPE_LIST
+            else
+                ab_stripes=_
+            fi
+            for STRIPE in ${ab_stripes//,/ }; do
+                [ "$STRIPE" = _ ] && STRIPE=""
+                [ "$STRIPE" = chunk ] || STRIPE=${STRIPE%[Kk]}
+                IFS='|' read -r FROM STEP SIZE RATES CONFIRM RATE LAYOUT IDLE <<<"$ab_save"
+                [ -n "$RING$STRIPE" ] && say "=== ring ${RING:-default}${STRIPE:+, stripe $(stripe_name "$STRIPE")}"
+                SWEEP_BEST=0; SWEEP_FAIL=0
+                run_cmd
+            done
+        done
+        ;;
 esac
 [ "$DRY" -eq 1 ] && say "dry run: the runs marked RUN need ~$(( DRY_EST / 60 )) min (estimate; budget ${BUDGET_MIN} min per session)"
 [ "$DRY" -eq 0 ] && [ "$CMD" != info ] && [ "$CMD" != status ] && \

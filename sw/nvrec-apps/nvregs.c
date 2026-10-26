@@ -78,10 +78,25 @@ int main(int argc, char **argv)
 	ha_dead = rc(NVREC_VERSION) >= NVREC_VERSION_1_1 && (rc(NVREC_STATE) & NVREC_STATE_HA_DEAD);
 	if (ha_dead)
 		printf("Host Accelerator: NOT RESPONDING (STATE.HA_DEAD; evaluation license expired?) -- its registers are not read\n");
+	if (rc(NVREC_VERSION) >= NVREC_VERSION_1_3) {
+		/* 1.3: split ring over two memories */
+		uint32_t cfg = rc(NVREC_CONFIG), st = rc(NVREC_STATE), sh = rc(NVREC_RING_STRIPE_SHIFT);
+
+		printf("  ring ports %u, memory 1 %s; ring %s, stripe %u KB (RING_STRIPE_SHIFT %u)\n",
+		       rc(NVREC_RING_PORTS) ? rc(NVREC_RING_PORTS) : 1,
+		       (st & NVREC_STATE_MEM1_READY) ? "READY" : "not ready (STATE.MEM1_READY = 0)",
+		       (cfg & NVREC_CONFIG_SPLIT) ? "SPLIT" : (cfg & NVREC_CONFIG_MEM1) ? "MEM1" : "single",
+		       sh >= 10 && sh < 32 ? 1u << (sh - 10) : 0, sh);
+	}
 	C(STATE); C(RUN_FIFO_HWM); C(ING_FIFO_HWM); C(CONFIG); C(IRQ_STATUS); C(IRQ_ENABLE); C(TPG_CTRL); C(ING_STATUS);
 	C64(ING_DROP_COUNT); C64(RUN_DROP_COUNT); C64(ING_BEATS_IN); C64(ING_BEATS_OUT);
 	C(RING_BASE_LO); C(RING_BASE_HI); C(NUM_CHUNKS); C(CHUNK_SIZE); C(PRP_LIST_BASE_LO);
 	C(PRP_LIST_SHIFT); C(LBA_SHIFT); C(LENGTH_CHUNKS); C(CREDIT_INIT);
+	if (rc(NVREC_VERSION) >= NVREC_VERSION_1_3) {
+		C(RING_BASE1_LO); C(RING_BASE1_HI); C(RING_STRIPE_SHIFT); C(RING_PORTS);
+		/* dp_clk cycles since START, saturating */
+		C(WR_PORT_STALL0); C(WR_PORT_STALL1); C(RD_PORT_WAIT0); C(RD_PORT_WAIT1);
+	}
 	C64(CHUNKS_FILLED); C64(CMDS_ISSUED); C64(CMDS_DONE); C(CMD_ERRORS); C(UNEXPECTED_CQES);
 	C64(BYTES); C(RING_FILL); C(RING_HWM); C(ERR_LAST_STATUS); C(ERR_LAST_CID);
 	C64(CHUNKS_RELEASED); C(LAT_MIN); C(LAT_MAX); C(LAT_COUNT);

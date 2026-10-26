@@ -12,6 +12,20 @@
 #                                   the ring writer/reader AXI4 master
 #   "egress_fifo_kb": <KB>          egress FIFO size in KB (optional; default by
 #                                   width, see below)
+#   "ring_mem": "none" | "pl_ddr4" | "lpddr4"
+#                                   memory 1 of the split ring (register map
+#                                   1.3, "one ring per SSD in two memories"):
+#                                   pl_ddr4 = Zynq UltraScale+ PL DDR4 behind a
+#                                   DDR4 controller (board interface
+#                                   "ring_mem_intf", default ddr4_sdram_062) at
+#                                   0x20_0000_0000; lpddr4 = Versal on-board
+#                                   LPDDR4 (second NoC instance, two DDRMCs) at
+#                                   DDR_CH2 0x600_0000_0000. Mapped for the ring
+#                                   master nvrec_core/m_axi1 and the root ports'
+#                                   bridges only, never for the CPUs. Default
+#                                   none: single ring (N_RING_PORTS 1).
+#   "ring_mem_intf": <board intf>   pl_ddr4 only: the DDR4 board interface of
+#                                   the PL DDR4 (default ddr4_sdram_062)
 #
 # A variable set before the block design script runs (eg. `set
 # nvrec_data_width 512` or `set nvrec_egr_fifo_kb 512` in the Tcl console
@@ -28,7 +42,15 @@
 #                           requests in flight and DDR read-latency spikes showed
 #                           as short underflows (VCK190 playback at 8250-8500
 #                           MB/s, 2026-10-23)
-#   nvrec_slot_w          = 11 (ring of at most 2048 slots)
+#   nvrec_slot_w          = 12 (ring of at most 4096 slots; register map 1.3)
+#   nvrec_ring_ports      = N_RING_PORTS of nvrec_core: 2 when ring_mem is not
+#                           none (second ring AXI4 master m_axi1), else 1
+#   nvrec_rd_skid_depth   = ring reader skid FIFO per ring port, beats: 512
+#                           (32 KB at 512 bits, 16 KB at 256 bits, block RAM),
+#                           so the port that is not streaming keeps fetching
+#                           ahead and a memory switch (chunk boundary with
+#                           chunk-sized stripes) costs no read latency
+#                           (unused with one ring port)
 #   nvrec_bridge_split    = Versal only: 1 = one NoC NMU per QDMA bridge (each
 #                           bridge with its own SmartConnect), 0 = both bridges
 #                           share the base design's S08 NMU. Default: 1 at
@@ -72,10 +94,24 @@ set nvrec_egr_fifo_depth [expr {$nvrec_egr_fifo_kb * 1024 / $nvrec_beat_bytes}]
 if {$nvrec_egr_fifo_depth & ($nvrec_egr_fifo_depth - 1)} {
   error "nvrec: egress FIFO of $nvrec_egr_fifo_kb KB is not a power-of-2 number of $nvrec_beat_bytes-byte beats"
 }
-set nvrec_slot_w 11
+set nvrec_slot_w 12
 if {![info exists nvrec_bridge_split]} {
   set nvrec_bridge_split [expr {$nvrec_data_width == 512}]
 }
+if {![info exists nvrec_ring_mem]} {
+  set nvrec_ring_mem [nvrec_target_attr $nvrec_json $target ring_mem none]
+}
+if {[lsearch -exact {none pl_ddr4 lpddr4} $nvrec_ring_mem] < 0} {
+  error "nvrec: ring_mem of $target must be none, pl_ddr4 or lpddr4 (got $nvrec_ring_mem)"
+}
+if {![info exists nvrec_ring_mem_intf]} {
+  set nvrec_ring_mem_intf [nvrec_target_attr $nvrec_json $target ring_mem_intf ddr4_sdram_062]
+}
+set nvrec_ring_ports [expr {$nvrec_ring_mem eq "none" ? 1 : 2}]
+if {![info exists nvrec_rd_skid_depth]} {
+  set nvrec_rd_skid_depth [nvrec_target_attr $nvrec_json $target rd_skid_depth 512]
+}
 puts "INFO: nvrec $target: DATA_WIDTH $nvrec_data_width ($nvrec_beat_bytes B/beat),\
  ingest FIFO $nvrec_ing_fifo_depth beats, egress FIFO $nvrec_egr_fifo_depth beats ($nvrec_egr_fifo_kb KB),\
- SLOT_W $nvrec_slot_w, bridge NMU split $nvrec_bridge_split"
+ SLOT_W $nvrec_slot_w, bridge NMU split $nvrec_bridge_split, reader skid $nvrec_rd_skid_depth beats, ring memory 1 $nvrec_ring_mem\
+ ([expr {$nvrec_ring_mem eq "pl_ddr4" ? "$nvrec_ring_mem_intf, " : ""}]N_RING_PORTS $nvrec_ring_ports)"

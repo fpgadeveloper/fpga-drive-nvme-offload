@@ -108,7 +108,36 @@
  * through the bridges' M_AXI_BRIDGE) as on Zynq UltraScale+.
  * If the block design changes the address map or the interrupt bits, change
  * this node with it.
+ *
+ * Split ring (register map 1.3, driver 1.2): nvrec_core's second ring port
+ * reaches the on-board LPDDR4 (NoC DDR_CH2, 0x600_0000_0000, 4 GB behind one
+ * DDRMC with both x32 channels interleaved; DDR_LOW1 is
+ * not possible: the QDMA bridge NMUs also reach the DDR4's DDR_LOW0, and one
+ * NMU may not span DDR_LOW regions of two NoC instances), mapped for
+ * the ring port and the QDMA bridges only -- the A72s have no route to it and
+ * no memory node covers it. memory-region reserves its first 1 GB for ring B
+ * (no-map: the kernel never maps or allocates it); ring A stays in the CMA
+ * pool (cma=, PS DDR4). opsero,ring-stripe-chunk makes the board's default
+ * stripe the whole chunk (driver module parameter stripe_kb and the apps'
+ * --stripe override it): measured on this board (2x 980 PRO RAID0, ring reader
+ * with skid FIFOs), whole chunks play back 10750 MB/s sustained (40 GiB) at
+ * MaxPayload 128 and 256 alike, against 10250 / 10500 with 4 KB stripes;
+ * recording is drive-bound (10000 MB/s) with any stripe. With whole chunks each
+ * SSD reads and writes one memory only.
  */
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		nvrec_ring1: nvrec-ring1@60000000000 {
+			reg = <0x600 0x00000000 0x0 0x40000000>;
+			no-map;
+		};
+	};
+};
+
 &amba_pl {
 	nvrec: nvrec@420010000 {
 		compatible = "opsero,nvrec";
@@ -120,5 +149,7 @@
 		interrupt-names = "core", "ha";
 		opsero,ssd-ports = <&qdma_0>, <&qdma_1>;
 		opsero,ha-sw-queues = <0>;
+		memory-region = <&nvrec_ring1>;
+		opsero,ring-stripe-chunk;
 	};
 };

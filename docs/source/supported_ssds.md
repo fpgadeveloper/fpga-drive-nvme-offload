@@ -48,8 +48,8 @@ Rocket 2230 has an MDTS of 256 KB (256 KB chunks).
 
 | SSD (brand and model) | Capacity | Firmware | MDTS | I/O queues used | Tested in this revision |
 |-----------------------|----------|----------|------|-----------------|--------|
-| Samsung 980 PRO       | 1 TB     | 5B2QGXA7 | 512 KB | 1 | `zcu106_hpc0` (Gen3 x4) and `vck190_fmcp1` (Gen4 x4), FPGA Drive FMC Gen4: single drive and RAID0 pair, recording, playback, `nvverify` |
-| Sabrent Rocket 2230 (SB-2130-1TB) | 1 TB | R21B47.1 | 256 KB | 1 | `zcu106_hpc0` (Gen3 x4) and `vck190_fmcp1` (Gen4 x4), M.2 M-key Stack FMC: single drive and RAID0 pair, recording, playback, `nvverify` |
+| Samsung 980 PRO       | 1 TB     | 5B2QGXA7 | 512 KB | 1 | `vck190_fmcp1` (Gen4 x4) and `zcu106_hpc0` (Gen3 x4), FPGA Drive FMC Gen4: single drive and RAID0 pair, recording, playback, `nvverify` |
+| Sabrent Rocket 2230 (SB-2130-1TB) | 1 TB | R21B47.1 | 256 KB | 1 | `vck190_fmcp1` (Gen4 x4) and `zcu106_hpc0` (Gen3 x4), M.2 M-key Stack FMC: single drive and RAID0 pair, recording, playback, `nvverify` |
 
 The Samsung 950 PRO 256GB and Samsung 970 EVO 250GB, used for the
 [fpga-drive-recorder](https://recorder.fpgadrive.com) benchmarks, have not been tested with
@@ -61,42 +61,44 @@ NVMe APST disabled; the driver switches it off in any case (module parameter `ap
 
 ### Observations with the tested drives
 
-* **The Samsung 980 PRO pair reaches the DDR ceiling on `vck190_fmcp1`.** Two 980 PROs on Gen4 x4
-  record 9250 MB/s and play back 8750 MB/s in RAID0, the limit of the VCK190's single DDR4
-  controller (every recorded byte crosses it twice), not of the drives: each writes ~4.95 GB/s
-  in its cache and reads ~6.3 GB/s (~7 GB/s at MaxPayload 256 bytes). Past its cache one 980 PRO
-  writes ~1.77 GB/s with this design as with fpga-drive-recorder (1750 MB/s over 200 GiB on
-  both boards).
-* **One Sabrent Rocket writes ~5 % slower with this design than with fpga-drive-recorder**, on
-  both link generations: in its SLC cache 2.75-2.83 against 2.88-2.95 GB/s at the first failing
-  step on `zcu106_hpc0` (Gen3 x4) and 4.24-4.31 against 4.57-4.65 GB/s on `vck190_fmcp1` (Gen4
-  x4), and past it ~1.73 against ~1.80 GB/s on both boards (the pair ~3.39-3.45 against ~3.6
-  GB/s). Its past-cache figures here are therefore one 250 MB/s step lower (1500 MB/s over
-  200 GiB against 1750 MB/s). More commands in flight do not help one Sabrent: at `--qd 63` it
-  writes the same in its cache (2.74 GB/s) and 1.74 GB/s past it. This is an open observation:
-  the cause, perhaps the drive's response to 256 KB commands with PRP lists on a single
-  hardware queue, has not been isolated, nor separated from the drives' wear (about 9.7 TB were
-  written to the pair in the two days of measurements); see [Comparison](comparison).
-* **The Sabrent Rocket 2230 1TB slowed down over a night of benchmarks.** After about 4.9 TB had
-  been written to the pair in one night (each recording on freshly deallocated drives, the
-  drives at most 59 °C, APST off), both drives wrote 3-5 % slower than at the start of the
-  night with the same image: one drive 4.12-4.21 GB/s instead of 4.24-4.31 GB/s at the same
-  step, the pair 6.45-6.56 GB/s instead of 6.69-6.76 GB/s. How much idle time the drives need
-  to recover was not measured. Rates near a drive's limit can therefore differ by one 250 MB/s
-  step between sessions: the one-drive figure of `vck190_fmcp1` on the
-  [Benchmarks](benchmarks) page (4000 MB/s) was measured after this slowdown, late that night
-  and again the next day. With the pair, more commands in flight now cost one step (7500 MB/s
-  at `--qd 63` against 7750 MB/s at 32, with write-latency maxima of 31-45 ms against ~21 ms),
-  where on the first night they had helped.
-* **The Sabrent pair needs the 512 MB ring at high RAID0 rates.** Its write stalls (20-32 ms)
-  used up to 369 MB of the ring at 5000 MB/s on `zcu106_hpc0`, and a 256 MB ring dropped data
-  there and at 7750 MB/s on `vck190_fmcp1`; keep the default ring (see
+* **Both pairs record at their drives' write rate on `vck190_fmcp1`.** In its SLC cache one
+  980 PRO writes ~4.95 GB/s on Gen4 x4 and one Sabrent ~4.0-4.2 GB/s, so the 980 PRO pair
+  records 10 000 MB/s over 32 GB and the Sabrent pair 8250 MB/s, both with the ring's help. In
+  playback the Sabrent pair is the limit too (9250 MB/s, 2 × ~4.63 GB/s read, at MaxPayload 128
+  or 256), the 980 PRO pair is not (11 000 MB/s, its commands complete in 0.2 ms). One drive
+  plays back 6250 MB/s (980 PRO, MaxPayload 128) or 4500 MB/s (Sabrent). Past the cache both
+  pairs hold 3250 MB/s over 350 GiB.
+* **On the Gen3 x4 slots of `zcu106_hpc0`** one 980 PRO writes ~3.04 GB/s and one Sabrent
+  2.76-2.78 GB/s; both read ~3.2 GB/s (at MaxPayload 128); at 256 bytes one 980 PRO records
+  3250 MB/s and plays back 3500 MB/s. At the default MaxPayload of 256 bytes the 980 PRO pair
+  plays back 5750 MB/s and the Sabrent pair 6000 MB/s, at 128 bytes both 5250 MB/s; both record
+  6000 MB/s, the split ring's writer being the limit (the Sabrent pair records 5250 MB/s at
+  128 bytes, its drives' rate). Past the cache the 980 PRO pair holds 3500 MB/s, the Sabrent
+  pair 3250 MB/s.
+* **One Sabrent Rocket writes slower with this design than with fpga-drive-recorder**: in its
+  SLC cache 2.76-2.78 against 2.88-2.95 GB/s at the first failing step on `zcu106_hpc0` (Gen3
+  x4), and 4.21-4.23 against 4.57-4.65 GB/s on `vck190_fmcp1` (Gen4 x4). This is an open
+  observation: the cause, perhaps the drive's response to 256 KB commands with PRP lists on a
+  single hardware queue, has not been isolated, nor separated from the drives' wear (more than
+  14 TB had been written to the pair by the end of the measurements); see
+  [Comparison](comparison).
+* **MaxPayload 256 bytes helps on the Gen3 x4 slots**, which is why both split-ring boards set
+  it at boot. On `zcu106_hpc0` the Sabrent pair records and plays back 6000 MB/s at 256 bytes
+  against 5250 MB/s at 128, the 980 PRO pair plays back 5750 MB/s against 5250 MB/s, and one
+  980 PRO records 3250 and plays back 3500 MB/s against 3000 / 3000 MB/s (see
+  [Benchmarks](benchmarks.md#maxpayload-256)). On `vck190_fmcp1` it changes nothing for the
+  Sabrent pair.
+* **The ring size needed depends on the pair.** The Sabrent pair on `vck190_fmcp1` needs the
+  whole 1 GB default ring at 8250 MB/s (512 MB holds 8000 MB/s); the 980 PRO pair on
+  `vck190_fmcp1` and the Sabrent pair on `zcu106_hpc0` need at least 512 MB at their tops; the
+  980 PRO pair on `zcu106_hpc0` hardly uses the ring in its cache but used 567 MB past it. A
+  256 MB ring dropped data with every pair but that one; keep the default (see
   [Benchmarks](benchmarks.md#ring-size)).
-* **Short playback underflows with the Sabrent pair on `vck190_fmcp1`.** Above 7500 MB/s a RAID0
-  playback of a long file sees short underflows (up to ~1.6 ms in total per file) at the
-  requested rate, with the ring full and the drives' read latency at most 3.1 ms: a 40 GiB file
-  plays clean at 7500 MB/s, a 10 GiB file at 8750 MB/s. The 980 PRO pair does not show them on
-  the same image; the cause has not been isolated.
+* **The SLC cache needs idle time to recover.** A 40 GiB recording at 8000 MB/s started
+  3 minutes after a 350 GiB recording dropped with the Sabrent pair (it wrote only 7.45 GB/s);
+  9 minutes later it passed.
+* **The Sabrents run warm.** They reached 65 °C in the 350 GiB RAID0 recordings on both boards,
+  close to the benchmark suite's 70 °C guard; the 980 PROs at most 51 °C.
 
 ## Choosing SSDs for recording
 
@@ -124,7 +126,7 @@ or beats are dropped. The rate printed on an SSD's datasheet is usually not that
   when they get hot. Give the SSDs airflow, or a heatsink, for long recordings. The driver
   reads each SSD's composite temperature and its warning and critical thresholds
   (`/sys/block/nvrecXn1/nvrec/temperature`), and `nvbench-suite.sh` stops a run above 70 °C;
-  in the benchmarks the drives stayed at or below 64 °C. (The full `nvme smart-log` needs the
+  in the benchmarks the drives stayed at or below 65 °C. (The full `nvme smart-log` needs the
   stock driver; see [Kernel driver](driver.md#using-the-stock-nvme-driver-reference-tests).)
 
 Drives designed for sustained writes (SLC or MLC flash, enterprise and industrial drives,
