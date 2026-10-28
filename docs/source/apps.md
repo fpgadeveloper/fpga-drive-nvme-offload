@@ -65,7 +65,10 @@ Keep the defaults for recordings and playbacks unless you have measured the alte
 your drives. With 512 KB chunks `--stripe 4` makes every NVMe command of a Samsung 980 PRO
 switch memory 128 times: on `zcu106_hpc0` the 980 PRO pair then plays back only ~3.8-4.0 GB/s
 instead of 5750 MB/s (5250 MB/s at MaxPayload 128). And `--ring split` on one SSD costs far more than it could gain (see
-[Benchmarks](benchmarks.md#stripe-whole-chunk-4-kb-or-64-kb)).
+[Benchmarks](benchmarks.md#stripe-whole-chunk-4-kb-or-64-kb)). The other way round, two
+WD_BLACK SN8100 (1 MB chunks) on `vck190_fmcp1` play back 14 250 MB/s with `--stripe 4` against
+11 000 MB/s with the default, and record the same 13 750 MB/s with either: use `--stripe 4` for
+that pair.
 ```
 
 The default ring is **1 GB when split** (half in each memory: 4096 × 256 KB, 2048 × 512 KB,

@@ -137,10 +137,14 @@ limit. With a purchased license none of this applies.
     slot (~2.8-3.0 GB/s write, ~3.2 GB/s read at MaxPayload 128 bytes). The UltraZed-EV has the HP port only (327.77 MHz, 5.24 GB/s peak).
   * Versal: without SSDs the split ring records 14 750 MB/s and plays back 15 000 MB/s with
     whole-chunk stripes (15 750 / 16 000 MB/s with 4 KB stripes). Two Samsung 980 PRO record
-    10 000 MB/s (their write rate) and play back 11 000 MB/s sustained; about 12 GB/s of
-    playback is not reached (11.84 GB/s at a 12 000 MB/s sink, the ring reader and its
-    memories being the limit). Two Sabrent Rocket 2230 record 8250 MB/s and play back
-    9250 MB/s, both their drives' rates.
+    10 000 MB/s (their write rate) and play back 11 000 MB/s sustained. Two Sabrent Rocket 2230
+    record 8250 MB/s and play back 9250 MB/s, both their drives' rates. Two WD_BLACK SN8100
+    (PCIe Gen5 drives at Gen4 x4) record 13 750 MB/s, their Gen4 x4 links' write rate, and play
+    back 11 000 MB/s with whole-chunk stripes, 14 250 MB/s with `--stripe 4` (their links' read
+    rate). **With whole-chunk stripes about 12 GB/s of playback is not reached** with any pair
+    (11.84-11.95 GB/s at 12 000-14 000 MB/s sinks): the memory being read carries the stream
+    and one SSD's writes, ~18 GB/s of mixed traffic. 4 KB stripes lift it only with drives
+    that take them (the SN8100 pair, not the 980 PRO pair).
   * A recording crosses DDR twice (the fabric writes the ring, the SSDs read it), and the SSDs'
     own write rates, especially past their SLC cache, are usually lower still.
   * `src_clk` and `dp_clk` run at the same 250 MHz, so a source at one beat every cycle leaves
@@ -155,8 +159,9 @@ limit. With a purchased license none of this applies.
 * **Playback near the top fails by short underflows.** With whole-chunk stripes a playback
   close to the highest sustained rate does not fall short steadily but runs dry for short,
   intermittent moments (on `vck190_fmcp1` 11 000 MB/s was clean in 3 of 3 runs of a 40 GiB file
-  on the release image but in 8 of 9 in the measurement session, and 11 250-11 750 MB/s in some
-  runs only). Leave a margin below the published rate.
+  on the release image but in 8 of 9 in the measurement session with the 980 PRO pair, in 8 of 9
+  on three recordings with the SN8100 pair, and 11 250-11 750 MB/s in some runs only). Leave a
+  margin below the published rate.
 * **One SSD must stay on a single ring.** One SSD whose writes alternate between the two
   memories plays back much slower: **one Samsung 980 PRO on `zcu106_hpc0` plays only
   ~1.44 GB/s on the split ring** (12 ms read latency) against 3000 MB/s on the single ring; one
@@ -168,7 +173,9 @@ limit. With a purchased license none of this applies.
   NVMe command of a Samsung 980 PRO switches memory 128 times, and the 980 PRO pair on
   `zcu106_hpc0` plays back only ~3.8-4.0 GB/s (6.3 ms read latency at MaxPayload 128) instead
   of 5750 MB/s (5250 MB/s at 128). With the Sabrent pair's 256 KB chunks 4 KB and whole-chunk
-  stripes tie in playback. Keep the default stripe (the whole chunk).
+  stripes tie in playback. Keep the default stripe (the whole chunk) unless you have measured
+  the alternative with your drives: two WD_BLACK SN8100 (1 MB chunks) on `vck190_fmcp1` play
+  back faster with `--stripe 4` (14 250 against 11 000 MB/s).
 * **The single ring on `vck190_fmcp1`** (`--ring single`) records RAID0 at 9250 MB/s with
   drops in 3 of 3 runs (9.24-9.25 GB/s written), less than the Release 1.1 build sustained
   with the same ring; the NoC bandwidth requests and MaxPayload were ruled out, the cause was

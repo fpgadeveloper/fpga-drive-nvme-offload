@@ -137,13 +137,22 @@ which is what wins once SSDs are in the loop:
   | fabric only: recording / ring-resident playback | 14 750 / 15 000 MB/s | 15 750 / 16 000 MB/s |
 
   Two Sabrent Rocket 2230, whose drives read more slowly than either layout takes, play back
-  9250 MB/s with both.
+  9250 MB/s with both. **Two WD_BLACK SN8100 (1 MB chunks) are the exception**: with 4 KB
+  stripes they play back 14 250 MB/s, their Gen4 x4 links' read rate, against 11 000 MB/s with
+  whole chunks, and record 13 750 MB/s with either; in playback their commands complete in
+  0.27-0.30 ms with either stripe up to 13 750 MB/s. For that pair, play back with `--stripe 4` (or load the driver with
+  `stripe_kb=4`).
 
   With 4 KB stripes every SSD command alternates between the DDR4 and the LPDDR4, and the NoC
   orders each Root Port's writes strictly, so every switch costs a round trip. With whole
   chunks each SSD writes one memory; the ring reader's skid FIFOs keep fetching from the other
   memory, so the switch from one memory to the next at a chunk boundary costs the reader
-  little. 4 KB stripes win only without SSDs.
+  little. But with whole chunks the reader drains one memory at a time at the full stream
+  rate while that memory also takes one SSD's writes, so playback stops at about 11.9 GB/s,
+  the mixed limit of one memory (~18 GB/s); 4 KB stripes spread both over the two memories.
+  4 KB stripes therefore win without SSDs, and with SSDs whose commands do not pay for the
+  memory switches (the SN8100, not the 980 PRO); see
+  [Benchmarks](benchmarks.md#stripe-whole-chunk-4-kb-or-64-kb).
 
 **Memory 1** is a `no-map` reserved-memory region the device tree hands to the nvrec node
 (`memory-region`, see [Device tree](#device-tree)): 1 GB at the start of the second memory on

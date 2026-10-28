@@ -113,8 +113,11 @@ faster. Here the fabric issues the reads, 32 per drive. On `zcu106_hpc0` the pai
 5750 MB/s (980 PRO) and 6000 MB/s (Sabrent) sustained at the default MaxPayload of 256 bytes,
 and 5250 MB/s, their drives' read rate on the split ring, at 128 bytes. On `vck190_fmcp1` the Sabrent pair
 plays back 9250 MB/s, its drives' read rate (2 × ~4.63 GB/s), and the 980 PRO pair 11 000 MB/s,
-where the ring reader and its memories, not the drives, set the limit (see
-[Ceilings at a glance](benchmarks.md#ceilings-at-a-glance)).
+where the limit is the memory being read, which also takes one SSD's writes, not the drives
+(see [Ceilings at a glance](benchmarks.md#ceilings-at-a-glance)). A third pair, two
+WD_BLACK SN8100, was measured with this design only (13 750 MB/s recording, 14 250 MB/s
+playback with 4 KB stripes, 2000 MB/s past its SLC cache over 800 GiB, see
+[Benchmarks](benchmarks)).
 
 **One drive: drive-bound, mostly equal.** Where the drive or its link is the limit, both designs
 measure the same or one step apart. One 980 PRO writes ~4.95 GB/s in its cache on

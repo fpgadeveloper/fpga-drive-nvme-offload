@@ -40,7 +40,7 @@ CPU does not use, `uzev` has a single ring in PS DDR:
 | target | fabric datapath | ring's memories | fabric-only ceiling, recording / playback | hardware status in this revision |
 |---|---|---|---|---|
 | `uzev` | 256 bits at 250 MHz (8 GB/s) | single ring in PS DDR through `S_AXI_HP2_FPD`, 128 bits at 327.77 MHz (5.24 GB/s peak) | not measured | built (XSA and Linux image), not tested on hardware |
-| `vck190_fmcp1` | 512 bits at 250 MHz (16 GB/s) | split ring: DDR4 (PS DDR) and the on-board LPDDR4, each through a 512-bit NoC port of its own; one more NoC port per PCIe Root Port | 14 750 / 15 000 MB/s (whole-chunk stripes, the default; 15 750 / 16 000 MB/s with 4 KB stripes) | tested with two Samsung 980 PRO 1TB and with two Sabrent Rocket 2230 1TB |
+| `vck190_fmcp1` | 512 bits at 250 MHz (16 GB/s) | split ring: DDR4 (PS DDR) and the on-board LPDDR4, each through a 512-bit NoC port of its own; one more NoC port per PCIe Root Port | 14 750 / 15 000 MB/s (whole-chunk stripes, the default; 15 750 / 16 000 MB/s with 4 KB stripes) | tested with two Samsung 980 PRO 1TB, two Sabrent Rocket 2230 1TB and two WD_BLACK SN8100 HS 1000GB |
 | `zcu106_hpc0` | 256 bits at 250 MHz (8 GB/s) | split ring: PS DDR4 through `S_AXI_HP2_FPD` (128 bits at 322.19 MHz, 5.16 GB/s peak) and the soldered PL DDR4 through a DDR4 controller in the PL | 6000 / 6250 MB/s (whole-chunk stripes, the default; 7000 / 6750 MB/s with 4 KB stripes) | tested with two Samsung 980 PRO 1TB and with two Sabrent Rocket 2230 1TB |
 
 The fabric-only ceiling is the highest rate at which data reaches DDR from the fabric (and comes
@@ -123,9 +123,10 @@ What a carrier needs for this design:
 
 * The `vck190_fmcp1` design uses the FMCP1 connector (FMC+), which supports two SSDs, each
   with an independent 4-lane PCIe Gen4 interface (QDMA Root Ports in AXI bridge mode).
-* Status: tested on hardware in this revision with two Samsung 980 PRO 1TB on the FPGA Drive
-  FMC Gen4 and with two Sabrent Rocket 2230 1TB on the M.2 M-key Stack FMC (single drive and
-  RAID0, recording, playback, verification); every SSD links at PCIe Gen4 x4.
+* Status: tested on hardware in this revision with two Samsung 980 PRO 1TB and two WD_BLACK
+  SN8100 HS 1000GB on the FPGA Drive FMC Gen4 and with two Sabrent Rocket 2230 1TB on the M.2
+  M-key Stack FMC (single drive and RAID0, recording, playback, verification); every SSD links
+  at PCIe Gen4 x4 (the SN8100, a PCIe Gen5 drive, too).
 * Datapath: 512 bits, `src_clk` = `dp_clk` = 250 MHz (16 GB/s), an ingest FIFO of 256 KB and
   an egress FIFO of 256 KB. The ring is split over two memories: ring A in the DDR4 (PS DDR)
   through a 512-bit NoC port of its own, ring B in the on-board LPDDR4 through a second NoC
@@ -136,7 +137,8 @@ What a carrier needs for this design:
   instead of the one port that both Root Ports share in the base design. Without SSDs the
   split ring records 14 750 MB/s and plays back 15 000 MB/s (whole-chunk stripes). The 980 PRO
   pair records 10 000 MB/s over 32 GB and plays back 11 000 MB/s sustained, the Sabrent pair
-  8250 and 9250 MB/s (both record at their drives' write rate), with PCIe MaxPayload 256 bytes,
+  8250 and 9250 MB/s (both record at their drives' write rate), the SN8100 pair 13 750 MB/s
+  (its Gen4 x4 links) and 11 000 MB/s, or 14 250 MB/s with `--stripe 4`, with PCIe MaxPayload 256 bytes,
   which the image sets at boot (`nvrec-pcie-mps.service`). See [Benchmarks](benchmarks.md#versal-vck190_fmcp1).
 * VADJ: the board's system controller normally sets the FMC VADJ supply from the FMC card's
   EEPROM. The Linux image does not depend on it: its U-Boot boot script enables VADJ at
